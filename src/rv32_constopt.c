@@ -776,7 +776,6 @@ CONSTOPT(cjal, {
 })
 
 /* C.LI 将符号扩展的 6 位立即数加载到 rd，展开为 addi rd, x0, imm[5:0]。 */
- */
 CONSTOPT(cli, {
     info->is_constant[ir->rd] = true;
     info->const_val[ir->rd] = ir->imm;
@@ -957,7 +956,6 @@ CONSTOPT(cjalr, {
 })
 
 /* C.ADD 将 rd 和 rs2 相加并写回 rd，展开为 add rd, rd, rs2。 */
- */
 CONSTOPT(cadd, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;

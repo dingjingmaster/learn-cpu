@@ -331,7 +331,9 @@ SOFTFLOAT_OBJS := $(addprefix $(OUT)/softfloat/, \
     $(SOFTFLOAT_OBJS_SPECIALIZE) \
     $(SOFTFLOAT_OBJS_OTHERS))
 
-SOFTFLOAT_SENTINEL := src/softfloat/.git
+# 使用 SoftFloat 的实际头文件作为哨兵，而不是 .git 目录。
+# 这样源码包或手动解压的 src/softfloat 目录也能被识别为已准备好。
+SOFTFLOAT_SENTINEL := src/softfloat/source/include/softfloat.h
 
 $(SOFTFLOAT_SENTINEL):
 	$(call ensure-submodule,src/softfloat,https://github.com/ucb-bar/berkeley-softfloat-3)

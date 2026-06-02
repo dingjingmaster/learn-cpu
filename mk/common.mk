@@ -109,12 +109,16 @@ $(1):
 endef
 
 # 兼容源码包的条件式子模块/克隆辅助模板。
-# 在 git 仓库中使用 submodule，在 release tarball 中退化为 git clone。
+# 只有路径在 .gitmodules 中登记为子模块时才使用 git submodule；否则即使当前目录是
+# git 仓库，也按普通依赖目录处理并在缺失时 clone。这样可兼容去掉 .gitmodules 的
+# 源码包、教学仓库快照或手动解压的依赖目录。
 # $(1)：目标目录
 # $(2)：仓库 URL
 # $(3)：分支或标签，可选，默认使用仓库默认分支
 define ensure-submodule
-	@if [ -d .git ]; then \
+	@if [ -d .git ] && [ -f .gitmodules ] && \
+	    git config --file .gitmodules --get-regexp '^submodule\..*\.path$$' 2>/dev/null | \
+	        awk '{ print $$2 }' | grep -qx "$(1)"; then \
 	    git submodule update --init --depth=1 "$(1)" || { \
 	        echo "错误：更新子模块 $(1) 失败" >&2; \
 	        exit 1; \
