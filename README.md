@@ -245,6 +245,8 @@ make arch-test
 
 ## 学习建议
 
+更完整的分路线阅读计划见 [docs/learning-roadmap.md](docs/learning-roadmap.md)。
+
 如果目标是理解 CPU 模拟器，可以按下面顺序阅读：
 
 1. `src/main.c`：了解程序入口和 `vm_attr_t` 如何描述一次运行。
