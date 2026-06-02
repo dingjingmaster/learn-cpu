@@ -45,6 +45,14 @@ config: env-check $(KCONFIG_DIR)/menuconfig.py
 	@echo "配置已保存到 .config 和 $(CONFIG_HEADER)"
 
 # 应用默认配置；也支持 CONFIG=name 选择命名配置。
+# tools/kconfig/defconfig.py
+# .config 生成流程解析：
+# 1. 若用户通过 make CONFIG=xxx 指定自定义配置：
+#    - 先检查 configs/xxx_defconfig 文件是否存在
+#    - 存在则调用 Kconfiglib 的 defconfig.py，传入 Kconfig 根文件和自定义defconfig，生成.project根目录的.config
+#    - 不存在则抛出错误终止
+# 2. 若用户未指定CONFIG，默认加载configs/defconfig，通过defconfig.py生成根目录的.config
+# 3. 生成.config后，调用genconfig.py将.config转换为C代码可引用的配置头文件$(CONFIG_HEADER)，该头文件的具体路径为src/rv32emu_config.h
 defconfig: $(KCONFIG_DIR)/defconfig.py
 	@if [ -n "$(CONFIG)" ]; then \
 	    if [ -f "configs/$(CONFIG)_defconfig" ]; then \

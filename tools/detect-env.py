@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-Environment Detection Script for rv32emu Build System
+rv32emu/learn-cpu 构建环境探测脚本。
 
-Detects compilers, libraries, and toolchains for Kconfig integration.
-Called by Kconfig with $(shell,...) to populate configuration options.
+Kconfig 会通过 `$(shell,...)` 调用本脚本，把宿主编译器、Emscripten、SDL2、
+LLVM 和 RISC-V 交叉工具链的探测结果写入配置选项。为了便于 Kconfig 解析，布尔
+查询仍固定输出 `y` 或 `n`，编译器类型仍固定输出 `GCC`、`Clang`、
+`Emscripten` 或 `Unknown`。
 
-Usage:
-    python3 detect-env.py [OPTIONS]
+用法：
+    python3 detect-env.py [选项]
 
-Options:
-    --compiler           Print detected compiler type (GCC/Clang/Emscripten)
-    --is-emcc           Check if compiler is Emscripten (prints y/n)
-    --is-clang          Check if compiler is Clang (prints y/n)
-    --is-gcc            Check if compiler is GCC (prints y/n)
-    --have-emcc         Check if Emscripten (emcc) is available (prints y/n)
-    --have-sdl2         Check if SDL2 is available (prints y/n)
-    --have-sdl2-mixer   Check if SDL2_mixer is available (prints y/n)
-    --have-llvm18       Check if LLVM 18 is available (prints y/n)
-    --have-riscv-toolchain  Check if RISC-V toolchain exists (prints y/n)
-    --summary           Print full environment summary
+常用选项：
+    --compiler              输出检测到的编译器类型。
+    --is-emcc               当前编译器是否为 Emscripten。
+    --is-clang              当前编译器是否为 Clang。
+    --is-gcc                当前编译器是否为 GCC。
+    --have-emcc             系统是否可用 emcc。
+    --have-sdl2             系统是否可用 SDL2。
+    --have-sdl2-mixer       系统是否可用 SDL2_mixer。
+    --have-llvm18           系统是否可用 LLVM 18。
+    --have-riscv-toolchain  系统是否可用 RISC-V 交叉工具链。
+    --summary               输出完整环境摘要，供人工排查使用。
 """
 
 import os
@@ -29,9 +31,11 @@ import sys
 
 
 def run_cmd(cmd, timeout=5):
-    """Run a command and return (returncode, stdout, stderr)."""
+    """执行外部命令，并返回 `(退出码, 标准输出, 标准错误)`。"""
     try:
         if isinstance(cmd, str):
+            # Kconfig/Make 可能传入带空格的命令字符串；统一拆成参数列表，避免
+            # `shell=True` 带来的引用和注入问题。
             cmd = shlex.split(cmd)
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout
@@ -42,20 +46,23 @@ def run_cmd(cmd, timeout=5):
 
 
 def get_compiler_path():
-    """Determine compiler path from environment."""
+    """根据环境变量推导当前构建使用的 C 编译器。"""
     cross_compile = os.environ.get("CROSS_COMPILE", "")
     cc = os.environ.get("CC", "")
 
     if cc:
+        # 显式 CC 覆盖优先级最高，支持用户指定 clang、gcc 或 emcc。
         return cc
     elif cross_compile:
+        # 交叉编译时 CROSS_COMPILE 通常是前缀，例如 riscv32-unknown-elf-。
         return f"{cross_compile}gcc"
     else:
+        # 未指定时遵循 Makefile 默认行为，使用系统 cc。
         return "cc"
 
 
 def get_compiler_version(compiler):
-    """Get compiler version string."""
+    """获取编译器版本输出，供后续判断编译器类型。"""
     ret, stdout, _ = run_cmd(
         [compiler, "--version"]
         if not " " in compiler
@@ -65,9 +72,10 @@ def get_compiler_version(compiler):
 
 
 def detect_compiler_type(version_output):
-    """Detect compiler type from version string."""
+    """从版本字符串中判断编译器类型。"""
     lower = version_output.lower()
 
+    # emcc 的版本输出通常也包含 clang，因此必须先判断 Emscripten。
     if "emcc" in lower:
         return "Emscripten"
     if "clang" in lower:
@@ -78,32 +86,32 @@ def detect_compiler_type(version_output):
 
 
 def check_pkg_config(package):
-    """Check if a package exists via pkg-config."""
+    """通过 pkg-config 检查系统库是否存在。"""
     ret, _, _ = run_cmd(["pkg-config", "--exists", package])
     return ret == 0
 
 
 def check_sdl2_config():
-    """Check if sdl2-config exists."""
+    """检查传统的 sdl2-config 工具是否存在。"""
     return shutil.which("sdl2-config") is not None
 
 
 def have_sdl2():
-    """Check if SDL2 is available."""
+    """检查 SDL2 开发环境是否可用。"""
     return check_sdl2_config() or check_pkg_config("sdl2")
 
 
 def have_sdl2_mixer():
-    """Check if SDL2_mixer is available."""
+    """检查 SDL2_mixer 开发环境是否可用。"""
     return check_pkg_config("SDL2_mixer")
 
 
 def have_emcc():
-    """Check if Emscripten (emcc) is available."""
+    """检查 Emscripten 编译器 `emcc` 是否可用。"""
     emcc = shutil.which("emcc")
     if emcc:
-        # Verify it works by checking version
-        # Some Emscripten builds emit version info to stderr, so check both
+        # 只找到可执行文件还不够，需要确认它能正常运行。
+        # 部分 Emscripten 构建会把版本信息输出到 stderr，因此同时检查 stdout/stderr。
         ret, stdout, stderr = run_cmd([emcc, "--version"])
         combined = (stdout + stderr).lower()
         if ret == 0 and "emcc" in combined:
@@ -112,12 +120,12 @@ def have_emcc():
 
 
 def have_llvm18():
-    """Check if LLVM 18 is available."""
-    # Check for llvm-config-18
+    """检查 LLVM 18 开发环境是否可用。"""
+    # Linux 发行版常见命名：llvm-config-18。
     if shutil.which("llvm-config-18"):
         return True
 
-    # Check Homebrew path on macOS (dynamic detection)
+    # macOS/Homebrew 常见安装路径：brew --prefix llvm@18。
     if shutil.which("brew"):
         ret, stdout, _ = run_cmd(["brew", "--prefix", "llvm@18"])
         if ret == 0:
@@ -125,7 +133,7 @@ def have_llvm18():
             if os.access(homebrew_path, os.X_OK):
                 return True
 
-    # Check standard llvm-config and verify version
+    # 最后检查通用 llvm-config，并确认主版本号确实为 18。
     llvm_config = shutil.which("llvm-config")
     if llvm_config:
         ret, stdout, _ = run_cmd([llvm_config, "--version"])
@@ -136,7 +144,7 @@ def have_llvm18():
 
 
 def have_riscv_toolchain():
-    """Check if a RISC-V cross-compiler toolchain is available."""
+    """检查是否存在可用的 RISC-V 交叉编译工具链。"""
     toolchain_prefixes = [
         "riscv-none-elf-",
         "riscv32-unknown-elf-",
@@ -147,7 +155,7 @@ def have_riscv_toolchain():
     for prefix in toolchain_prefixes:
         gcc = shutil.which(f"{prefix}gcc")
         if gcc:
-            # Verify it's actually a RISC-V compiler by checking predefined macros
+            # 优先通过预定义宏确认这是 RISC-V 编译器，避免只靠文件名误判。
             try:
                 result = subprocess.run(
                     [gcc, "-dM", "-E", "-x", "c", "-"],
@@ -161,7 +169,7 @@ def have_riscv_toolchain():
             except (subprocess.TimeoutExpired, OSError):
                 pass
 
-            # Fallback: just check if --version mentions RISC-V
+            # 回退策略：检查 --version 输出中是否出现 RISC-V 字样。
             ret, stdout, _ = run_cmd([gcc, "--version"])
             if ret == 0 and (
                 "riscv" in stdout.lower() or "risc-v" in stdout.lower()
@@ -172,7 +180,7 @@ def have_riscv_toolchain():
 
 
 def print_summary():
-    """Print full environment summary."""
+    """输出完整环境摘要，主要用于人工调试构建配置。"""
     compiler = get_compiler_path()
     version = get_compiler_version(compiler)
     comp_type = detect_compiler_type(version)
@@ -187,6 +195,7 @@ def print_summary():
 
 
 def main():
+    """解析命令行选项，并按 Kconfig 期望格式输出探测结果。"""
     if len(sys.argv) < 2:
         print_summary()
         return
@@ -218,7 +227,7 @@ def main():
     elif arg == "--summary":
         print_summary()
     else:
-        print(f"Unknown option: {arg}", file=sys.stderr)
+        print(f"未知选项：{arg}", file=sys.stderr)
         sys.exit(1)
 
 

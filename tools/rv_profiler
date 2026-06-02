@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
+"""
+rv32emu profiling 数据查看工具。
+
+模拟器启用 profiling 后会在 `build/<name>.prof` 中输出基本块信息。本脚本读取该
+文件，支持按地址范围打印表格，也支持从指定基本块开始递归构造 IR 控制流图，并交给
+lolviz/Graphviz 可视化。
+"""
+
 import sys
 import argparse
 import math
 from lolviz import *
 
+
 class Block:
+    """用于 lolviz 展示的基本块节点。"""
+
     def __init__(self, PC, IR_list, branch_taken=None, branch_untaken=None):
+        # PC 是基本块起始地址；IR_list 是该块内指令摘要。
         self.PC = PC;
         self.IR_list = IR_list
+        # branch_taken/branch_untaken 指向后继基本块，用来表达控制流边。
         self.branch_taken = branch_taken
         self.branch_untaken = branch_untaken
 
+
 def printTable(table):
+    """按 profiling 记录类型打印对齐后的文本表格。"""
     col_widths = getLongestWordLength(table)
     if len(table):
         if len(table[0]) == 9:
+        # 九字段格式来自带热点统计的性能数据，额外包含执行频次、热点标志和循环标志。
             print("PC_start".rjust(col_widths[0]), end=' ')
             print("PC_end".rjust(col_widths[0]), end=' ')
             print("frequency".rjust(col_widths[0]), end=' ')
@@ -37,6 +53,7 @@ def printTable(table):
                 print(table[i]["IR_list"], end=' ')
                 print()
         else:
+            # 五字段格式是较简化的性能数据，只保留基本块范围、分支边和 IR 列表。
             print("PC_start".rjust(col_widths[0]), end=' ')
             print("PC_end".rjust(col_widths[0]), end=' ')
             print("untaken".rjust(col_widths[0]), end=' ')
@@ -55,13 +72,21 @@ def printTable(table):
 
 
 def getLongestWordLength(table):
+    """计算每一行最长字段宽度，供简单表格对齐使用。"""
     return[max([len(item) for item in line]) for line in table]
 
+
+# profile_dict 通过基本块起始地址快速定位原始记录；block_dict 保存已经构造出的
+# Block 对象，避免图中同一基本块被重复创建。
 profile_dict = {}
 block_dict = {}
 pc_set = set()
+
+
 def print_graph_IR(pc):
+    """从指定 PC 开始递归构造控制流图节点。"""
     if (pc in pc_set):
+        # 已访问过的节点直接停止递归，避免循环控制流导致无限遍历。
         return None;
     pc_set.add(pc);
     data = profile_dict[pc]
@@ -71,11 +96,13 @@ def print_graph_IR(pc):
     untaken = None
     taken = None
     if data["untaken"] != "NULL":
+        # 未命中分支边可能指向已构造节点，也可能需要递归创建。
         if (data["untaken"] in pc_set):
             untaken = block_dict[data["untaken"]]
         else:
             untaken = print_graph_IR(data["untaken"])
     if data["taken"] != "NULL":
+        # 命中分支边同样递归展开，形成 Block 对象之间的引用关系。
         if (data["taken"] in pc_set):
             taken = block_dict[data["taken"]]
         else:
@@ -84,17 +111,21 @@ def print_graph_IR(pc):
     block.branch_taken = taken
     return block
 
-parser = argparse.ArgumentParser()
+
+parser = argparse.ArgumentParser(
+    description="读取 build/<文件名>.prof，并查看基本块 profile 数据。"
+)
 parser.add_argument('filename', type=str,
-                    help='an integer for the accumulator')
+                    help='profile 文件名，不含 build/ 前缀和 .prof 后缀')
 parser.add_argument('--start-address', type=str,
-                    help='start address for profiling data')
+                    help='按起始地址过滤 profile 数据，例如 0x80000000')
 parser.add_argument('--stop-address', type=str,
-                    help='stop address for profiling data')
+                    help='按结束地址过滤 profile 数据，例如 0x80001000')
 parser.add_argument('--graph-ir', type=str,
-                    help='visualize graph IR')
+                    help='从指定 PC 开始可视化 IR 控制流图')
 args = parser.parse_args()
 
+# 性能数据文件由模拟器生成，命名约定为 build/<filename>.prof。
 f = open(f'build/{args.filename}.prof', 'r')
 fileds = f.readline()
 raw_datas = f.read().split("\n")
@@ -102,6 +133,7 @@ profile_datas = []
 for data in raw_datas:
     tmp = data.split("|")
     if len(tmp) == 9:
+        # 带热点统计的九列记录。字段名沿用模拟器写入 .prof 文件时使用的原始列名。
         d = {
             "PC_start": tmp[0].strip(),
             "PC_end": tmp[1].strip(),
@@ -116,6 +148,7 @@ for data in raw_datas:
         profile_datas.append(d)
         profile_dict[d["PC_start"]] = d;
     elif len(tmp) == 5:
+        # 简化的五列记录。缺少热点统计时仍可展示基本控制流信息。
         d = {
             "PC_start": tmp[0].strip(),
             "PC_end": tmp[1].strip(),
@@ -127,6 +160,7 @@ for data in raw_datas:
         profile_dict[d["PC_start"]] = d;
 
 if  args.start_address or args.stop_address:
+    # 若用户指定地址范围，只打印完全落在该范围内的基本块。
     print_data = []
     start_address = 0
     stop_address = math.inf
@@ -142,6 +176,7 @@ if  args.start_address or args.stop_address:
     printTable(print_data)
 
 if args.graph_ir:
+    # 构造控制流图后交给 lolviz 渲染。g.view() 会调用 Graphviz 并打开生成文件。
     block = print_graph_IR(args.graph_ir)
     g = objviz(block)
-    g.view() # render and show graphviz.files.Source object
+    g.view()

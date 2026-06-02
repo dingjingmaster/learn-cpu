@@ -287,9 +287,9 @@ int main(int argc, char **args)
     run_flag |= opt_prof_data << 2;
 
     vm_attr_t attr = {
-        .mem_size = MEM_SIZE,
-        .stack_size = STACK_SIZE,
-        .args_offset_size = ARGS_OFFSET_SIZE,
+        .mem_size = MEM_SIZE,                   // 256MB
+        .stack_size = STACK_SIZE,               // 4KB
+        .args_offset_size = ARGS_OFFSET_SIZE,   // 4K
         .argc = prog_argc,
         .argv = prog_args,
         .log_level = LOG_WARN,

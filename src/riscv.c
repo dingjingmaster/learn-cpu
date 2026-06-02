@@ -1121,7 +1121,7 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
     memory_t *mem = attr->mem;
 #endif
 
-    /* 设置复位地址。 */
+    /* 设置复位地址。0 */
     rv->PC = pc;
 
     /* 设置默认栈指针。 */
