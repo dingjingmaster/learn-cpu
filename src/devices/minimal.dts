@@ -63,7 +63,7 @@
             no-loopback-test;
             clock-frequency = <5000000>;
 
-            /* the baudrate divisor is ignored */
+            /* 波特率分频值由模拟器忽略。 */
         };
         rtc0: rtc@4100000 {
             compatible = "google,goldfish-rtc";
@@ -73,8 +73,8 @@
         };
 
         /*
-         * Virtio block example subnode
-         * The actual subnode are generated dynamically depends on the CLI -x vblk option
+         * Virtio 块设备示例子节点。
+         * 实际子节点会根据 CLI 的 -x vblk 选项动态生成。
          */
         /*blk0: virtio@4200000 {
             compatible = "virtio,mmio";

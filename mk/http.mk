@@ -1,32 +1,31 @@
-# HTTP download utilities
+# HTTP 下载工具
 #
-# Provides unified HTTP download macros for curl/wget with retry logic.
-# Include this file before any mk file that needs HTTP downloads.
+# 为 curl/wget 提供统一下载宏，并带重试逻辑。
+# 任何需要 HTTP 下载的 mk 文件都应先 include 本文件。
 
 ifndef _MK_HTTP_INCLUDED
 _MK_HTTP_INCLUDED := 1
 
-# HTTP download tool detection (prefer curl, fallback to wget)
+# HTTP 下载工具探测：优先使用 curl，找不到时回退到 wget。
 CURL := $(shell command -v curl 2>/dev/null)
 WGET := $(shell command -v wget 2>/dev/null)
 
-# Detect wget --show-progress support (GNU wget extension)
+# 探测 wget 是否支持 --show-progress（GNU wget 扩展）。
 WGET_HAS_PROGRESS := $(if $(WGET),$(shell $(WGET) --help 2>&1 | grep -q show-progress && echo 1))
 
-# Select HTTP tool and define unified commands
-# Note: GH_TOKEN environment variable enables authenticated GitHub API requests
-# (avoids 60 requests/hour rate limit for unauthenticated requests)
+# 选择 HTTP 工具并定义统一命令。
+# GH_TOKEN 环境变量可启用 GitHub API 认证请求，避免匿名请求 60 次/小时限制。
 ifdef CURL
     HTTP_TOOL := curl
-    # Fetch URL to stdout (for parsing API responses)
-    # Uses GH_TOKEN if available for authenticated requests
-    # $(1): URL
+    # 获取 URL 内容并输出到 stdout，常用于解析 API 响应。
+    # 如果存在 GH_TOKEN，则使用认证请求。
+    # $(1)：URL
     HTTP_GET = curl -fsSL $(if $(GH_TOKEN),-H "Authorization: Bearer $(GH_TOKEN)") $(1) 2>/dev/null
-    # Download file with progress bar and retry
-    # $(1): URL, $(2): output file
+    # 带进度条和重试的文件下载。
+    # $(1)：URL，$(2)：输出文件
     HTTP_DOWNLOAD = curl -fSL --retry 3 --retry-delay 2 --progress-bar $(1) -o $(2)
-    # Download file silently with retry
-    # $(1): URL, $(2): output file
+    # 静默下载文件，并带重试。
+    # $(1)：URL，$(2)：输出文件
     HTTP_DOWNLOAD_QUIET = curl -fsSL --retry 3 --retry-delay 2 $(1) -o $(2)
 else ifdef WGET
     HTTP_TOOL := wget

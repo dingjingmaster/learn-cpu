@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 最小 ELF32 读取和装载器。
+ *
+ * 用户态运行时通过本文件打开 ELF、校验头部、装载 PT_LOAD 段、查询符号表，
+ * 并为架构测试读取 begin_signature/end_signature/tohost 等符号。实现只覆盖
+ * 模拟器需要的 ELF32 小端场景，不追求完整链接器/加载器能力。
  */
 
 #include <assert.h>
@@ -17,7 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #else
-/* fallback to standard I/O text stream */
+/* 回退到标准 I/O 文件流。 */
 #include <stdio.h>
 #endif
 
@@ -57,7 +64,7 @@ struct elf_internal {
     uint32_t raw_size;
     uint8_t *raw_data;
 
-    /* symbol table map: uint32_t -> (const char *) */
+    /* 符号表映射：uint32_t -> const char *。 */
     map_t symbols;
 };
 
@@ -94,7 +101,7 @@ void elf_delete(elf_t *e)
     free(e);
 }
 
-/* release a loaded ELF file */
+/* 释放已加载 ELF 文件占用的资源。 */
 static void release(elf_t *e)
 {
 #if !HAVE_MMAP
@@ -106,25 +113,25 @@ static void release(elf_t *e)
     e->hdr = NULL;
 }
 
-/* check if the ELF file header is valid */
+/* 校验 ELF 文件头是否有效。 */
 static bool is_valid(elf_t *e)
 {
-    /* check for ELF magic */
+    /* 校验 ELF magic。 */
     if (memcmp(e->hdr->e_ident, "\177ELF", 4))
         return false;
 
-    /* must be 32bit ELF */
+    /* 只接受 32 位 ELF。 */
     if (e->hdr->e_ident[EI_CLASS] != ELFCLASS32)
         return false;
 
-    /* check if machine type is RISC-V */
+    /* 校验机器类型是否为 RISC-V。 */
     if (e->hdr->e_machine != EM_RISCV)
         return false;
 
     return true;
 }
 
-/* get section header string table */
+/* 获取 section header 字符串表中的字符串。 */
 static const char *get_sh_string(elf_t *e, int index)
 {
     uint32_t offset =
@@ -134,7 +141,7 @@ static const char *get_sh_string(elf_t *e, int index)
     return (const char *) (e->raw_data + shdr->sh_offset + index);
 }
 
-/* get a section header */
+/* 按段名获取 section header。 */
 static const struct Elf32_Shdr *get_section_header(elf_t *e, const char *name)
 {
     for (int s = 0; s < e->hdr->e_shnum; ++s) {
@@ -148,7 +155,7 @@ static const struct Elf32_Shdr *get_section_header(elf_t *e, const char *name)
     return NULL;
 }
 
-/* get the ELF string table */
+/* 获取 ELF 符号字符串表。 */
 static const char *get_strtab(elf_t *e)
 {
     const struct Elf32_Shdr *shdr = get_section_header(e, ".strtab");
@@ -158,61 +165,61 @@ static const char *get_strtab(elf_t *e)
     return (const char *) (e->raw_data + shdr->sh_offset);
 }
 
-/* find a symbol entry */
+/* 查找指定名称的符号条目。 */
 const struct Elf32_Sym *elf_get_symbol(elf_t *e, const char *name)
 {
-    const char *strtab = get_strtab(e); /* get the string table */
+    const char *strtab = get_strtab(e); /* 获取字符串表。 */
     if (!strtab)
         return NULL;
 
-    /* get the symbol table */
+    /* 获取符号表。 */
     const struct Elf32_Shdr *shdr = get_section_header(e, ".symtab");
     if (!shdr)
         return NULL;
 
-    /* find symbol table range */
+    /* 计算符号表范围。 */
     const struct Elf32_Sym *sym =
         (const struct Elf32_Sym *) (e->raw_data + shdr->sh_offset);
     const struct Elf32_Sym *end =
         (const struct Elf32_Sym *) (e->raw_data + shdr->sh_offset +
                                     shdr->sh_size);
 
-    for (; sym < end; ++sym) { /* try to find the symbol */
+    for (; sym < end; ++sym) { /* 尝试查找目标符号。 */
         const char *sym_name = strtab + sym->st_name;
         if (!strcmp(name, sym_name))
             return sym;
     }
 
-    /* no symbol found */
+    /* 未找到符号。 */
     return NULL;
 }
 
 static void fill_symbols(elf_t *e)
 {
-    /* initialize the symbol table */
+    /* 初始化内部符号表。 */
     map_clear(e->symbols);
     map_insert(e->symbols, &(int) {0}, &(char *) {NULL});
 
-    /* get the string table */
+    /* 获取字符串表。 */
     const char *strtab = get_strtab(e);
     if (!strtab)
         return;
 
-    /* get the symbol table */
+    /* 获取符号表。 */
     const struct Elf32_Shdr *shdr = get_section_header(e, ".symtab");
     if (!shdr)
         return;
 
-    /* find symbol table range */
+    /* 计算符号表范围。 */
     const struct Elf32_Sym *sym =
         (const struct Elf32_Sym *) (e->raw_data + shdr->sh_offset);
     const struct Elf32_Sym *end =
         (const struct Elf32_Sym *) (e->raw_data + shdr->sh_offset +
                                     shdr->sh_size);
 
-    for (; sym < end; ++sym) { /* try to find the symbol */
+    for (; sym < end; ++sym) { /* 尝试收集符号。 */
         const char *sym_name = strtab + sym->st_name;
-        switch (ELF_ST_TYPE(sym->st_info)) { /* add to the symbol table */
+        switch (ELF_ST_TYPE(sym->st_info)) { /* 加入内部符号表。 */
         case STT_NOTYPE:
         case STT_OBJECT:
         case STT_FUNC:
@@ -241,44 +248,44 @@ bool elf_get_data_section_range(elf_t *e, uint32_t *start, uint32_t *end)
     return true;
 }
 
-/* A quick ELF briefer:
+/* ELF 快速结构说明：
  *    +--------------------------------+
- *    | ELF Header                     |--+
+ *    | ELF 头                         |--+
  *    +--------------------------------+  |
  *    | Program Header                 |  |
  *    +--------------------------------+  |
- * +->| Sections: .text, .strtab, etc. |  |
+ * +->| Sections: .text、.strtab 等    |  |
  * |  +--------------------------------+  |
  * +--| Section Headers                |<-+
  *    +--------------------------------+
  *
- * Finding the section header table (SHT):
- *   File start + ELF_header.shoff -> section_header table
- * Finding the string table for section header names:
- *   section_header table[ELF_header.shstrndx] -> section header for name table
- * Finding data for section headers:
- *   File start + section_header.offset -> section Data
+ * 查找 section header table（SHT）：
+ *   文件起点 + ELF_header.shoff -> section_header table。
+ * 查找 section header 名称字符串表：
+ *   section_header table[ELF_header.shstrndx] -> 名称表对应 section header。
+ * 查找 section 数据：
+ *   文件起点 + section_header.offset -> section 数据。
  */
 bool elf_load(elf_t *e, memory_t *mem)
 {
-    /* loop over all of the program headers */
+    /* 遍历所有 program header。 */
     for (int p = 0; p < e->hdr->e_phnum; ++p) {
-        /* find next program header */
+        /* 取得下一个 program header。 */
         uint32_t offset = e->hdr->e_phoff + (p * e->hdr->e_phentsize);
         const struct Elf32_Phdr *phdr =
             (const struct Elf32_Phdr *) (e->raw_data + offset);
 
-        /* check this section should be loaded */
+        /* 只装载 PT_LOAD 段。 */
         if (phdr->p_type != PT_LOAD)
             continue;
 
-        /* memcpy required range */
+        /* 复制文件中实际存在的字节范围。 */
         const int to_copy = min(phdr->p_memsz, phdr->p_filesz);
         if (to_copy && !memory_write(mem, phdr->p_vaddr,
                                      e->raw_data + phdr->p_offset, to_copy))
             return false;
 
-        /* zero fill required range */
+        /* 对 memsz 超过 filesz 的部分补零。 */
         const int to_zero = max(phdr->p_memsz, phdr->p_filesz) - to_copy;
         if (to_zero && !memory_fill(mem, phdr->p_vaddr + to_copy, to_zero, 0))
             return false;
@@ -289,7 +296,7 @@ bool elf_load(elf_t *e, memory_t *mem)
 
 bool elf_open(elf_t *e, const char *input)
 {
-    /* free previous memory */
+    /* 释放上一次打开的 ELF 数据。 */
     if (e->raw_data)
         release(e);
 
@@ -302,47 +309,46 @@ bool elf_open(elf_t *e, const char *input)
     if (fd < 0)
         goto free_path;
 
-    /* get file size */
+    /* 获取文件大小。 */
     struct stat st;
     fstat(fd, &st);
     e->raw_size = st.st_size;
 
-    /* map or unmap files or devices into memory.
-     * The beginning of the file is ELF header.
+    /* 把文件映射到内存；文件开头就是 ELF header。
      */
     e->raw_data = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (e->raw_data == MAP_FAILED)
         goto free_fd;
     close(fd);
 
-#else  /* fallback to standard I/O text stream */
+#else  /* 回退到标准 I/O 文件流。 */
     FILE *f = fopen(path, "rb");
     if (!f)
         goto free_path;
 
-    /* get file size */
+    /* 获取文件大小。 */
     fseek(f, 0, SEEK_END);
     e->raw_size = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (!e->raw_size)
         goto free_fd;
 
-    /* allocate memory */
+    /* 分配缓冲区。 */
     free(e->raw_data);
     e->raw_data = malloc(e->raw_size);
     assert(e->raw_data);
 
-    /* read data into memory */
+    /* 读取文件内容到内存。 */
     const size_t r = fread(e->raw_data, 1, e->raw_size, f);
     fclose(f);
     if (r != e->raw_size)
         goto free_path;
 #endif /* HAVE_MMAP */
 
-    /* point to the header */
+    /* 指向 ELF 文件头。 */
     e->hdr = (const struct Elf32_Ehdr *) e->raw_data;
 
-    /* check it is a valid ELF file */
+    /* 校验是否为有效 ELF 文件。 */
     if (!is_valid(e))
         goto free_path;
 

@@ -1,10 +1,17 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 断点表实现。
+ *
+ * GDB stub 需要按客体 PC 快速查找、插入和删除软件断点。本文件把通用 map
+ * 容器包装成 breakpoint_map_t，key 使用 RISC-V 地址，value 保存断点描述。
+ * 断点比较只关心地址，因此同一地址不会重复插入。
  */
 
 #if !RV32_HAS(GDBSTUB)
-#error "Do not manage to build this file unless you enable gdbstub support."
+#error "只有启用 gdbstub 支持时才能构建此文件。"
 #endif
 
 #include "breakpoint.h"
@@ -27,7 +34,7 @@ bool breakpoint_map_insert(breakpoint_map_t map, riscv_word_t addr)
     breakpoint_t bp = (breakpoint_t) {.addr = addr, .orig_insn = 0};
     map_iter_t it;
     map_find(map, &it, &addr);
-    /* breakpoints are not expected to be set at duplicate addresses */
+    /* 同一地址不应重复设置断点。 */
     if (!map_at_end(map, &it))
         return false;
 

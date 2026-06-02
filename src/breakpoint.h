@@ -3,6 +3,13 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * GDB stub 断点接口。
+ *
+ * 对外暴露断点 map 的创建、插入、查找、删除和销毁函数。实现隐藏在
+ * breakpoint.c 中，调用方只需要按 RISC-V 地址操作断点集合。
+ */
+
 #pragma once
 
 #include "map.h"

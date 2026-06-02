@@ -20,6 +20,13 @@
  * IN THE SOFTWARE.
  */
 
+/*
+ * 轻量日志接口。
+ *
+ * 对外提供日志级别、锁回调、静默模式、stdout 重定向和 log_impl 输出入口。
+ * rv_log_* 宏会在调用处记录文件名与行号，便于定位模拟器运行时错误。
+ */
+
 #pragma once
 
 #include <stdarg.h>
@@ -49,24 +56,23 @@ enum LOG_LEVEL {
     LOG_FATAL,
 };
 
-/* lowest level logging */
+/* 最低级别日志。 */
 #define rv_log_trace(...) log_impl(LOG_TRACE, __FILE__, __LINE__, __VA_ARGS__)
 #define rv_log_debug(...) log_impl(LOG_DEBUG, __FILE__, __LINE__, __VA_ARGS__)
 #define rv_log_info(...) log_impl(LOG_INFO, __FILE__, __LINE__, __VA_ARGS__)
 #define rv_log_warn(...) log_impl(LOG_WARN, __FILE__, __LINE__, __VA_ARGS__)
 #define rv_log_error(...) log_impl(LOG_ERROR, __FILE__, __LINE__, __VA_ARGS__)
 #define rv_log_fatal(...) log_impl(LOG_FATAL, __FILE__, __LINE__, __VA_ARGS__)
-/* highest level logging */
+/* 最高级别日志。 */
 
 #define rv_log_level_string(...) log_level_string(__VA_ARGS__)
 #define rv_log_set_lock(...) log_set_lock(__VA_ARGS__)
 #define rv_log_set_level(...) log_set_level(__VA_ARGS__)
 #define rv_log_set_quiet(...) log_set_quiet(__VA_ARGS__)
 /*
- * By default, log messages are directed to stdout. However,
- * rv_remap_stdstream() may redirect stdout to a different target, such as a
- * file. Therefore, rv_log_set_stdout_stream() should be invoked within
- * rv_remap_stdstream() to properly handle any changes to the stdout stream.
+ * 默认情况下日志写入 stdout。但 rv_remap_stdstream() 可能会把 stdout 重定向到
+ * 文件等其他目标，因此需要在 rv_remap_stdstream() 内调用
+ * rv_log_set_stdout_stream()，同步日志模块看到的输出流。
  */
 #define rv_log_set_stdout_stream(...) log_set_stdout_stream(__VA_ARGS__)
 

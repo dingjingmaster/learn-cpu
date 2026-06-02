@@ -1,6 +1,12 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 指令解码接口和 IR 定义。
+ *
+ * rv_insn_t 是解释器、JIT 和优化阶段共享的指令内部表示。这里定义 opcode 枚举、
+ * 字段掩码、压缩指令格式常量以及 rv_decode 入口。
  */
 
 #pragma once
@@ -29,13 +35,13 @@ enum op_field {
 #define ENC_GEN(X, A) ENCN(X, A)
 #define ENC(...) ENC_GEN(ENC, COUNT_VARARGS(__VA_ARGS__))(__VA_ARGS__)
 
-/* RISC-V instruction list in format _(instruction-name, can-branch, insn_len,
- *                                     translatable, reg-mask)
+/* RISC-V 指令清单，格式为：
+ * _(指令名, 是否可能分支, 指令长度, 是否可翻译为快速路径, 使用的寄存器掩码)
  */
 /* clang-format off */
 #define RV_INSN_LIST                                   \
     _(nop, 0, 4, 1, ENC(rs1, rd))                      \
-    /* RV32I Base Instruction Set */                   \
+    /* RV32I 基础指令集。 */                           \
     _(lui, 0, 4, 1, ENC(rd))                           \
     _(auipc, 0, 4, 1, ENC(rd))                         \
     _(jal, 1, 4, 1, ENC(rd))                           \
@@ -76,7 +82,7 @@ enum op_field {
     _(fence, 1, 4, 0, ENC(rs1, rd))                    \
     _(ecall, 1, 4, 1, ENC(rs1, rd))                    \
     _(ebreak, 1, 4, 1, ENC(rs1, rd))                   \
-    /* RISC-V Privileged Instruction */                \
+    /* RISC-V 特权指令。 */                            \
     _(wfi, 0, 4, 0, ENC(rs1, rd))                      \
     _(uret, 0, 4, 0, ENC(rs1, rd))                     \
     IIF(RV32_HAS(SYSTEM))(                             \
@@ -85,11 +91,11 @@ enum op_field {
     _(hret, 0, 4, 0, ENC(rs1, rd))                     \
     _(mret, 1, 4, 0, ENC(rs1, rd))                     \
     _(sfencevma, 1, 4, 0, ENC(rs1, rs2, rd))           \
-    /* RV32 Zifencei Standard Extension */             \
+    /* RV32 Zifencei 标准扩展。 */                     \
     IIF(RV32_HAS(Zifencei))(                           \
         _(fencei, 1, 4, 0, ENC(rs1, rd))               \
     )                                                  \
-    /* RV32 Zicsr Standard Extension */                \
+    /* RV32 Zicsr 标准扩展。 */                        \
     IIF(RV32_HAS(Zicsr))(                              \
         _(csrrw, 1, 4, 0, ENC(rs1, rd))                \
         _(csrrs, 0, 4, 0, ENC(rs1, rd))                \
@@ -98,13 +104,13 @@ enum op_field {
         _(csrrsi, 0, 4, 0, ENC(rs1, rd))               \
         _(csrrci, 0, 4, 0, ENC(rs1, rd))               \
     )                                                  \
-    /* RV32 Zba Standard Extension */                  \
+    /* RV32 Zba 标准扩展。 */                          \
     IIF(RV32_HAS(Zba))(                                \
         _(sh1add, 0, 4, 0, ENC(rs1, rs2, rd))          \
         _(sh2add, 0, 4, 0, ENC(rs1, rs2, rd))          \
         _(sh3add, 0, 4, 0, ENC(rs1, rs2, rd))          \
     )                                                  \
-    /* RV32 Zbb Standard Extension */                  \
+    /* RV32 Zbb 标准扩展。 */                          \
     IIF(RV32_HAS(Zbb))(                                \
         _(andn, 0, 4, 0, ENC(rs1, rs2, rd))            \
         _(orn, 0, 4, 0, ENC(rs1, rs2, rd))             \
@@ -125,13 +131,13 @@ enum op_field {
         _(orcb, 0, 4, 0, ENC(rs1, rd))                 \
         _(rev8, 0, 4, 0, ENC(rs1, rd))                 \
     )                                                  \
-     /* RV32 Zbc Standard Extension */                 \
+     /* RV32 Zbc 标准扩展。 */                         \
     IIF(RV32_HAS(Zbc))(                                \
         _(clmul, 0, 4, 0, ENC(rs1, rs2, rd))           \
         _(clmulh, 0, 4, 0, ENC(rs1, rs2, rd))          \
         _(clmulr, 0, 4, 0, ENC(rs1, rs2, rd))          \
     )                                                  \
-    /* RV32 Zbs Standard Extension */                  \
+    /* RV32 Zbs 标准扩展。 */                          \
     IIF(RV32_HAS(Zbs))(                                \
         _(bclr, 0, 4, 0, ENC(rs1, rs2, rd))            \
         _(bclri, 0, 4, 0, ENC(rs1, rs2, rd))           \
@@ -142,7 +148,7 @@ enum op_field {
         _(bset, 0, 4, 0, ENC(rs1, rs2, rd))            \
         _(bseti, 0, 4, 0, ENC(rs1, rs2, rd))           \
     )                                                  \
-    /* RV32M Standard Extension */                     \
+    /* RV32M 标准扩展。 */                             \
     IIF(RV32_HAS(EXT_M))(                              \
         _(mul, 0, 4, 1, ENC(rs1, rs2, rd))             \
         _(mulh, 0, 4, 1, ENC(rs1, rs2, rd))            \
@@ -153,7 +159,7 @@ enum op_field {
         _(rem, 0, 4, 1, ENC(rs1, rs2, rd))             \
         _(remu, 0, 4, 1, ENC(rs1, rs2, rd))            \
     )                                                  \
-    /* RV32A Standard Extension */                     \
+    /* RV32A 标准扩展。 */                             \
     IIF(RV32_HAS(EXT_A))(                              \
         _(lrw, 0, 4, 0, ENC(rs1, rs2, rd))             \
         _(scw, 0, 4, 0, ENC(rs1, rs2, rd))             \
@@ -167,7 +173,7 @@ enum op_field {
         _(amominuw, 0, 4, 0, ENC(rs1, rs2, rd))        \
         _(amomaxuw, 0, 4, 0, ENC(rs1, rs2, rd))        \
     )                                                  \
-    /* RV32F Standard Extension */                     \
+    /* RV32F 标准扩展。 */                             \
     IIF(RV32_HAS(EXT_F))(                              \
         _(flw, 0, 4, 0, ENC(rs1, rd))                  \
         _(fsw, 0, 4, 0, ENC(rs1, rs2))                 \
@@ -196,7 +202,7 @@ enum op_field {
         _(fcvtswu, 0, 4, 0, ENC(rs1, rs2, rd))         \
         _(fmvwx, 0, 4, 0, ENC(rs1, rs2, rd))           \
     )                                                  \
-    /* RV32C Standard Extension */                     \
+    /* RV32C 标准扩展。 */                             \
     IIF(RV32_HAS(EXT_C))(                              \
         _(caddi4spn, 0, 2, 1, ENC(rd))                 \
         _(clw, 0, 2, 1, ENC(rs1, rd))                  \
@@ -225,7 +231,7 @@ enum op_field {
         _(cjalr, 1, 2, 1, ENC(rs1, rs2, rd))           \
         _(cadd, 0, 2, 1, ENC(rs1, rs2, rd))            \
         _(cswsp, 0, 2, 1, ENC(rs2))                    \
-        /* RV32FC Instruction */                       \
+        /* RV32FC 指令。 */                            \
         IIF(RV32_HAS(EXT_F))(                          \
             _(cflwsp, 0, 2, 1, ENC(rd))                \
             _(cfswsp, 0, 2, 1, ENC(rs2))               \
@@ -235,11 +241,9 @@ enum op_field {
     )
 /* clang-format on */
 
-/* Macro operation fusion */
+/* 宏操作融合。 */
 
-/* macro operation fusion: convert specific RISC-V instruction patterns
- * into faster and equivalent code
- */
+/* 宏操作融合会把特定 RISC-V 指令序列转换为语义等价但更快的内部操作。 */
 #define FUSE_INSN_LIST \
     _(fuse1)           \
     _(fuse2)           \
@@ -254,25 +258,23 @@ enum op_field {
     _(fuse11)          \
     _(fuse12)
 
-/* Fusion pattern descriptions:
- * fuse1:  Multiple LUI              - Batch upper immediate loads
- * fuse2:  LUI + ADD                 - Upper immediate + register add
- * fuse3:  Multiple SW               - Batch stores
- * fuse4:  Multiple LW               - Batch loads
- * fuse5:  Multiple shift-imm        - Batch SLLI/SRLI/SRAI
- * fuse6:  LI a7 + ECALL             - Syscall dispatch
- * fuse7:  Multiple ADDI             - Batch immediate adds
- * fuse8:  LUI + ADDI                - 32-bit constant load (li)
- * fuse9:  LUI + LW                  - Absolute/PC-relative load
- * fuse10: LUI + SW                  - Absolute/PC-relative store
- * fuse11: LW + ADDI (post-inc)      - Load with pointer increment
- * fuse12: ADDI + BNE                - Loop counter decrement-branch
+/* 融合模式说明：
+ * fuse1:  多条 LUI                  - 批量加载高位立即数。
+ * fuse2:  LUI + ADD                 - 高位立即数加寄存器。
+ * fuse3:  多条 SW                   - 批量存储。
+ * fuse4:  多条 LW                   - 批量加载。
+ * fuse5:  多条移位立即数指令        - 批量处理 SLLI/SRLI/SRAI。
+ * fuse6:  LI a7 + ECALL             - 系统调用分派。
+ * fuse7:  多条 ADDI                 - 批量立即数加法。
+ * fuse8:  LUI + ADDI                - 32 位常量加载（li）。
+ * fuse9:  LUI + LW                  - 绝对地址或 PC 相对加载。
+ * fuse10: LUI + SW                  - 绝对地址或 PC 相对存储。
+ * fuse11: LW + ADDI（post-inc）     - 加载后递增指针。
+ * fuse12: ADDI + BNE                - 循环计数递减并分支。
  */
 
 /* clang-format off */
-/* IR (intermediate representation) is exclusively represented by RISC-V
- * instructions, yet it is executed at a lower cost.
- */
+/* IR（中间表示）仍以 RISC-V 指令形式表达，但执行成本更低。 */
 enum {
 #define _(inst, can_branch, insn_len, translatable, reg_mask) rv_insn_##inst,
     RV_INSN_LIST
@@ -285,39 +287,39 @@ enum {
 /* clang-format on */
 
 /* clang-format off */
-/* instruction decode masks */
+/* 指令解码掩码。 */
 enum {
     //               ....xxxx....xxxx....xxxx....xxxx
     INSN_6_2     = 0b00000000000000000000000001111100,
     //               ....xxxx....xxxx....xxxx....xxxx
-    FR_OPCODE    = 0b00000000000000000000000001111111, // R-type
+    FR_OPCODE    = 0b00000000000000000000000001111111, // R 型
     FR_RD        = 0b00000000000000000000111110000000,
     FR_FUNCT3    = 0b00000000000000000111000000000000,
     FR_RS1       = 0b00000000000011111000000000000000,
     FR_RS2       = 0b00000001111100000000000000000000,
     FR_FUNCT7    = 0b11111110000000000000000000000000,
     //               ....xxxx....xxxx....xxxx....xxxx
-    FI_IMM_11_0  = 0b11111111111100000000000000000000, // I-type
+    FI_IMM_11_0  = 0b11111111111100000000000000000000, // I 型
     //               ....xxxx....xxxx....xxxx....xxxx
-    FS_IMM_4_0   = 0b00000000000000000000111110000000, // S-type
+    FS_IMM_4_0   = 0b00000000000000000000111110000000, // S 型
     FS_IMM_11_5  = 0b11111110000000000000000000000000,
     //               ....xxxx....xxxx....xxxx....xxxx
-    FB_IMM_11    = 0b00000000000000000000000010000000, // B-type
+    FB_IMM_11    = 0b00000000000000000000000010000000, // B 型
     FB_IMM_4_1   = 0b00000000000000000000111100000000,
     FB_IMM_10_5  = 0b01111110000000000000000000000000,
     FB_IMM_12    = 0b10000000000000000000000000000000,
     //               ....xxxx....xxxx....xxxx....xxxx
-    FU_IMM_31_12 = 0b11111111111111111111000000000000, // U-type
+    FU_IMM_31_12 = 0b11111111111111111111000000000000, // U 型
     //               ....xxxx....xxxx....xxxx....xxxx
-    FJ_IMM_19_12 = 0b00000000000011111111000000000000, // J-type
+    FJ_IMM_19_12 = 0b00000000000011111111000000000000, // J 型
     FJ_IMM_11    = 0b00000000000100000000000000000000,
     FJ_IMM_10_1  = 0b01111111111000000000000000000000,
     FJ_IMM_20    = 0b10000000000000000000000000000000,
     //               ....xxxx....xxxx....xxxx....xxxx
-    FR4_FMT      = 0b00000110000000000000000000000000, // R4-type
+    FR4_FMT      = 0b00000110000000000000000000000000, // R4 型
     FR4_RS3      = 0b11111000000000000000000000000000,
     //               ....xxxx....xxxx....xxxx....xxxx
-    FC_OPCODE    = 0b00000000000000000000000000000011, // compressed-instruction
+    FC_OPCODE    = 0b00000000000000000000000000000011, // 压缩指令
     FC_FUNC3     = 0b00000000000000001110000000000000,
     //               ....xxxx....xxxx....xxxx....xxxx
     FC_RS1C      = 0b00000000000000000000001110000000,
@@ -341,9 +343,9 @@ enum {
 };
 /* clang-format on */
 
-/* Fused instruction data - must match first 8 bytes of rv_insn_t layout.
- * This structure is used in fuse arrays and handlers access fields directly.
- * WARNING: Never cast opcode_fuse_t* to rv_insn_t* - use dedicated functions.
+/* 融合指令数据必须与 rv_insn_t 布局的前 8 字节完全一致。
+ * fuse 数组和处理器会直接访问这些字段。
+ * 警告：不要把 opcode_fuse_t* 强转为 rv_insn_t*，应使用专门函数。
  */
 typedef struct {
     int32_t imm;
@@ -351,42 +353,41 @@ typedef struct {
     uint8_t opcode;
 } opcode_fuse_t;
 
-/* Compile-time layout verification */
+/* 编译期布局校验。 */
 _Static_assert(sizeof(opcode_fuse_t) == 8,
-               "opcode_fuse_t must be exactly 8 bytes");
+               "opcode_fuse_t 必须正好为 8 字节");
 _Static_assert(offsetof(opcode_fuse_t, imm) == 0,
-               "opcode_fuse_t.imm must be at offset 0");
+               "opcode_fuse_t.imm 必须位于偏移 0");
 _Static_assert(offsetof(opcode_fuse_t, rd) == 4,
-               "opcode_fuse_t.rd must be at offset 4");
+               "opcode_fuse_t.rd 必须位于偏移 4");
 _Static_assert(offsetof(opcode_fuse_t, rs1) == 5,
-               "opcode_fuse_t.rs1 must be at offset 5");
+               "opcode_fuse_t.rs1 必须位于偏移 5");
 _Static_assert(offsetof(opcode_fuse_t, rs2) == 6,
-               "opcode_fuse_t.rs2 must be at offset 6");
+               "opcode_fuse_t.rs2 必须位于偏移 6");
 _Static_assert(offsetof(opcode_fuse_t, opcode) == 7,
-               "opcode_fuse_t.opcode must be at offset 7");
+               "opcode_fuse_t.opcode 必须位于偏移 7");
 
 #define HISTORY_SIZE 16
-/* Direct-mapped BHT requires power-of-2 size for mask calculation */
+/* 直接映射 BHT 需要 2 的幂大小，便于用掩码计算索引。 */
 _Static_assert((HISTORY_SIZE & (HISTORY_SIZE - 1)) == 0,
-               "HISTORY_SIZE must be a power of 2");
+               "HISTORY_SIZE 必须是 2 的幂");
 
 typedef struct {
-    uint32_t PC[HISTORY_SIZE]; /**< PC tags for direct-mapped lookup */
+    uint32_t PC[HISTORY_SIZE]; /**< 直接映射查找使用的 PC 标签。 */
 #if !RV32_HAS(JIT)
-    struct rv_insn *target[HISTORY_SIZE]; /**< target IR pointers */
+    struct rv_insn *target[HISTORY_SIZE]; /**< 目标 IR 指针。 */
 #else
-    uint32_t times[HISTORY_SIZE]; /**< access counts for JIT hotness */
+    uint32_t times[HISTORY_SIZE]; /**< 用于 JIT 热度判断的访问次数。 */
 #if RV32_HAS(SYSTEM)
-    uint32_t satp[HISTORY_SIZE]; /**< SATP for address space matching */
+    uint32_t satp[HISTORY_SIZE]; /**< 用于地址空间匹配的 SATP。 */
 #endif
 #endif
 } branch_history_table_t;
 
 #if RV32_HAS(JIT)
-/* Find index with maximum times count in branch history table.
- * Used by JIT to identify the most frequently taken indirect jump target.
- * Note: With direct-mapped BHT, zeros can appear at any index, so we must
- * scan all entries (cannot break early on first zero).
+/* 在分支历史表中找到 times 最大的索引。
+ * JIT 使用它识别最常被采用的间接跳转目标。直接映射 BHT 中任意索引都可能为 0，
+ * 因此必须扫描所有条目，不能在遇到第一个 0 时提前停止。
  */
 static inline int bht_find_max_idx(const branch_history_table_t *bt)
 {
@@ -406,7 +407,7 @@ typedef struct rv_insn {
         uint8_t rs3;
     };
     uint8_t rd, rs1, rs2;
-    /* store IR list */
+    /* 保存 IR 操作码。 */
     uint8_t opcode;
 
 #if RV32_HAS(EXT_C)
@@ -414,36 +415,26 @@ typedef struct rv_insn {
 #endif
 
 #if RV32_HAS(EXT_F)
-    /* Floating-point operations use either a static rounding mode encoded in
-     * the instruction, or a dynamic rounding mode held in frm. A value of 111
-     * in the instruction’s rm field selects the dynamic rounding mode held in
-     * frm. If frm is set to an invalid value (101–111), any subsequent attempt
-     * to execute a floating-point operation with a dynamic rounding mode will
-     * cause an illegal instruction trap. Some instructions that have the rm
-     * field are nevertheless unaffected by the rounding mode; they should have
-     * their rm field set to RNE (000).
+    /* 浮点操作可以使用指令编码中的静态舍入模式，也可以使用 frm 中的动态舍入
+     * 模式。指令 rm 字段为 111 时选择 frm；如果 frm 为非法值（101-111），后续
+     * 任何使用动态舍入模式的浮点操作都会触发非法指令异常。有些带 rm 字段的
+     * 指令实际不受舍入模式影响，它们应把 rm 设为 RNE（000）。
      */
     uint8_t rm;
 #endif
 
-    /* fuse operation */
+    /* 融合操作附加数据。 */
     int32_t imm2;
     opcode_fuse_t *fuse;
 
     uint32_t pc;
 
-    /* Tail-call optimization (TCO) allows a C function to replace a function
-     * call to another function or itself, followed by a simple return of the
-     * function's result, with a direct jump to the target function. This
-     * optimization enables the self-recursive function to reuse the same
-     * function stack frame.
+    /* 尾调用优化（TCO）允许 C 函数把“调用另一个函数或自身并立即返回其结果”的
+     * 模式替换为直接跳转到目标函数。这样自递归函数就能复用同一栈帧。
      *
-     * The @next member indicates the next IR or is NULL if it is the final
-     * instruction in a basic block. The @impl member facilitates the direct
-     * invocation of the next instruction emulation without the need to compute
-     * the jump address. By utilizing these two members, all instruction
-     * emulations can be rewritten into a self-recursive version, enabling the
-     * compiler to leverage TCO.
+     * @next 指向下一条 IR；如果当前指令是基本块最后一条则为 NULL。@impl 保存
+     * 下一条指令的模拟函数入口，避免运行时再计算跳转地址。借助这两个成员，指令
+     * 模拟函数可以写成自递归形式，让编译器利用 TCO。
      */
     struct rv_insn *next;
     PRESERVE_NONE bool (*impl)(riscv_t *,
@@ -451,16 +442,13 @@ typedef struct rv_insn {
                                uint64_t,
                                uint32_t);
 
-    /* Two pointers, 'branch_taken' and 'branch_untaken', are employed to
-     * avoid the overhead associated with aggressive memory copying. Instead
-     * of copying the entire IR array, these pointers indicate the first IR
-     * of the first basic block in the path of the taken and untaken branches.
-     * This allows for direct jumping to the specific IR array without the
-     * need for additional copying.
+    /* branch_taken 和 branch_untaken 用来避免频繁复制整段 IR 数组。它们分别指向
+     * 分支命中路径和未命中路径中第一个基本块的第一条 IR，使解释器/JIT 可以直接
+     * 跳到对应 IR 数组。
      */
     struct rv_insn *branch_taken, *branch_untaken;
     branch_history_table_t *branch_table;
 } rv_insn_t;
 
-/* decode the RISC-V instruction */
+/* 解码一条 RISC-V 指令。 */
 bool rv_decode(rv_insn_t *ir, const uint32_t insn);

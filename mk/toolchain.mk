@@ -1,16 +1,16 @@
-# Compiler and toolchain detection with Kconfig integration
+# 编译器和工具链探测，并与 Kconfig 集成
 #
-# This file detects the compiler type and sets up appropriate flags.
-# Works with Kconfig-based configuration via CONFIG_* variables.
+# 本文件探测编译器类型，并设置相应编译/链接参数。
+# 通过 CONFIG_* 变量与 Kconfig 配置协同工作。
 
 ifndef _MK_TOOLCHAIN_INCLUDED
 _MK_TOOLCHAIN_INCLUDED := 1
 
-# Cross-compilation support
-# Note: CROSS_COMPILE is auto-detected below if not provided by user
+# 交叉编译支持。
+# 如果用户未提供 CROSS_COMPILE，下方会自动探测。
 SYSROOT ?=
 
-# Platform Detection
+# 平台探测。
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
@@ -31,20 +31,20 @@ else
     HOST_PLATFORM := unknown
 endif
 
-# Compiler Detection
+# 编译器探测。
 
-# WebAssembly build: override CC to emcc when BUILD_WASM is enabled via Kconfig
+# WebAssembly 构建：当 Kconfig 启用 BUILD_WASM 时强制使用 emcc。
 ifeq ($(CONFIG_BUILD_WASM),y)
     CC     := emcc
 endif
 
-# Set defaults
+# 默认工具。
 CC      ?= cc
 AR      ?= ar
 RANLIB  ?= ranlib
 STRIP   ?= strip
 
-# Apply cross-compile prefix
+# 应用交叉编译前缀。
 ifneq ($(CROSS_COMPILE),)
     ifeq ($(origin CC),default)
         CC      := $(CROSS_COMPILE)$(CC)
@@ -54,44 +54,44 @@ ifneq ($(CROSS_COMPILE),)
     endif
 endif
 
-# Host toolchain for build-time tools
+# 构建期工具使用的宿主工具链。
 HOSTCC  ?= cc
 HOSTAR  ?= ar
 
-# Detect compiler type from version string (cached to avoid repeated shell calls)
+# 从版本字符串探测编译器类型，并缓存输出以避免重复 shell 调用。
 CC_VERSION_OUTPUT := $(shell $(CC) --version 2>&1)
 
 CC_IS_EMCC  := $(if $(findstring emcc,$(CC_VERSION_OUTPUT)),1,)
 CC_IS_CLANG := $(if $(and $(findstring clang,$(CC_VERSION_OUTPUT)),$(if $(CC_IS_EMCC),,1)),1,)
 CC_IS_GCC   := $(if $(and $(findstring Free Software Foundation,$(CC_VERSION_OUTPUT)),$(if $(CC_IS_EMCC)$(CC_IS_CLANG),,1)),1,)
 
-# Verify supported compiler
+# 校验是否为受支持编译器。
 ifeq ("$(CC_IS_CLANG)$(CC_IS_GCC)$(CC_IS_EMCC)", "")
-$(error Unsupported compiler. Only GCC, Clang, and Emscripten are supported.)
+$(error 不支持当前编译器。仅支持 GCC、Clang 和 Emscripten。)
 endif
 
-# Consistency check: warn if CONFIG_BUILD_WASM but CC is not emcc
+# 一致性检查：CONFIG_BUILD_WASM 已启用但 CC 不是 emcc 时给出警告。
 ifeq ($(CONFIG_BUILD_WASM),y)
     ifneq ($(CC_IS_EMCC),1)
-        $(warning [Config Mismatch] CONFIG_BUILD_WASM is enabled, but CC is not Emscripten.)
-        $(warning Current compiler: $(CC). Run 'make defconfig' to reset or check your CC override.)
+        $(warning [配置不一致] CONFIG_BUILD_WASM 已启用，但 CC 不是 Emscripten。)
+        $(warning 当前编译器：$(CC)。请运行 'make defconfig' 重置，或检查 CC 覆盖设置。)
     endif
 endif
 
-# Emscripten version detection (reuses cached CC_VERSION_OUTPUT)
+# Emscripten 版本探测，复用已缓存的 CC_VERSION_OUTPUT。
 ifeq ("$(CC_IS_EMCC)", "1")
     EMCC_VERSION := $(word 10,$(CC_VERSION_OUTPUT))
     EMCC_MAJOR := $(word 1,$(subst ., ,$(EMCC_VERSION)))
     EMCC_MINOR := $(word 2,$(subst ., ,$(EMCC_VERSION)))
     EMCC_PATCH := $(word 3,$(subst ., ,$(EMCC_VERSION)))
 
-    # Override toolchain for Emscripten
+    # Emscripten 构建使用配套工具。
     AR     := emar
     RANLIB := emranlib
     STRIP  := emstrip
 endif
 
-# RISC-V Cross-Compiler Detection
+# RISC-V 交叉编译器探测。
 
 TOOLCHAIN_LIST := riscv-none-elf- \
                   riscv32-unknown-elf- \
@@ -105,25 +105,25 @@ $(shell which $(1)gcc >/dev/null 2>&1 && \
         echo "$(1) ")
 endef
 
-# Auto-detect RISC-V toolchain if not provided by user
+# 用户未提供 CROSS_COMPILE 时自动探测 RISC-V 工具链。
 ifeq ($(CROSS_COMPILE),)
     CROSS_COMPILE := $(word 1,$(foreach prefix,$(TOOLCHAIN_LIST),$(call check-cross-tools,$(prefix))))
 endif
 export CROSS_COMPILE
 
-# CET Protection Flags (reuses UNAME_M from platform detection)
+# CET 保护相关编译参数，复用平台探测得到的 UNAME_M。
 
 CFLAGS_NO_CET :=
 ifeq ($(UNAME_M),$(filter $(UNAME_M),i386 x86_64))
-    # Disable Intel's Control-flow Enforcement Technology for JIT
+    # JIT 需要关闭 Intel Control-flow Enforcement Technology。
     CFLAGS_NO_CET := -fcf-protection=none
 endif
 
-# macOS Linker Compatibility
+# macOS 链接器兼容处理。
 
 ifeq ($(UNAME_S),Darwin)
     ifneq ("$(CC_IS_CLANG)$(CC_IS_GCC)", "")
-        # Xcode 15+ warns about duplicate -l options
+        # Xcode 15+ 会对重复 -l 选项给出警告。
         LD_VERSION := $(shell ld -version_details 2>/dev/null | head -n 1)
         ifneq ($(shell echo "$(LD_VERSION)" | grep -E "(15|16|17|18|19|[2-9][0-9])\.[0-9]"),)
             LDFLAGS += -Wl,-no_warn_duplicate_libraries
@@ -131,12 +131,12 @@ ifeq ($(UNAME_S),Darwin)
     endif
 endif
 
-# Kconfig-derived build flags
+# 从 Kconfig 推导编译/链接参数。
 
 KCONFIG_CFLAGS :=
 KCONFIG_LDFLAGS :=
 
-# Optimization level
+# 优化级别。
 ifeq ($(CONFIG_OPTIMIZE_SIZE),y)
     KCONFIG_CFLAGS += -Os
 else
@@ -144,16 +144,16 @@ else
     KCONFIG_CFLAGS += $(OPT_LEVEL)
 endif
 
-# Debug symbols
+# 调试符号。
 ifeq ($(CONFIG_DEBUG_SYMBOLS),y)
     KCONFIG_CFLAGS += -g
 endif
 
-# Link-time optimization
+# 链接时优化。
 ifeq ($(CONFIG_LTO),y)
     ifeq ("$(CC_IS_EMCC)", "1")
         ifeq ($(CONFIG_SDL),y)
-            $(warning LTO is not supported for SDL builds with Emscripten)
+            $(warning Emscripten 的 SDL 构建不支持 LTO。)
         else
             KCONFIG_CFLAGS += -flto
             KCONFIG_LDFLAGS += -flto
@@ -167,50 +167,51 @@ ifeq ($(CONFIG_LTO),y)
     endif
 endif
 
-# Undefined behavior sanitizer
+# 未定义行为检测器。
 ifeq ($(CONFIG_UBSAN),y)
     KCONFIG_CFLAGS += -fsanitize=undefined -fno-sanitize=alignment -fno-sanitize-recover=all
     KCONFIG_LDFLAGS += -fsanitize=undefined -fno-sanitize=alignment -fno-sanitize-recover=all
 endif
 
-# Sysroot support
+# sysroot 支持。
 ifneq ($(SYSROOT),)
     KCONFIG_CFLAGS += --sysroot=$(SYSROOT)
     KCONFIG_LDFLAGS += --sysroot=$(SYSROOT)
 endif
 
-# LLVM Detection for T2C (Tier-2 Compiler)
+# T2C（二级编译器）的 LLVM 探测。
 #
-# Supports LLVM 18-21. Detection is deferred until CONFIG_T2C is enabled
-# to avoid expensive shell calls in most builds.
+# 支持 LLVM 18 到 21。探测会延后到 CONFIG_T2C 启用后，
+# 避免普通构建中执行昂贵的 shell 调用。
 #
-# User can override: make LLVM_CONFIG=/path/to/llvm-config
+# 用户可通过 `make LLVM_CONFIG=/path/to/llvm-config` 覆盖。
 
-# Supported LLVM version range
+# 支持的 LLVM 版本范围。
 LLVM_MIN_VERSION := 18
 LLVM_MAX_VERSION := 21
 
-# Check if a versioned llvm-config exists in PATH
-# Usage: $(call llvm-config-path,VERSION)
+# 检查 PATH 中是否存在带版本号的 llvm-config。
+# 用法：$(call llvm-config-path,VERSION)
 define llvm-config-path
 $(shell which llvm-config-$(1) 2>/dev/null)
 endef
 
-# Check if Homebrew LLVM version exists
-# Usage: $(call llvm-homebrew-config,VERSION)
+# 检查 Homebrew 是否安装了指定版本 LLVM。
+# 用法：$(call llvm-homebrew-config,VERSION)
 define llvm-homebrew-config
 $(shell brew --prefix llvm@$(1) 2>/dev/null | xargs -I{} sh -c 'test -x {}/bin/llvm-config && echo {}/bin/llvm-config' 2>/dev/null)
 endef
 
-# Check generic llvm-config with version validation
-# Usage: $(call llvm-config-generic,MIN,MAX)
+# 检查通用 llvm-config，并校验版本范围。
+# 用法：$(call llvm-config-generic,MIN,MAX)
 define llvm-config-generic
 $(shell which llvm-config 2>/dev/null | xargs -I{} sh -c 'ver=$$({} --version 2>/dev/null | cut -d. -f1); [ "$$ver" -ge $(1) ] && [ "$$ver" -le $(2) ] && echo {}' 2>/dev/null)
 endef
 
-# Auto-detect LLVM configuration
-# Priority: versioned binaries (18-21), Homebrew versioned, Homebrew generic, generic with version check
-# Note: Prefers oldest supported version (18) for stability; override with LLVM_CONFIG= for newer
+# 自动探测 LLVM 配置。
+# 优先级：带版本号二进制（18-21）、Homebrew 版本化安装、
+# Homebrew 通用安装、最后是带版本校验的通用 llvm-config。
+# 为稳定性优先选择最老的受支持版本 18；需要更新版本时可设置 LLVM_CONFIG。
 define detect-llvm-config
 $(strip $(or \
     $(call llvm-config-path,18),\
@@ -225,7 +226,7 @@ $(strip $(or \
     $(call llvm-config-generic,$(LLVM_MIN_VERSION),$(LLVM_MAX_VERSION))))
 endef
 
-# Detect Homebrew LLVM prefix for library path
+# 探测 Homebrew LLVM 前缀，用于补充库搜索路径。
 define detect-homebrew-llvm-prefix
 $(strip $(or \
     $(shell which brew >/dev/null 2>&1 && brew --prefix llvm@18 2>/dev/null),\
@@ -235,33 +236,33 @@ $(strip $(or \
     $(shell which brew >/dev/null 2>&1 && brew --prefix llvm 2>/dev/null)))
 endef
 
-# Get LLVM version major number
-# Usage: $(call llvm-version,LLVM_CONFIG_PATH)
+# 获取 LLVM 主版本号。
+# 用法：$(call llvm-version,LLVM_CONFIG_PATH)
 define llvm-version
 $(shell $(1) --version 2>/dev/null | cut -d. -f1)
 endef
 
-# Check if LLVM libraries are available
-# Usage: $(call llvm-check-libs,LLVM_CONFIG_PATH)
-# Returns: "0" (string) on success, non-zero string on failure
-# Example: ifeq ($(call llvm-check-libs,$(LLVM_CONFIG)),0)
+# 检查 LLVM 库是否可用。
+# 用法：$(call llvm-check-libs,LLVM_CONFIG_PATH)
+# 成功返回字符串 "0"，失败返回非零字符串。
+# 示例：ifeq ($(call llvm-check-libs,$(LLVM_CONFIG)),0)
 define llvm-check-libs
 $(shell $(1) --libs 2>/dev/null 1>&2; echo $$?)
 endef
 
-# Get LLVM compiler flags
-# Usage: $(call llvm-cflags,LLVM_CONFIG_PATH)
+# 获取 LLVM 编译参数。
+# 用法：$(call llvm-cflags,LLVM_CONFIG_PATH)
 define llvm-cflags
 $(shell $(1) --cflags 2>/dev/null)
 endef
 
-# Get LLVM library files for linking
-# Usage: $(call llvm-libfiles,LLVM_CONFIG_PATH)
+# 获取 LLVM 链接库文件列表。
+# 用法：$(call llvm-libfiles,LLVM_CONFIG_PATH)
 define llvm-libfiles
 $(shell $(1) --libfiles 2>/dev/null)
 endef
 
-# Version Comparison Utilities
+# 版本比较工具。
 
 version_num = $(shell printf "%d%03d%03d" $(1) $(2) $(3) 2>/dev/null || echo 0)
 version_eq = $(shell echo "$$(($(call version_num,$(1),$(2),$(3)) == $(call version_num,$(4),$(5),$(6))))")

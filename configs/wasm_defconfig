@@ -1,4 +1,4 @@
-# WebAssembly build with Emscripten
+# 使用 Emscripten 的 WebAssembly 构建配置
 CONFIG_BUILD_WASM=y
 # CONFIG_LTO is not set
 CONFIG_OPTIMIZE_LEVEL=3

@@ -3,8 +3,16 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * GDB 远程调试适配层。
+ *
+ * mini-gdbstub 通过 target_ops 回调读写寄存器、内存、单步执行和管理断点。
+ * 本文件把这些回调映射到 riscv_t 状态与 breakpoint_map_t，使外部 GDB 可以
+ * 通过 target remote 调试客体 RISC-V 程序。
+ */
+
 #if !RV32_HAS(GDBSTUB)
-#error "Do not manage to build this file unless you enable gdbstub support."
+#error "只有启用 gdbstub 支持时才能构建此文件。"
 #endif
 
 #include <assert.h>
@@ -56,9 +64,8 @@ static int rv_read_mem(void *args, size_t addr, size_t len, void *val)
 
     int err = 0;
     for (size_t i = 0; i < len; i++) {
-        /* FIXME: This is implemented as a simple workaround for reading
-         * an invalid address. We may have to do error handling in the
-         * mem_read_* function directly.
+        /* FIXME：这里用简单回退方式处理无效地址读取。
+         * 后续可能需要直接在 mem_read_* 函数中做错误处理。
          */
         *((uint8_t *) val + i) = rv->io.mem_read_b(rv, addr + i);
     }
@@ -93,7 +100,7 @@ static gdb_action_t rv_cont(void *args)
         rv_step_debug(rv);
     }
 
-    /* Clear the interrupt if it's pending */
+    /* 若中断处于 pending 状态，则清除它。 */
     ATOMIC_STORE(&rv->is_interrupted, false, ATOMIC_RELAXED);
 
     return ACT_RESUME;
@@ -123,7 +130,7 @@ static bool rv_del_bp(void *args, size_t addr, bp_type_t type)
     if (type != BP_SOFTWARE)
         return false;
 
-    /* When there is no matched breakpoint, no further action is taken */
+    /* 没有匹配断点时，不执行额外动作。 */
     breakpoint_map_del(rv->breakpoint_map, addr);
     return true;
 }
@@ -132,7 +139,7 @@ static void rv_on_interrupt(void *args)
 {
     riscv_t *rv = (riscv_t *) args;
 
-    /* Notify the emulator to break out the for loop in rv_cont */
+    /* 通知模拟器跳出 rv_cont 中的 for 循环。 */
     ATOMIC_STORE(&rv->is_interrupted, true, ATOMIC_RELAXED);
 }
 

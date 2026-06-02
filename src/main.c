@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 命令行入口。
+ *
+ * main.c 负责解析模拟器参数、组装 vm_attr_t、创建 riscv_t 实例并调用 rv_run。
+ * 运行结束后，它根据选项导出寄存器 JSON、架构测试 signature 和 profile 数据，
+ * 最后释放模拟器资源并返回客体程序的退出码。
  */
 
 #include <assert.h>
@@ -21,48 +28,48 @@
 #include "riscv.h"
 #include "utils.h"
 
-/* enable program trace mode */
+/* 是否启用程序 trace 模式。 */
 #if !RV32_HAS(SYSTEM_MMIO)
 static bool opt_trace = false;
 #endif
 
 #if RV32_HAS(GDBSTUB)
-/* enable program gdbstub mode */
+/* 是否启用 gdbstub 远程调试模式。 */
 static bool opt_gdbstub = false;
 #endif
 
-/* dump registers as JSON */
+/* 是否以 JSON 导出寄存器。 */
 static bool opt_dump_regs = false;
 static char *registers_out_file;
 
-/* RISC-V arch-test */
+/* RISC-V 架构测试 signature 输出。 */
 static bool opt_arch_test = false;
 static char *signature_out_file;
 
-/* Quiet outputs */
+/* 是否静默普通输出。 */
 static bool opt_quiet_outputs = false;
 
-/* target executable */
+/* 客体目标可执行文件。 */
 static char *opt_prog_name;
 
-/* target argc and argv */
+/* 传给客体程序的 argc/argv。 */
 static int prog_argc;
 static char **prog_args;
 static const char *optstr = "tgqmhpd:a:k:i:b:x:";
 
-/* enable misaligned memory access */
+/* 是否允许非对齐内存访问。 */
 static bool opt_misaligned = false;
 
-/* dump profiling data */
+/* 是否导出 profiling 数据。 */
 static bool opt_prof_data = false;
 static char *prof_out_file;
 
 #if RV32_HAS(SYSTEM_MMIO)
-/* Linux kernel data */
+/* Linux 内核引导数据。 */
 static char *opt_kernel_img;
 static char *opt_rootfs_img;
 static char *opt_bootargs;
-/* FIXME: handle overflow */
+/* FIXME：后续应更完整地处理设备数量溢出。 */
 #define VBLK_DEV_MAX 100
 static char *opt_virtio_blk_img[VBLK_DEV_MAX];
 static int opt_virtio_blk_idx = 0;
@@ -71,32 +78,28 @@ static int opt_virtio_blk_idx = 0;
 static void print_usage(const char *filename)
 {
     rv_log_error(
-        "\nRV32I[MAFC] Emulator which loads an ELF file to execute.\n"
-        "Usage: %s [options] [filename] [arguments]\n"
-        "Options:\n"
+        "\nRV32I[MAFC] 模拟器，可加载 ELF 文件并执行。\n"
+        "用法：%s [选项] [文件名] [程序参数]\n"
+        "选项：\n"
 #if !RV32_HAS(SYSTEM_MMIO)
-        "  -t : print executable trace\n"
+        "  -t : 打印执行 trace\n"
 #endif
 #if RV32_HAS(GDBSTUB)
-        "  -g : allow remote GDB connections (as gdbstub)\n"
+        "  -g : 允许远程 GDB 连接（gdbstub）\n"
 #endif
 #if RV32_HAS(SYSTEM_MMIO)
-        "  -k <image> : use <image> as kernel image\n"
-        "  -i <image> : use <image> as rootfs\n"
-        "  -x vblk:<image>[,readonly]: use "
-        "<image> as virtio-blk disk image "
-        "(default read and write). This option may be specified "
-        "multiple times for multiple block devices\n"
-        "  -b <bootargs> : use customized <bootargs> for the kernel\n"
+        "  -k <image> : 使用 <image> 作为内核镜像\n"
+        "  -i <image> : 使用 <image> 作为 rootfs/initrd\n"
+        "  -x vblk:<image>[,readonly]: 使用 <image> 作为 virtio-blk "
+        "磁盘镜像（默认可读写）。该选项可重复指定多个块设备\n"
+        "  -b <bootargs> : 为内核指定自定义 <bootargs>\n"
 #endif
-        "  -d [filename]: dump registers as JSON to the "
-        "given file or `-` (STDOUT)\n"
-        "  -q : Suppress outputs other than `dump-registers`\n"
-        "  -a [filename] : dump signature to the given file, "
-        "required by arch-test test\n"
-        "  -m : enable misaligned memory access\n"
-        "  -p : generate profiling data\n"
-        "  -h : show this message",
+        "  -d [filename]: 将寄存器以 JSON 写入指定文件；`-` 表示标准输出\n"
+        "  -q : 静默除 dump-registers 之外的普通输出\n"
+        "  -a [filename] : 将 signature 写入指定文件，arch-test 需要该输出\n"
+        "  -m : 启用非对齐内存访问\n"
+        "  -p : 生成 profiling 数据\n"
+        "  -h : 显示本帮助信息",
         filename);
 }
 
@@ -134,7 +137,7 @@ static bool parse_args(int argc, char **args)
             break;
         case 'x':
             if (opt_virtio_blk_idx >= VBLK_DEV_MAX) {
-                rv_log_error("Too many virtio-blk devices. Maximum is %d.\n",
+                rv_log_error("virtio-blk 设备过多，最大数量为 %d。\n",
                              VBLK_DEV_MAX);
                 return false;
             }
@@ -173,8 +176,7 @@ static bool parse_args(int argc, char **args)
     }
 
     prog_argc = argc - emu_argc - 1;
-    /* optind points to the first non-option string, so it should indicate the
-     * target program.
+    /* optind 指向第一个非选项字符串，也就是客体目标程序。
      */
     prog_args = &args[optind];
     opt_prog_name = prog_args[0];
@@ -185,7 +187,7 @@ static bool parse_args(int argc, char **args)
 
         char rel_path[PATH_MAX] = {0};
         size_t args0_len = strlen(args[0]);
-        /* Ensure args[0] is long enough before subtracting */
+        /* 先确认 args[0] 足够长，再截掉结尾的 "rv32emu"。 */
         if (args0_len > 7) { /* strlen("rv32emu") */
             size_t copy_len = args0_len - 7;
             if (copy_len >= PATH_MAX)
@@ -199,7 +201,7 @@ static bool parse_args(int argc, char **args)
                            strlen(prog_basename) + 5 + 1;
         prof_out_file = malloc(total_len);
         if (!prof_out_file) {
-            rv_log_error("Failed to allocate profiling output filename");
+            rv_log_error("分配 profiling 输出文件名失败");
             return false;
         }
         assert(prof_out_file);
@@ -219,21 +221,21 @@ static void dump_test_signature(const char UNUSED *prog_name)
     const struct Elf32_Sym *sym;
     FILE *f = fopen(signature_out_file, "w");
     if (!f) {
-        rv_log_fatal("Cannot open signature output file: %s",
+        rv_log_fatal("无法打开 signature 输出文件：%s",
                      signature_out_file);
         return;
     }
 
-    /* use the entire .data section as a fallback */
+    /* 默认使用整个 .data 段作为 signature 区间。 */
     elf_get_data_section_range(elf, &start, &end);
 
-    /* try and access the exact signature range */
+    /* 如果 ELF 暴露 begin_signature/end_signature，则使用精确区间。 */
     if ((sym = elf_get_symbol(elf, "begin_signature")))
         start = sym->st_value;
     if ((sym = elf_get_symbol(elf, "end_signature")))
         end = sym->st_value;
 
-    /* dump it word by word */
+    /* 以 32 位字为单位导出 signature。 */
     for (uint32_t addr = start; addr < end; addr += 4)
         fprintf(f, "%08x\n", memory_read_w(addr));
 
@@ -241,26 +243,24 @@ static void dump_test_signature(const char UNUSED *prog_name)
     elf_delete(elf);
 }
 
-/* CYCLE_PER_STEP shall be defined on different runtime */
+/* 不同运行时可以覆盖 CYCLE_PER_STEP；默认每轮执行 100 个周期。 */
 #ifndef CYCLE_PER_STEP
 #define CYCLE_PER_STEP 100
 #endif
-/* MEM_SIZE is defined by Makefile:
- * - SYSTEM mode (kernel): configurable, default 512 MiB
- * - User-mode: configurable via USER_MEM_SIZE, default 256 MiB
- * With demand paging, physical memory is allocated only when accessed.
+/* MEM_SIZE 由 Makefile 传入：
+ * - SYSTEM 模式（Linux 内核）：可配置，默认 512 MiB。
+ * - 用户态模式：可通过 USER_MEM_SIZE 配置，默认 256 MiB。
+ * 启用按需分页后，物理内存只在真正访问时分配。
  */
 #ifndef MEM_SIZE
-#define MEM_SIZE (256ULL * 1024 * 1024) /* 256 MiB default */
+#define MEM_SIZE (256ULL * 1024 * 1024) /* 默认 256 MiB。 */
 #endif
 #define STACK_SIZE 0x1000       /* 4096 */
 #define ARGS_OFFSET_SIZE 0x1000 /* 4096 */
 
-/* To use rv_halt function in wasm, we have to expose RISC-V instance(rv),
- * but we can add a layer to not expose the instance and make rv_halt
- * callable. A small trade-off is that declaring instance as a global
- * variable. rv_halt is useful when cancelling the main loop of wasm,
- * see rv_step in emulate.c for more detail
+/* wasm 运行时需要能间接调用 rv_halt 来停止主循环。
+ * 这里保留全局 rv 指针，并通过一层 indirect_rv_halt 暴露停止能力，避免把
+ * riscv_t 实例直接交给外部 JS 调用侧。更多细节见 emulate.c 的 rv_step。
  */
 riscv_t *rv;
 #ifdef __EMSCRIPTEN__
@@ -315,31 +315,31 @@ int main(int argc, char **args)
     attr.data.user.elf_program = opt_prog_name;
 #endif
 
-    /* enable or disable the logging outputs */
+    /* 根据 -q 开关启用或静默普通日志输出。 */
     rv_log_set_quiet(opt_quiet_outputs);
 
-    /* create the RISC-V runtime */
+    /* 创建 RISC-V 运行时实例。 */
     rv = rv_create(&attr);
     if (!rv) {
-        rv_log_fatal("Unable to create riscv emulator");
+        rv_log_fatal("无法创建 RISC-V 模拟器");
         attr.exit_code = 1;
         goto end;
     }
-    rv_log_info("RISC-V emulator is created and ready to run");
+    rv_log_info("RISC-V 模拟器已创建，可以运行");
 
 #if RV32_HAS(ARCH_TEST)
-    /* Extract tohost/fromhost addresses for arch-test mode */
+    /* 架构测试模式下提取 tohost/fromhost 地址。 */
     if (opt_arch_test && opt_prog_name) {
         elf_t *elf = elf_new();
         if (elf && elf_open(elf, opt_prog_name)) {
             const struct Elf32_Sym *sym;
             if ((sym = elf_get_symbol(elf, "tohost"))) {
                 rv_set_tohost_addr(rv, sym->st_value);
-                rv_log_info("Found tohost at 0x%08x", sym->st_value);
+                rv_log_info("找到 tohost：0x%08x", sym->st_value);
             }
             if ((sym = elf_get_symbol(elf, "fromhost"))) {
                 rv_set_fromhost_addr(rv, sym->st_value);
-                rv_log_info("Found fromhost at 0x%08x", sym->st_value);
+                rv_log_info("找到 fromhost：0x%08x", sym->st_value);
             }
         }
         elf_delete(elf);
@@ -352,25 +352,24 @@ int main(int argc, char **args)
 
     rv_run(rv);
 
-    /* dump registers as JSON */
+    /* 按需导出寄存器 JSON。 */
     if (opt_dump_regs)
         dump_registers(rv, registers_out_file);
 
-    /* dump test result in test mode */
+    /* 架构测试模式下导出 signature 结果。 */
     if (opt_arch_test)
         dump_test_signature(opt_prog_name);
 
-    /* finalize the RISC-V runtime */
+    /* 释放 RISC-V 运行时。 */
     rv_delete(rv);
     /*
-     * Other translation units cannot update the pointer, update it here
-     * to prevent multiple atexit()'s callback be called.
+     * 其他编译单元无法更新这个指针，因此在这里置空，避免 atexit 回调重复访问。
      */
     rv = NULL;
     uint64_t mem_usage = memory_get_usage();
-    rv_log_info("Peak memory usage: %" PRIu64 " KB (%" PRIu64 " MB)",
+    rv_log_info("峰值内存使用：%" PRIu64 " KB (%" PRIu64 " MB)",
                 mem_usage / 1024, mem_usage / (1024 * 1024));
-    rv_log_info("RISC-V emulator is destroyed");
+    rv_log_info("RISC-V 模拟器已销毁");
 
 end:
     free(prof_out_file);

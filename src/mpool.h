@@ -1,13 +1,11 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
  */
 
-/* Fixed-size memory pool allocator.
+/* 固定大小对象内存池分配器。
  *
- * Provides O(1) allocation/free for fixed-size objects. Uses mmap with
- * demand paging when available, falling back to malloc. Pools auto-extend
- * when exhausted. All functions are NULL-safe.
+ * 为固定大小对象提供 O(1) 分配/释放。可用时使用 mmap，缺失时退回 malloc。
+ * 内存池耗尽后会自动扩展；所有函数都允许传入 NULL 并安全返回。
  */
 
 #pragma once
@@ -17,39 +15,39 @@
 struct mpool;
 
 /**
- * mpool_create - create a memory pool
- * @pool_size: initial pool size in bytes
- * @chunk_size: size of each allocation unit
+ * mpool_create - 创建内存池。
+ * @pool_size: 初始内存池大小，单位字节。
+ * @chunk_size: 每个分配单元大小。
  *
- * Returns pointer to pool, or NULL on failure.
+ * 返回内存池指针；失败时返回 NULL。
  */
 struct mpool *mpool_create(size_t pool_size, size_t chunk_size);
 
 /**
- * mpool_alloc - allocate a chunk from the pool
- * @mp: memory pool (NULL-safe)
+ * mpool_alloc - 从内存池分配一个 chunk。
+ * @mp: 内存池，可为 NULL。
  *
- * Returns pointer to chunk, or NULL if mp is NULL or allocation fails.
+ * 返回 chunk 指针；mp 为 NULL 或分配失败时返回 NULL。
  */
 void *mpool_alloc(struct mpool *mp);
 
 /**
- * mpool_calloc - allocate a zero-initialized chunk from the pool
- * @mp: memory pool (NULL-safe)
+ * mpool_calloc - 从内存池分配并清零一个 chunk。
+ * @mp: 内存池，可为 NULL。
  *
- * Returns pointer to zeroed chunk, or NULL if mp is NULL or allocation fails.
+ * 返回已清零 chunk 指针；mp 为 NULL 或分配失败时返回 NULL。
  */
 void *mpool_calloc(struct mpool *mp);
 
 /**
- * mpool_free - return a chunk to the pool
- * @mp: memory pool (NULL-safe)
- * @target: chunk to free (NULL-safe)
+ * mpool_free - 把 chunk 归还给内存池。
+ * @mp: 内存池，可为 NULL。
+ * @target: 待释放 chunk，可为 NULL。
  */
 void mpool_free(struct mpool *mp, void *target);
 
 /**
- * mpool_destroy - destroy pool and release all memory
- * @mp: memory pool (NULL-safe)
+ * mpool_destroy - 销毁内存池并释放所有内存。
+ * @mp: 内存池，可为 NULL。
  */
 void mpool_destroy(struct mpool *mp);

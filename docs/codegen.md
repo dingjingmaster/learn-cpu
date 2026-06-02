@@ -1,187 +1,116 @@
-# Code Generation
+# 代码生成
 
-## Overview
-rv32emu employs a tiered execution strategy with an interpreter and a two-tier JIT compiler.
-The interpreter provides baseline execution while the JIT compiler generates native machine code for hot paths,
-significantly improving performance for compute-intensive workloads.
+## 概览
 
-The code generation infrastructure supports both x86-64 and Arm64 host architectures through
-an abstraction layer that maps common operations to architecture-specific instructions.
+rv32emu 使用分层执行策略：解释器负责基线执行，一级 JIT 为热点基本块生成宿主
+机器码，二级 JIT 使用 LLVM 对更热的路径做进一步优化。
 
-## Execution Tiers
-The emulator uses three execution tiers:
-1. Interpreter: Direct execution of RISC-V instructions via tail-call threaded dispatch
-2. Tier-1 JIT: Template-based native code generation for basic blocks
-3. Tier-2 JIT: LLVM-based compilation for frequently executed hot paths
+代码生成层支持 x86-64 和 Arm64 宿主架构。`jit.c` 提供跨架构发射 API，
+`rv32_jit.c` 定义每条 RISC-V 指令如何发射宿主指令，`t2c.c` 与
+`t2c_template.c` 则负责 LLVM IR 生成。
 
-When a basic block reaches a configurable execution threshold, it gets promoted from interpreter to Tier-1 JIT.
-Blocks that continue to execute frequently may be further compiled by the Tier-2 LLVM backend for additional optimizations.
+## 执行层级
 
-## Source File Organization
+| 层级 | 说明 |
+| --- | --- |
+| 解释器 | 使用尾调用调度直接执行 RISC-V 指令 |
+| 一级 JIT | 使用模板化发射器为基本块生成宿主机器码 |
+| 二级 JIT | 使用 LLVM 编译高频热点基本块 |
 
-| File | Purpose |
-|------|---------|
-| `src/rv32_template.c` | Interpreter instruction implementations using RVOP macro |
-| `src/rv32_jit.c` | Tier-1 JIT code generators using GEN macro (included by jit.c) |
-| `src/rv32_constopt.c` | IR-level constant folding and optimization |
-| `src/jit.c` | Tier-1 JIT infrastructure, emit_* API, and fused instruction handlers |
-| `src/t2c.c` | Tier-2 JIT driver (includes t2c_template.c) |
-| `src/t2c_template.c` | Tier-2 JIT instruction handlers using T2C_OP macro |
-| `src/emulate.c` | Main execution loop, tail-call dispatch, and macro-op fusion |
+基本块达到阈值后会从解释器提升到一级 JIT；如果仍持续高频执行，可进一步交给
+二级 LLVM JIT 编译。
 
-## Interpreter Implementation
-The interpreter uses the `RVOP` macro to define instruction handlers.
-Each handler receives the emulator state and decoded instruction, then performs the operation directly in C:
+## 源文件组织
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/rv32_template.c` | 解释器指令语义，使用 `RVOP` 宏 |
+| `src/rv32_jit.c` | 一级 JIT 指令生成器，使用 `GEN` 宏并由 `jit.c` include |
+| `src/rv32_constopt.c` | IR 层常量传播与折叠 |
+| `src/jit.c` | 一级 JIT 基础设施、`emit_*` API、寄存器分配和融合处理 |
+| `src/t2c.c` | 二级 JIT 驱动，管理 LLVM 模块、执行引擎和缓存 |
+| `src/t2c_template.c` | 二级 JIT 指令处理器，使用 `T2C_OP` 宏生成 LLVM IR |
+| `src/emulate.c` | 执行循环、尾调用调度、基本块翻译和宏操作融合 |
+
+## 解释器实现
+
+解释器用 `RVOP` 宏定义指令处理器：
+
 ```c
 RVOP(name, { body })
 ```
 
-This expands to a function that:
-- Receives: rv (emulator state), ir (decoded instruction), cycle (counter), PC
-- Returns: bool indicating whether to continue execution
+每个处理器接收模拟器状态 `rv`、已解码指令 `ir`、周期计数 `cycle` 和当前 `PC`，
+并返回是否继续执行。示例：
 
-Example implementation for the addi instruction:
 ```c
 RVOP(addi, { rv->X[ir->rd] = rv->X[ir->rs1] + ir->imm; })
 ```
 
-The interpreter uses Tail Call Threaded Code (TCTC) for efficient instruction dispatch.
-Each handler ends with a tail call (using the `musttail` attribute) to the next instruction's handler,
-avoiding function call overhead and enabling better branch prediction compared to switch-based dispatch.
+解释器采用 Tail Call Threaded Code 方式调度。当前指令处理器通过尾调用进入下一
+条指令处理器，减少传统 `switch` 分发开销。
 
-## Tier-1 JIT Code Generation
-The Tier-1 JIT compiler uses the GEN macro to define native code generators:
+## 一级 JIT
+
+一级 JIT 使用 `GEN` 宏定义宿主机器码生成器：
+
 ```c
 GEN(name, { body })
 ```
 
-Each generator emits native machine code that performs the equivalent operation using host CPU instructions.
-The `emit_*` functions append bytes to the JIT buffer.
+生成器通过 `emit_*` 函数向代码缓冲区写入宿主指令。寄存器分配器会把 RISC-V
+寄存器映射到少量宿主寄存器，并在需要时从 `riscv_t` 中加载或回写。
 
-Example: The addi instruction generates a host instruction sequence like:
-```
-mov  VR0, [memory address of (rv->X + rs1)]
-mov  VR1, VR0
-add  VR1, imm
-```
+常见辅助宏：
 
-Note: This is conceptual assembly.
-Actual instruction generation depends on the dynamic register allocator state and whether source registers are already mapped.
+| 宏 | 覆盖指令 |
+| --- | --- |
+| `GEN_BRANCH` | `beq`、`bne`、`blt`、`bge`、`bltu`、`bgeu` |
+| `GEN_CBRANCH` | `cbeqz`、`cbnez` |
+| `GEN_ALU_IMM` | `addi`、`xori`、`ori`、`andi` |
+| `GEN_ALU_REG` | `add`、`sub`、`xor`、`or`、`and` |
+| `GEN_SHIFT_IMM` | `slli`、`srli`、`srai` |
+| `GEN_SHIFT_REG` | `sll`、`srl`、`sra` |
+| `GEN_LOAD` | `lb`、`lh`、`lw`、`lbu`、`lhu` |
+| `GEN_STORE` | `sb`、`sh`、`sw` |
 
-## Register Allocation (Tier-1)
-The Tier-1 JIT maintains a register mapping between RISC-V and host registers:
+## 二级 JIT
 
-| Register | Purpose |
-|----------|---------|
-| `vm_reg[0..2]` | Host registers mapped to VM registers for current operation |
-| `temp_reg` | Scratch register for intermediate calculations |
-| `parameter_reg[0]` | Points to the `riscv_t` structure |
+二级 JIT 使用 LLVM C API，把 IR 转成 LLVM IR：
 
-Register allocation is performed dynamically.
-When a RISC-V register value is needed,
-the allocator either returns an already-mapped host register or loads the value from memory into an available host register.
-
-## Tier-2 JIT Compilation
-The Tier-2 JIT uses LLVM to compile frequently executed blocks into highly optimized native code.
-Instruction handlers are defined in `src/t2c_template.c` using the `T2C_OP` macro:
 ```c
 T2C_OP(name, { body })
 ```
 
-Each handler translates the RISC-V instruction semantics into LLVM IR using the LLVM C API.
-LLVM then applies its optimization passes and register allocation,
-producing native code that typically outperforms Tier-1 for hot paths.
+LLVM 会执行优化、寄存器分配和目标代码生成。二级 JIT 编译成本更高，适合长期
+执行的热点路径。当前构建要求 LLVM 18 到 21。
 
-Tier-2 compilation requires LLVM 18 and is enabled with `ENABLE_JIT=1` at build time.
+## IR 优化
 
-## IR Optimization
-Before execution or JIT compilation,
-the emulator performs optimization passes on the internal instruction representation (IR).
-Defined in `src/rv32_constopt.c`,
-these passes analyze basic blocks to identify opportunities for constant propagation and folding.
-For example, a `lui` followed by `addi` to construct a 32-bit constant can be optimized to reduce runtime computation.
-This optimization benefits both the interpreter and JIT tiers.
+执行或编译前，`src/rv32_constopt.c` 会对基本块做常量传播和折叠。例如 `lui`
+后接 `addi` 构造 32 位常量时，可以减少运行时重复计算。该优化同时服务解释器、
+一级 JIT 和二级 JIT。
 
-## Code Generation Macros (Tier-1)
-Helper macros reduce code duplication for common Tier-1 instruction patterns:
+## 双架构支持
 
-| Macro | Instructions |
-|-------|--------------|
-| `GEN_BRANCH` | beq, bne, blt, bge, bltu, bgeu |
-| `GEN_CBRANCH` | cbeqz, cbnez (compressed) |
-| `GEN_ALU_IMM` | addi, xori, ori, andi |
-| `GEN_ALU_REG` | add, sub, xor, or, and |
-| `GEN_SHIFT_IMM` | slli, srli, srai |
-| `GEN_SHIFT_REG` | sll, srl, sra |
-| `GEN_SLT_IMM` | slti, sltiu |
-| `GEN_SLT_REG` | slt, sltu |
-| `GEN_LOAD` | lb, lh, lw, lbu, lhu |
-| `GEN_STORE` | sb, sh, sw |
+`jit.c` 用 `emit_*` API 屏蔽 x86-64 和 Arm64 的指令编码差异。部分常量沿用
+x86-64 编码值作为符号标识，例如 `JCC_JE`、`ALU_OP_ADD`，Arm64 后端再映射到
+对应条件码或指令序列。
 
-Each macro encapsulates the common code generation pattern for its instruction class,
-taking only the instruction-specific parameters (opcode, condition code, etc.).
+## 基本块链接
 
-## Dual-Architecture Support
-The JIT supports both x86-64 and Arm64 through an abstraction layer in jit.c.
-Constants use x86-64 encoding values but serve as symbolic identifiers on both architectures.
-The `emit_*` functions contain architecture-specific implementations guarded by preprocessor conditionals:
-```c
-#if defined(__x86_64__)
-    // x86-64 specific code generation
-#elif defined(__aarch64__)
-    // Arm64 specific code generation
-#endif
-```
+当一个已翻译基本块以直接分支结束，并且目标基本块也已经翻译时，JIT 可以修补
+跳转目标，让两个基本块直接相连，避免回到调度器。该能力由
+`CONFIG_BLOCK_CHAINING` 控制。
 
-For example, jump condition codes (`JCC_JE`, `JCC_JNE`, etc.) match x86-64 Jcc opcodes
-but are mapped to equivalent Arm64 condition codes by `emit_jcc_offset()`.
+## 宏操作融合
 
-## Emit API (Tier-1)
-The `emit_*` functions provide the low-level interface for Tier-1 machine code generation:
+`emulate.c` 会识别常见指令序列，并把它们融合成一个更粗粒度操作。融合后的操作
+在解释器、一级 JIT 和二级 JIT 中分别有专用处理器，以减少分发次数和中间状态
+读写。该能力由 `CONFIG_MOP_FUSION` 控制。
 
-| Function | Description |
-|----------|-------------|
-| `emit_alu32_imm32` | ALU operation with 32-bit immediate |
-| `emit_alu32_imm8` | ALU operation with 8-bit immediate |
-| `emit_alu32` | ALU operation between registers |
-| `emit_load_imm` | Load immediate value into register |
-| `emit_load` / `emit_store` | Memory access operations |
-| `emit_mov` | Register-to-register move |
-| `emit_cmp32` / `emit_cmp_imm32` | Comparison operations |
-| `emit_jcc_offset` | Conditional jump |
-| `emit_jmp` | Unconditional jump |
-| `emit_call` | Function call to runtime helper |
+## 内存访问和 MMIO
 
-## Block Chaining
-Translated blocks can be chained together to avoid returning to the dispatcher between consecutive blocks.
-When a block ends with a direct branch to another translated block,
-the JIT patches the branch target to jump directly to the target block's native code.
-
-Block chaining is controlled by the `ENABLE_BLOCK_CHAINING` configuration option.
-
-## Macro-op Fusion
-The emulator fuses common instruction sequences into single operations,
-benefiting both the interpreter and JIT tiers. Fusion is implemented in `src/emulate.c`
-via `match_pattern` and `do_fuse*` handlers, which transform the IR before execution.
-
-For example, a lui followed by addi to construct a 32-bit constant can be fused into a single load-immediate operation.
-The fused instructions are then handled by dedicated handlers in each tier:
-- Interpreter: `do_fuse*` functions in `src/emulate.c`
-- Tier-1 JIT: `do_fuse*` functions in `src/jit.c`
-- Tier-2 JIT: `T2C_OP(fuse*, ...)` handlers in `src/t2c_template.c`
-
-Macro-op fusion is controlled by the `ENABLE_MOP_FUSION` configuration option.
-
-## Memory Access and MMIO
-Load and store instructions check for memory-mapped I/O regions when system emulation is enabled.
-The `GEN_LOAD` and `GEN_STORE` macros include conditional code generation for MMIO handling:
-```c
-IIF(RV32_HAS(SYSTEM_MMIO))(
-    // MMIO check and handler call
-,
-    // Direct memory access
-)
-```
-
-When MMIO is not enabled, the generated code performs direct memory access
-without the overhead of region checking.
+系统模式下，load/store 需要检查 MMIO 和 MMU。一级 JIT 的 `GEN_LOAD`、
+`GEN_STORE` 会根据 `RV32_HAS(SYSTEM_MMIO)` 选择直接 RAM 快路径，或进入 MMU/MMIO
+handler。非系统模式可以跳过这些检查，直接访问客体内存。

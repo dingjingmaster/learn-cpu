@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 全局公共定义。
+ *
+ * 该头文件会通过 Makefile 的 -include 自动注入多数编译单元，集中放置属性宏、
+ * 条件编译辅助、数组工具、断言和跨平台小工具。不要在这里加入会引入重依赖的
+ * 业务接口，否则会放大所有源码文件的编译耦合。
  */
 
 #pragma once
@@ -35,7 +42,7 @@
 #include <intrin.h>
 static inline int rv_clz(uint32_t v)
 {
-    /* 0 is considered as undefined behavior */
+    /* 输入 0 属于未定义行为。 */
     assert(v);
 
     uint32_t leading_zero = 0;
@@ -46,15 +53,15 @@ static inline int rv_clz(uint32_t v)
 static inline int rv_clz(uint32_t v)
 {
     /* https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html */
-    /* 0 is considered as undefined behavior */
+    /* 输入 0 属于未定义行为。 */
     assert(v);
 
     return __builtin_clz(v);
 }
-#else /* generic implementation */
+#else /* 通用实现。 */
 static inline int rv_clz(uint32_t v)
 {
-    /* 0 is considered as undefined behavior */
+    /* 输入 0 属于未定义行为。 */
     assert(v);
 
     /* http://graphics.stanford.edu/~seander/bithacks.html#IntegerLogDeBruijn */
@@ -77,7 +84,7 @@ static inline int rv_clz(uint32_t v)
 #include <intrin.h>
 static inline int rv_ctz(uint32_t v)
 {
-    /* 0 is considered as undefined behavior */
+    /* 输入 0 属于未定义行为。 */
     assert(v);
 
     uint32_t trailing_zero = 0;
@@ -88,15 +95,15 @@ static inline int rv_ctz(uint32_t v)
 static inline int rv_ctz(uint32_t v)
 {
     /* https://gcc.gnu.org/onlinedocs/gcc/Other-Builtins.html */
-    /* 0 is considered as undefined behavior */
+    /* 输入 0 属于未定义行为。 */
     assert(v);
 
     return __builtin_ctz(v);
 }
-#else /* generic implementation */
+#else /* 通用实现。 */
 static inline int rv_ctz(uint32_t v)
 {
-    /* 0 is considered as undefined behavior */
+    /* 输入 0 属于未定义行为。 */
     assert(v);
 
     /* https://graphics.stanford.edu/~seander/bithacks.html#ZerosOnRightMultLookup
@@ -117,7 +124,7 @@ static inline int rv_popcount(uint32_t v)
 
     return __builtin_popcount(v);
 }
-#else /* generic implementation */
+#else /* 通用实现。 */
 static inline int rv_popcount(uint32_t v)
 {
     /* https://graphics.stanford.edu/~seander/bithacks.html#CountBitsSetParallel
@@ -131,10 +138,9 @@ static inline int rv_popcount(uint32_t v)
 #endif
 
 /*
- * Integer log base 2
+ * 以 2 为底的整数对数。
  *
- * The input x must not be zero.
- * Otherwise, the result is undefined on some platform.
+ * 输入 x 不能为 0，否则部分平台上的结果未定义。
  *
  */
 static inline uint8_t ilog2(uint32_t x)
@@ -142,25 +148,25 @@ static inline uint8_t ilog2(uint32_t x)
     return 31 - rv_clz(x);
 }
 
-/* Alignment macro */
+/* 对齐属性宏。 */
 #if defined(__GNUC__) || defined(__clang__)
 #define __ALIGNED(x) __attribute__((aligned(x)))
 #elif defined(_MSC_VER)
 #define __ALIGNED(x) __declspec(align(x))
-#else /* unsupported compilers */
+#else /* 不支持的编译器。 */
 #define __ALIGNED(x)
 #endif
 
-/* Packed macro */
+/* 紧凑布局属性宏。 */
 #if defined(__GNUC__) || defined(__clang__)
 #define PACKED(name) name __attribute__((packed))
 #elif defined(_MSC_VER)
 #define PACKED(name) __pragma(pack(push, 1)) name __pragma(pack(pop))
-#else /* unsupported compilers */
+#else /* 不支持的编译器。 */
 #define PACKED(name)
 #endif
 
-/* Endianness */
+/* 字节序转换。 */
 #if defined(__GNUC__) || defined(__clang__)
 #define bswap16(x) __builtin_bswap16(x)
 #define bswap32(x) __builtin_bswap32(x)
@@ -171,24 +177,23 @@ static inline uint8_t ilog2(uint32_t x)
         (bswap16(((x & 0xffff) << 16) | ((x >> 16) & 0xffff)) & 0xffff) << 16
 #endif
 
-/* The purpose of __builtin_unreachable() is to assist the compiler in:
- * - Eliminating dead code that the programmer knows will never be executed.
- * - Linearizing the code by indicating to the compiler that the path is 'cold'
- *   (a similar effect can be achieved by calling a noreturn function).
+/* __builtin_unreachable() 用来辅助编译器：
+ * - 消除程序员已知永远不会执行的死代码。
+ * - 告诉编译器该路径是 cold 路径，帮助线性化代码；调用 noreturn 函数也能达到
+ *   类似效果。
  */
 #if defined(__GNUC__) || defined(__clang__)
 #define __UNREACHABLE __builtin_unreachable()
 #elif defined(_MSC_VER)
 #define __UNREACHABLE __assume(false)
-#else /* unspported compilers */
+#else /* 不支持的编译器。 */
 /* clang-format off */
 #define __UNREACHABLE do { /* nop */ } while (0)
 /* clang-format on */
 #endif
 
-/* Non-optimized builds do not have tail-call optimization (TCO). To work
- * around this, the compiler attribute 'musttail' is used, which forces TCO
- * even without optimizations enabled.
+/* 非优化构建通常没有尾调用优化（TCO）。使用编译器属性 musttail 可以在未启用
+ * 优化时强制进行 TCO。
  */
 #if defined(__has_attribute) && __has_attribute(musttail)
 #define MUST_TAIL __attribute__((musttail))
@@ -196,9 +201,8 @@ static inline uint8_t ilog2(uint32_t x)
 #define MUST_TAIL
 #endif
 
-/* The preserve_none calling convention minimizes register preservation overhead
- * in the interpreter's threaded dispatch. It must be applied to function
- * declarations, not return statements. macOS clang falsely reports support.
+/* preserve_none 调用约定可以降低解释器 threaded dispatch 中的寄存器保存开销。
+ * 该属性必须用于函数声明，不能用于 return 语句。macOS clang 会误报支持。
  */
 #if defined(__has_attribute) && __has_attribute(preserve_none) && \
     !defined(__APPLE__)
@@ -207,15 +211,13 @@ static inline uint8_t ilog2(uint32_t x)
 #define PRESERVE_NONE
 #endif
 
-/* Disable UBSAN function pointer type checking.
- * When LLVM-compiled code (T2C) is called via function pointers from
- * non-LLVM code, UBSAN can emit false positives due to function type
- * metadata mismatches. This attribute suppresses those checks.
+/* 关闭 UBSAN 函数指针类型检查。
+ * 非 LLVM 代码通过函数指针调用 LLVM 编译出的 T2C 代码时，函数类型元数据可能不
+ * 匹配，UBSAN 会产生误报。该属性用于抑制这类检查。
  *
- * Note: GCC supports no_sanitize for some sanitizers but NOT for "function".
- * Using __has_attribute(no_sanitize) would return true on GCC but applying
- * no_sanitize("function") causes a warning/error. Therefore, we explicitly
- * check for __clang__ only, which is the compiler that supports this variant.
+ * 注意：GCC 支持部分 no_sanitize 变体，但不支持 "function"。GCC 上
+ * __has_attribute(no_sanitize) 可能返回 true，但应用 no_sanitize("function")
+ * 会产生警告/错误。因此这里只显式检查支持该变体的 __clang__。
  */
 #if defined(__clang__) && defined(__has_attribute) && \
     __has_attribute(no_sanitize)
@@ -224,31 +226,30 @@ static inline uint8_t ilog2(uint32_t x)
 #define DISABLE_UBSAN_FUNC
 #endif
 
-/* Assume that all POSIX-compatible environments provide mmap system call.
- * Emscripten is excluded because it lacks signal-based demand paging support
- * and C11 atomics require special compilation flags not enabled by default.
+/* 假设所有 POSIX 兼容环境都提供 mmap 系统调用。Emscripten 被排除，因为它缺少
+ * 基于 signal 的按需分页支持，且 C11 原子操作需要默认未启用的特殊编译参数。
  */
 #if defined(_WIN32) || defined(__EMSCRIPTEN__)
 #define HAVE_MMAP 0
 #else
-/* Assume POSIX-compatible runtime */
+/* 假设为 POSIX 兼容运行时。 */
 #define HAVE_MMAP 1
 #endif
 
-/* Portable atomic operations
+/* 可移植原子操作。
  *
- * Prefer GNU __atomic builtins (GCC 4.7+, Clang 3.1+) as they work with
- * non-_Atomic types, which is required for our existing struct definitions.
- * C11 stdatomic requires _Atomic type qualifiers on all atomic variables.
+ * 优先使用 GNU __atomic builtins（GCC 4.7+、Clang 3.1+），因为它们可用于
+ * 非 _Atomic 类型，适配当前已有结构体定义。C11 stdatomic 要求所有原子变量都带
+ * _Atomic 类型限定。
  *
- * Memory ordering constants:
- *   ATOMIC_RELAXED - No synchronization, only atomicity guaranteed
- *   ATOMIC_ACQUIRE - Prevents reordering of subsequent reads
- *   ATOMIC_RELEASE - Prevents reordering of preceding writes
- *   ATOMIC_SEQ_CST - Full sequential consistency (strongest)
+ * 内存序常量：
+ *   ATOMIC_RELAXED - 不提供同步，只保证原子性。
+ *   ATOMIC_ACQUIRE - 防止后续读操作重排到其前面。
+ *   ATOMIC_RELEASE - 防止前序写操作重排到其后面。
+ *   ATOMIC_SEQ_CST - 完整顺序一致性，最强内存序。
  */
 #if defined(__GNUC__) || defined(__clang__)
-/* GNU __atomic builtins (GCC 4.7+, Clang 3.1+) */
+/* GNU __atomic builtins（GCC 4.7+、Clang 3.1+）。 */
 #define HAVE_C11_ATOMICS 0
 
 #define ATOMIC_RELAXED __ATOMIC_RELAXED
@@ -266,9 +267,9 @@ static inline uint8_t ilog2(uint32_t x)
 
 #elif !defined(__EMSCRIPTEN__) && defined(__STDC_VERSION__) && \
     (__STDC_VERSION__ >= 201112L) && !defined(__STDC_NO_ATOMICS__)
-/* C11 atomics fallback - requires GNU __typeof__ extension for type inference.
- * Note: The cast to (_Atomic T*) is technically undefined behavior per C11,
- * but is a widely-used idiom that works correctly on GCC/Clang.
+/* C11 原子操作回退实现，需要 GNU __typeof__ 扩展做类型推导。
+ * 注意：按 C11 标准，强转为 (_Atomic T*) 严格说是未定义行为；但这是常见惯用法，
+ * 在 GCC/Clang 上能正确工作。
  */
 #include <stdatomic.h>
 #define HAVE_C11_ATOMICS 1
@@ -293,13 +294,13 @@ static inline uint8_t ilog2(uint32_t x)
         (_Atomic __typeof__(*(ptr)) *) (ptr), expected, desired, succ, fail)
 
 #else
-/* No atomic support - single-threaded fallback (T2C requires atomics) */
+/* 无原子操作支持：退回单线程实现（T2C 需要原子操作）。 */
 #define HAVE_C11_ATOMICS 0
 
 #if defined(_MSC_VER)
-#pragma message("No atomic operations available. T2C JIT will be disabled.")
+#pragma message("没有可用的原子操作。T2C JIT 将被关闭。")
 #else
-#warning "No atomic operations available. T2C JIT will be disabled."
+#warning "没有可用的原子操作。T2C JIT 将被关闭。"
 #endif
 
 #define ATOMIC_RELAXED 0
@@ -307,57 +308,53 @@ static inline uint8_t ilog2(uint32_t x)
 #define ATOMIC_RELEASE 0
 #define ATOMIC_SEQ_CST 0
 
-/* Simple non-atomic fallback - only safe for single-threaded use.
- * WARNING: ATOMIC_EXCHANGE returns new value (not old) without extensions.
- * T2C/GDBSTUB require proper atomics and will have data races on these
- * platforms - they should be disabled when atomics are unavailable.
+/* 简单非原子退化实现：仅在单线程场景安全。
+ * 警告：无扩展时 ATOMIC_EXCHANGE 返回新值而不是旧值。T2C/GDBSTUB 需要真实
+ * 原子操作，否则在这些平台上会有数据竞争；缺少原子操作时应关闭它们。
  */
 #define ATOMIC_LOAD(ptr, order) (*(ptr))
 #define ATOMIC_STORE(ptr, val, order) ((void) (*(ptr) = (val)))
 #define ATOMIC_FETCH_ADD(ptr, val, order) \
-    ((*(ptr) += (val)) - (val)) /* return old value */
+    ((*(ptr) += (val)) - (val)) /* 返回旧值。 */
 #define ATOMIC_FETCH_SUB(ptr, val, order) \
-    ((*(ptr) -= (val)) + (val)) /* return old value */
-/* ATOMIC_EXCHANGE cannot return old value without statement expressions.
- * This returns NEW value - callers must not rely on return value. */
+    ((*(ptr) -= (val)) + (val)) /* 返回旧值。 */
+/* 没有 statement expression 时，ATOMIC_EXCHANGE 无法返回旧值。
+ * 这里返回新值，调用者不能依赖返回值。 */
 #define ATOMIC_EXCHANGE(ptr, val, order) (*(ptr) = (val))
-/* ATOMIC_COMPARE_EXCHANGE_WEAK: non-atomic, single-threaded only */
+/* ATOMIC_COMPARE_EXCHANGE_WEAK：非原子实现，只能用于单线程。 */
 #define ATOMIC_COMPARE_EXCHANGE_WEAK(ptr, expected, desired, succ, fail) \
     ((*(ptr) == *(expected)) ? (*(ptr) = (desired), 1)                   \
                              : (*(expected) = *(ptr), 0))
 #endif
 
-/* Pattern Matching for C macros.
+/* C 宏模式匹配技巧。
  * https://github.com/pfultz2/Cloak/wiki/C-Preprocessor-tricks,-tips,-and-idioms
  */
 
-/* In Visual Studio, __VA_ARGS__ is treated as a separate parameter. */
+/* Visual Studio 会把 __VA_ARGS__ 当成独立参数处理。 */
 #define FIX_VC_BUG(x) x
 
-/* catenate */
+/* 拼接 token。 */
 #define PRIMITIVE_CAT(a, ...) FIX_VC_BUG(a##__VA_ARGS__)
 
 #define IIF(c) PRIMITIVE_CAT(IIF_, c)
-/* run the 2nd parameter */
+/* 选择并展开第二个参数。 */
 #define IIF_0(t, ...) __VA_ARGS__
-/* run the 1st parameter */
+/* 选择并展开第一个参数。 */
 #define IIF_1(t, ...) t
 
-/* Accept any number of args >= N, but expand to just the Nth one. The macro
- * that calls the function still only supports 4 args, but the set of values
- * that might need to be returned is 1 larger, so N is increased to 6.
+/* 接受不少于 N 个参数，但只展开第 N 个。调用方宏仍只支持 4 个参数；由于可能
+ * 返回的值集合多 1 个，因此 N 增加到 6。
  */
 #define _GET_NTH_ARG(_1, _2, _3, _4, _5, N, ...) N
 
-/* Count how many args are in a variadic macro. The GCC/Clang extension is used
- * to handle the case where ... expands to nothing. A placeholder arg is added
- * before ##VA_ARGS (its value is irrelevant but necessary to preserve the
- * shifting offset).
- * Additionally, 0 is added as a valid value in the N position.
+/* 统计可变参数宏中有多少参数。这里用 GCC/Clang 扩展处理 ... 展开为空的场景。
+ * ##VA_ARGS 前的占位参数值无关紧要，但需要它保持偏移正确。N 位置额外加入 0，
+ * 作为合法返回值。
  */
 #define COUNT_VARARGS(...) _GET_NTH_ARG("ignored", ##__VA_ARGS__, 4, 3, 2, 1, 0)
 
-/* As of C23, typeof is now included as part of the C standard. */
+/* 从 C23 开始，typeof 已纳入 C 标准。 */
 #if defined(__GNUC__) || defined(__clang__) ||         \
     (defined(__STDC__) && defined(__STDC_VERSION__) && \
      (__STDC_VERSION__ >= 202000L)) /* C2x/C23 ?*/
@@ -365,12 +362,12 @@ static inline uint8_t ilog2(uint32_t x)
 #endif
 
 /**
- * container_of() - Calculate address of object that contains address ptr
- * @ptr: pointer to member variable
- * @type: type of the structure containing ptr
- * @member: name of the member variable in struct @type
+ * container_of() - 根据成员指针反推出包含它的对象地址。
+ * @ptr: 成员变量指针。
+ * @type: 包含该成员的结构体类型。
+ * @member: @type 中的成员名。
  *
- * Return: @type pointer of object containing ptr
+ * Return: 包含 ptr 的对象指针，类型为 @type*。
  */
 #ifndef container_of
 #ifdef __HAVE_TYPEOF

@@ -1,53 +1,63 @@
-# Demos
+# 演示程序
 
 ## Doom
-**source**: [doom\_riscv](https://github.com/sysprog21/doom_riscv)
 
-**command**: `make doom`
+**来源**：[doom_riscv](https://github.com/sysprog21/doom_riscv)
 
-[Doom](https://en.wikipedia.org/wiki/Doom_(franchise)), a pioneering first-person shooter game developed by [id Software](https://en.wikipedia.org/wiki/Id_Software) in 1993, is known for its open-source code and vibrant community.
-It debuted innovations like genuine 3D graphics, networked multiplayer gameplay and the ability for players to create custom expansions. 
+**命令**：`make doom`
 
-![Doom Gameplay](https://imgur.com/bLc5LG8.gif)
+[Doom](https://en.wikipedia.org/wiki/Doom_(franchise)) 是 id Software 在 1993
+年推出的第一人称射击游戏，也是开源游戏移植和复古平台移植中常见的测试目标。
+它适合验证 rv32emu 的整数执行、SDL 图形、输入事件和音频系统调用。
 
-### Main Key Bindings (All key bindings are listed in the "READ THIS!" menu)
-* Move Forward/Backward: Up Arrow Key/Down Arrow Key
-* Move Left/Right: Comma(,) Key/Period(.) Key
-* Turn Left/Right: Left Arrow Key/Right Arrow Key
-* Shoot: Left Mouse Button or CTRL Key
-* Sprint: Shift Key
-* 1: Fist
-* 3: Shotgun
+![Doom 游戏画面](https://imgur.com/bLc5LG8.gif)
 
-### Music and Sound Effects
-The music and sound effects are supported.
+### 主要按键
+
+完整按键列表见游戏内 `"READ THIS!"` 菜单。
+
+* 前进/后退：上方向键/下方向键
+* 左移/右移：逗号键（`,`）/句号键（`.`）
+* 左转/右转：左方向键/右方向键
+* 射击：鼠标左键或 CTRL 键
+* 奔跑：Shift 键
+* `1`：拳头
+* `3`：霰弹枪
+
+### 音乐和音效
+
+Doom 的音乐和音效均已支持。
 
 ## Quake
-**source**: [quake-embedded](https://github.com/sysprog21/quake-embedded/)
 
-**command**: `make quake`
+**来源**：[quake-embedded](https://github.com/sysprog21/quake-embedded/)
 
-[Quake](https://en.wikipedia.org/wiki/Quake_(series)) was created in 1996 as a successor to the highly successful first-person shooter game Doom.
-It features a fully 3D engine developed by id Software, offering true 3D graphics and gameplay.
-It emphasizes fast-paced gameplay and supports online multiplayer over the Internet.
+**命令**：`make quake`
 
-![Quake Gameplay](https://imgur.com/gXKb7D0.gif)
+[Quake](https://en.wikipedia.org/wiki/Quake_(series)) 是 id Software 在 1996 年
+推出的第一人称射击游戏，使用完整 3D 引擎。该 demo 适合验证 RV32F 浮点、
+图形帧刷新、输入事件和较重的解释/JIT 执行路径。
 
-### Default Key Bindings
-* Move Forward/Backward: Up Arrow Key/Down Arrow Key
-* Move Left/Right: Comma(,) Key/Period(.) Key
-* Turn Left/Right: Left Arrow Key/Right Arrow Key
-* Swim Up/Down: D Key/C Key
-* Shoot: Left Mouse Button or CTRL Key
-* Switch Weapon: Slash(/) Key
-* Sprint: Shift Key
+![Quake 游戏画面](https://imgur.com/gXKb7D0.gif)
 
-You may use the mouse to adjust the pitch and yaw angle.
+### 默认按键
 
-### Music and Sound Effects
-Sound effects are supported, but music is currently unavailable in Quake because it requires a CD-ROM.
-The extracted pak file lacks any music or background music files.
+* 前进/后退：上方向键/下方向键
+* 左移/右移：逗号键（`,`）/句号键（`.`）
+* 左转/右转：左方向键/右方向键
+* 上浮/下潜：D 键/C 键
+* 射击：鼠标左键或 CTRL 键
+* 切换武器：斜杠键（`/`）
+* 奔跑：Shift 键
 
-### Limitations
-* Mouse wheel input is not supported
-* Music related functions in Quake are not implemented
+可以使用鼠标调整俯仰角和偏航角。
+
+### 音乐和音效
+
+Quake 当前支持音效；音乐暂不可用，因为原游戏音乐依赖 CD-ROM，提取出的 pak
+文件不包含音乐或背景音乐资源。
+
+### 限制
+
+* 暂不支持鼠标滚轮输入
+* 暂未实现 Quake 中的音乐相关函数

@@ -3,57 +3,61 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * JIT 基本块缓存接口。
+ *
+ * cache_t 管理 PC/SATP 到 block_t 的映射、热点计数和系统模式下的页级失效索引。
+ * JIT、T2C 和 SFENCE.VMA/FENCE.I 路径通过这些 API 查询、插入、清理缓存块。
+ */
+
 #pragma once
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 
-/* Currently, THRESHOLD is set to identify hot spots. Once the using frequency
- * for a block exceeds the THRESHOLD, the tier-1 JIT compiler process is
- * triggered.
+/* THRESHOLD 用于判定热点基本块。
+ * 某个基本块的使用频次超过该阈值后，会触发一级 JIT 编译流程。
  */
 #define THRESHOLD 4096
 
 struct cache;
 
-/** cache_create - create a new cache
- * @size_bits: cache size is 2^size_bits
- * @return: a pointer points to new cache
+/** cache_create - 创建一个新的缓存对象
+ * @size_bits: 缓存容量为 2^size_bits
+ * @return: 新缓存对象指针；创建失败时返回 NULL
  */
 struct cache *cache_create(uint32_t size_bits);
 
 /**
- * cache_get - retrieve the specified entry from the cache
- * @cache: a pointer points to target cache
- * @key: the key of the specified entry
- * @update: update frequency or not
- * @return: the specified entry or NULL
+ * cache_get - 从缓存中查询指定条目
+ * @cache: 目标缓存指针
+ * @key: 待查询条目的键
+ * @update: 是否更新命中频次
+ * @return: 命中的条目值；未命中时返回 NULL
  */
 void *cache_get(const struct cache *cache, uint32_t key, bool update);
 
 /**
- * cache_put - insert a new entry into the cache
- * @cache: a pointer points to target cache
- * @key: the key of the inserted entry
- * @value: the value of the inserted entry
- * @return: the replaced entry or NULL
+ * cache_put - 向缓存插入新条目
+ * @cache: 目标缓存指针
+ * @key: 待插入条目的键
+ * @value: 待插入条目的值
+ * @return: 被替换的旧条目值；没有替换项时返回 NULL
  */
 void *cache_put(struct cache *cache, uint32_t key, void *value);
 
 /**
- * cache_free - free a cache
- * @cache: a pointer points to target cache
- * @callback: a function for freeing cache entry completely
+ * cache_free - 释放缓存对象
+ * @cache: 目标缓存指针
  */
 void cache_free(struct cache *cache);
 
 #if RV32_HAS(JIT)
 /**
- * cache_hot - check whether the frequency of the cache entry exceeds the
- * threshold or not
- * @cache: a pointer points to target cache
- * @key: the key of the specified entry
+ * cache_hot - 检查缓存条目的访问频次是否已经超过热点阈值
+ * @cache: 目标缓存指针
+ * @key: 待查询条目的键
  */
 bool cache_hot(const struct cache *cache, uint32_t key);
 
@@ -70,35 +74,34 @@ uint32_t cache_freq(const struct cache *cache, uint32_t key);
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM)
 
 /**
- * cache_invalidate_satp - invalidate all blocks matching the given SATP
- * @cache: a pointer to target cache
- * @satp: the SATP value to match
- * @return: number of blocks invalidated
+ * cache_invalidate_satp - 失效所有匹配指定 SATP 的基本块
+ * @cache: 目标缓存指针
+ * @satp: 用于匹配的 SATP 值
+ * @return: 被失效的基本块数量
  *
- * This is used by SFENCE.VMA with rs1=0 (global flush) to invalidate
- * JIT-compiled blocks that may contain stale VA→PA mappings.
+ * 该接口用于处理 rs1=0 的 SFENCE.VMA（全局刷新），清理可能包含过期
+ * VA 到 PA 映射的 JIT 编译基本块。
  */
 uint32_t cache_invalidate_satp(struct cache *cache, uint32_t satp);
 
 /**
- * cache_invalidate_va - invalidate blocks within a VA page matching SATP
- * @cache: a pointer to target cache
- * @va: the virtual address (page will be derived)
- * @satp: the SATP value to match
- * @return: number of blocks invalidated
+ * cache_invalidate_va - 失效匹配 SATP 且落在指定虚拟页内的基本块
+ * @cache: 目标缓存指针
+ * @va: 虚拟地址（函数内部会提取页地址）
+ * @satp: 用于匹配的 SATP 值
+ * @return: 被失效的基本块数量
  *
- * This is used by SFENCE.VMA with rs1!=0 (address-specific flush) to
- * invalidate JIT-compiled blocks in a specific virtual page.
- * Uses O(1) page-indexed lookup when BLOCK_CHAINING is enabled,
- * otherwise falls back to O(n) scan.
+ * 该接口用于处理 rs1!=0 的 SFENCE.VMA（按地址刷新），清理指定虚拟页内的
+ * JIT 编译基本块。启用 BLOCK_CHAINING 时优先使用 O(1) 页索引查找，
+ * 否则退回到 O(n) 全量扫描。
  */
 uint32_t cache_invalidate_va(struct cache *cache, uint32_t va, uint32_t satp);
 
 #if RV32_HAS(BLOCK_CHAINING)
-/* Page index for O(1) cache invalidation by virtual address.
- * With page-bounded blocks, each block fits entirely within one 4KB page,
- * allowing direct lookup by page address instead of O(n) scan.
- * Requires BLOCK_CHAINING for page-terminated blocks (see emulate.c).
+/* 按虚拟地址做 O(1) 缓存失效的页索引。
+ * 基本块被限制在页边界内时，每个块都完整落在一个 4KB 页中，因此可以按页地址
+ * 直接定位，而不必执行 O(n) 扫描。该机制依赖 BLOCK_CHAINING 产生的页终止块
+ * （见 emulate.c）。
  */
 #define PAGE_INDEX_BITS 10
 #define PAGE_INDEX_SIZE (1 << PAGE_INDEX_BITS)

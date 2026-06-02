@@ -3,12 +3,19 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
-#pragma once
-
-/* Check: https://github.com/torvalds/linux/blob/v6.1/drivers/rtc/rtc-goldfish.c
+/*
+ * Goldfish RTC 设备接口。
+ *
+ * 定义 Linux goldfish RTC 驱动期望的 MMIO 寄存器列表和状态结构，用于读取当前
+ * 时间、设置闹钟并向 PLIC 触发中断。
  */
 
-/* Google Goldfish RTC MMIO registers */
+#pragma once
+
+/* 参考：https://github.com/torvalds/linux/blob/v6.1/drivers/rtc/rtc-goldfish.c
+ */
+
+/* Google Goldfish RTC MMIO 寄存器。 */
 #define RTC_REG_LIST                   \
     _(TIME_LOW, 0x00)        /* R/W */ \
     _(TIME_HIGH, 0x04)       /* R/W */ \
@@ -34,8 +41,7 @@ typedef struct {
     uint32_t alarm_status;
     uint32_t interrupt_status;
 
-    /* Ensure the clock always progresses so RTC_SET_TIME ioctl can set any
-     * arbitrary time */
+    /* 保证时钟始终向前推进，同时允许 RTC_SET_TIME ioctl 设置任意时间。 */
     uint64_t clock_offset;
 } rtc_t;
 

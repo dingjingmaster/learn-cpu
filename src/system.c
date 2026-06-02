@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 系统模式支持。
+ *
+ * 该文件实现特权态运行所需的中断更新、SV32 页表遍历、TLB 缓存、MMIO 分派和
+ * 地址转换。Linux 内核访问 UART、PLIC、RTC、virtio-blk 等设备时，会通过这里
+ * 的 MMU 和 MMIO 路径进入对应设备模型。
  */
 
 #include <assert.h>
@@ -71,9 +78,8 @@ void mmu_tlb_flush(riscv_t *rv, uint32_t vaddr)
         rv->itlb[idx].valid = 0;
 }
 
-/* TLB lookup for data accesses (read/write).
- * Returns physical address if TLB hit, 0 if miss.
- * Updates A/D bits in PTE on successful lookup.
+/* 数据访问（读/写）的 TLB 查询。
+ * 命中时返回物理地址，未命中返回 0；写访问命中时同步更新 PTE 的 A/D 位。
  */
 static inline uint32_t dtlb_lookup(riscv_t *rv,
                                    uint32_t vaddr,
@@ -85,16 +91,16 @@ static inline uint32_t dtlb_lookup(riscv_t *rv,
     tlb_entry_t *entry = &rv->dtlb[idx];
 
     if (entry->valid && entry->vpn == vpn) {
-        /* Check permissions */
+        /* 检查访问权限。 */
         uint8_t needed = write ? PTE_W : PTE_R;
         if (!(entry->perm & needed)) {
             *hit = false;
             return 0;
         }
 
-        /* Handle dirty bit for writes */
+        /* 写访问需要处理 dirty 位。 */
         if (write && !entry->dirty) {
-            /* Update PTE dirty bit in memory */
+            /* 同步更新内存中的 PTE dirty 位。 */
             vm_attr_t *attr = PRIV(rv);
             pte_t *pte = (pte_t *) (attr->mem->mem_base + entry->pte_addr);
             *pte |= PTE_D;
@@ -102,7 +108,7 @@ static inline uint32_t dtlb_lookup(riscv_t *rv,
         }
 
         *hit = true;
-        /* ppn stores the page-aligned physical address base */
+        /* ppn 保存页对齐的物理地址基址。 */
         uint32_t offset = (entry->level == TLB_PAGE_LEVEL_SUPER)
                               ? (vaddr & MASK(RV_PG_SHIFT + 10))
                               : (vaddr & MASK(RV_PG_SHIFT));
@@ -113,8 +119,8 @@ static inline uint32_t dtlb_lookup(riscv_t *rv,
     return 0;
 }
 
-/* TLB lookup for instruction fetches.
- * Returns physical address if TLB hit, 0 if miss.
+/* 指令取指的 TLB 查询。
+ * 命中时返回物理地址，未命中返回 0。
  */
 static inline uint32_t itlb_lookup(riscv_t *rv, uint32_t vaddr, bool *hit)
 {
@@ -123,14 +129,14 @@ static inline uint32_t itlb_lookup(riscv_t *rv, uint32_t vaddr, bool *hit)
     tlb_entry_t *entry = &rv->itlb[idx];
 
     if (entry->valid && entry->vpn == vpn) {
-        /* Check execute permission */
+        /* 检查执行权限。 */
         if (!(entry->perm & PTE_X)) {
             *hit = false;
             return 0;
         }
 
         *hit = true;
-        /* ppn stores the page-aligned physical address base */
+        /* ppn 保存页对齐的物理地址基址。 */
         uint32_t offset = (entry->level == TLB_PAGE_LEVEL_SUPER)
                               ? (vaddr & MASK(RV_PG_SHIFT + 10))
                               : (vaddr & MASK(RV_PG_SHIFT));
@@ -141,7 +147,7 @@ static inline uint32_t itlb_lookup(riscv_t *rv, uint32_t vaddr, bool *hit)
     return 0;
 }
 
-/* Populate dTLB entry after successful page walk */
+/* 页表遍历成功后填充 dTLB 条目。 */
 static inline void dtlb_populate(riscv_t *rv,
                                  uint32_t vaddr,
                                  pte_t *pte,
@@ -153,8 +159,7 @@ static inline void dtlb_populate(riscv_t *rv,
     tlb_entry_t *entry = &rv->dtlb[idx];
 
     entry->vpn = vpn;
-    /* Store page-aligned physical address base (PPN extracted from PTE bits
-     * [31:10], shifted left by 12) */
+    /* 保存页对齐物理地址基址：从 PTE [31:10] 提取 PPN 后左移 12 位。 */
     entry->ppn = *pte >> (RV_PG_SHIFT - 2) << RV_PG_SHIFT;
     entry->pte_addr = (uint8_t *) pte - attr->mem->mem_base;
     entry->perm = *pte & (PTE_R | PTE_W | PTE_X | PTE_U);
@@ -163,7 +168,7 @@ static inline void dtlb_populate(riscv_t *rv,
     entry->valid = 1;
 }
 
-/* Populate iTLB entry after successful page walk */
+/* 页表遍历成功后填充 iTLB 条目。 */
 static inline void itlb_populate(riscv_t *rv,
                                  uint32_t vaddr,
                                  pte_t *pte,
@@ -175,8 +180,7 @@ static inline void itlb_populate(riscv_t *rv,
     tlb_entry_t *entry = &rv->itlb[idx];
 
     entry->vpn = vpn;
-    /* Store page-aligned physical address base (PPN extracted from PTE bits
-     * [31:10], shifted left by 12) */
+    /* 保存页对齐物理地址基址：从 PTE [31:10] 提取 PPN 后左移 12 位。 */
     entry->ppn = *pte >> (RV_PG_SHIFT - 2) << RV_PG_SHIFT;
     entry->pte_addr = (uint8_t *) pte - attr->mem->mem_base;
     entry->perm = *pte & (PTE_R | PTE_W | PTE_X | PTE_U);
@@ -190,19 +194,18 @@ static inline void itlb_populate(riscv_t *rv,
         ? (uint32_t *) (attr->mem->mem_base + (ppn << (RV_PG_SHIFT))) \
         : NULL
 
-/* Walk through page tables and get the corresponding PTE by virtual address if
- * exists
- * @rv: RISC-V emulator
- * @vaddr: virtual address
- * @level: the level of which the PTE is located
- * @return: NULL if a not found or fault else the corresponding PTE
+/* 遍历页表，按虚拟地址查找对应 PTE。
+ * @rv: RISC-V 模拟器实例。
+ * @vaddr: 虚拟地址。
+ * @level: 输出 PTE 所在页表层级。
+ * @return: 未找到或遇到异常时返回 NULL，否则返回对应 PTE。
  */
 pte_t *mmu_walk(riscv_t *rv, const uint32_t vaddr, uint32_t *level)
 {
     vm_attr_t *attr = PRIV(rv);
     uint32_t ppn = rv->csr_satp & MASK(22);
 
-    /* root page table */
+    /* 根页表。 */
     uint32_t *page_table = PAGE_TABLE(ppn);
     if (!page_table)
         return NULL;
@@ -215,7 +218,7 @@ pte_t *mmu_walk(riscv_t *rv, const uint32_t vaddr, uint32_t *level)
 
         uint8_t XWRV_bit = (*pte & MASK(4));
         switch (XWRV_bit) {
-        case NEXT_PG_TBL: /* next level of the page table */
+        case NEXT_PG_TBL: /* 下一层页表。 */
             ppn = (*pte >> (RV_PG_SHIFT - 2));
             page_table = PAGE_TABLE(ppn);
             if (!page_table)
@@ -228,9 +231,9 @@ pte_t *mmu_walk(riscv_t *rv, const uint32_t vaddr, uint32_t *level)
         case RWX_PAGE:
             ppn = (*pte >> (RV_PG_SHIFT - 2));
             if (*level == 1 &&
-                unlikely(ppn & MASK(10))) /* misaligned superpage */
+                unlikely(ppn & MASK(10))) /* 超级页未对齐。 */
                 return NULL;
-            return pte; /* leaf PTE */
+            return pte; /* 叶子 PTE。 */
         case RESRV_PAGE1:
         case RESRV_PAGE2:
         default:
@@ -241,15 +244,14 @@ pte_t *mmu_walk(riscv_t *rv, const uint32_t vaddr, uint32_t *level)
     return NULL;
 }
 
-/* Verify the PTE and generate corresponding faults if needed
- * @op: the operation
- * @rv: RISC-V emulator
- * @pte: to be verified pte
- * @vaddr: the corresponding virtual address to cause fault
- * @return: false if a any fault is generated which caused by violating the
- * access permission else true
+/* 校验 PTE，必要时产生对应页异常。
+ * @op: 访问操作。
+ * @rv: RISC-V 模拟器实例。
+ * @pte: 待校验 PTE。
+ * @vaddr: 触发异常的虚拟地址。
+ * @return: 因权限违规产生异常时返回 false，否则返回 true。
  */
-/* FIXME: handle access fault, addr out of range check */
+/* FIXME：补充 access fault 和地址越界检查。 */
 #define MMU_FAULT_CHECK(op, rv, pte, vaddr, access_bits) \
     mmu_##op##_fault_check(rv, pte, vaddr, access_bits)
 #define MMU_FAULT_CHECK_IMPL(op, pgfault)                                     \
@@ -281,11 +283,9 @@ pte_t *mmu_walk(riscv_t *rv, const uint32_t vaddr, uint32_t *level)
             return false;                                                     \
         }                                                                     \
         /*                                                                    \
-         * (1) When MXR=0, only loads from pages marked readable (R=1) will   \
-         * succeed.                                                           \
+         * (1) MXR=0 时，只允许从标记为可读（R=1）的页面加载。              \
          *                                                                    \
-         * (2) When MXR=1, loads from pages marked either readable or         \
-         * executable (R=1 or X=1) will succeed.                              \
+         * (2) MXR=1 时，标记为可读或可执行（R=1 或 X=1）的页面都可加载。   \
          */                                                                   \
         if (pte && ((!(SSTATUS_MXR & rv->csr_sstatus) && !(*pte & PTE_R) &&   \
                      (access_bits == PTE_R)) ||                               \
@@ -296,20 +296,19 @@ pte_t *mmu_walk(riscv_t *rv, const uint32_t vaddr, uint32_t *level)
             return false;                                                     \
         }                                                                     \
         /*                                                                    \
-         * When SUM=0, S-mode memory accesses to pages that are accessible by \
-         * U-mode will fault.                                                 \
+         * SUM=0 时，S 模式访问 U 模式可访问页面会触发异常。                \
          */                                                                   \
         if (pte && rv->priv_mode == RV_PRIV_S_MODE &&                         \
             !(SSTATUS_SUM & rv->csr_sstatus) && (*pte & PTE_U)) {             \
             SET_CAUSE_AND_TVAL_THEN_TRAP(rv, scause, stval);                  \
             return false;                                                     \
         }                                                                     \
-        /* PTE not found, map it in handler */                                \
+        /* 没有找到 PTE，交给异常处理器建立映射。 */                         \
         if (!pte) {                                                           \
             SET_CAUSE_AND_TVAL_THEN_TRAP(rv, scause, stval);                  \
             return false;                                                     \
         }                                                                     \
-        /* valid PTE */                                                       \
+        /* PTE 有效。 */                                                     \
         return true;                                                          \
     }
 
@@ -317,14 +316,10 @@ MMU_FAULT_CHECK_IMPL(ifetch, pagefault_insn)
 MMU_FAULT_CHECK_IMPL(read, pagefault_load)
 MMU_FAULT_CHECK_IMPL(write, pagefault_store)
 
-/* The IO handler that operates when the Memory Management Unit (MMU)
- * is enabled during system emulation is responsible for managing
- * input/output operations. These callbacks are designed to implement
- * the riscv_io_t interface, ensuring compatibility and consistency to
- * the structure required by the interface. As a result, the riscv_io_t
- * interface can be reused.
+/* 系统模拟启用 MMU 后，I/O 处理器负责管理地址转换后的取指、读写和 MMIO 分派。
+ * 这些回调实现 riscv_io_t 接口，因此解释器、JIT 和 T2C 都能复用同一组入口。
  *
- * The IO handlers include:
+ * I/O 处理器包括：
  * - mmu_ifetch
  * - mmu_read_w
  * - mmu_read_s
@@ -337,9 +332,8 @@ extern bool need_retranslate;
 static uint32_t mmu_ifetch(riscv_t *rv, const uint32_t vaddr)
 {
     /*
-     * Do not call rv->io.mem_translate() because the basic block might be
-     * retranslated and the corresponding PTE is NULL, get_ppn_and_offset()
-     * cannot work on a NULL PTE.
+     * 这里不要调用 rv->io.mem_translate()。基本块可能正在重翻译，对应 PTE 可能
+     * 为 NULL，而 get_ppn_and_offset() 无法处理 NULL PTE。
      */
 
     if (!rv->csr_satp)
@@ -348,13 +342,13 @@ static uint32_t mmu_ifetch(riscv_t *rv, const uint32_t vaddr)
     if (need_retranslate)
         return 0;
 
-    /* Try iTLB first for fast path */
+    /* 快路径先查 iTLB。 */
     bool hit;
     uint32_t paddr = itlb_lookup(rv, vaddr, &hit);
     if (hit)
         return memory_ifetch(paddr);
 
-    /* TLB miss - do full page walk */
+    /* TLB 未命中，执行完整页表遍历。 */
     uint32_t level;
     pte_t *pte = mmu_walk(rv, vaddr, &level);
     bool ok = MMU_FAULT_CHECK(ifetch, rv, pte, vaddr, PTE_X);
@@ -364,22 +358,22 @@ static uint32_t mmu_ifetch(riscv_t *rv, const uint32_t vaddr)
         if (need_handle_signal)
             return 0;
 #endif
-        /* Retry walk after trap handler has set up the page */
+        /* 异常处理器建立页面后重试页表遍历。 */
         pte = mmu_walk(rv, vaddr, &level);
-        /* Re-validate permissions after retry */
+        /* 重试后再次校验权限。 */
         if (!pte || !MMU_FAULT_CHECK(ifetch, rv, pte, vaddr, PTE_X)) {
             need_retranslate = true;
-            /* Also set need_handle_signal so RVOP macro returns for retry */
+            /* 同时设置 need_handle_signal，让 RVOP 宏返回解释器重试。 */
             need_handle_signal = true;
             return 0;
         }
     }
 
-    /* Update Accessed bit per RISC-V Sv32 spec */
+    /* 按 RISC-V Sv32 规范更新 Accessed 位。 */
     if (!(*pte & PTE_A))
         *pte |= PTE_A;
 
-    /* Populate iTLB for future accesses */
+    /* 填充 iTLB，服务后续访问。 */
     itlb_populate(rv, vaddr, pte, level);
 
     get_ppn_and_offset();
@@ -529,13 +523,13 @@ uint32_t mmu_translate(riscv_t *rv, uint32_t vaddr, bool rw)
     if (!rv->csr_satp)
         return vaddr;
 
-    /* Try dTLB first for fast path */
+    /* 快路径先查 dTLB。 */
     bool hit;
     uint32_t paddr = dtlb_lookup(rv, vaddr, !rw, &hit);
     if (hit)
         return paddr;
 
-    /* TLB miss - do full page walk */
+    /* TLB 未命中，执行完整页表遍历。 */
     uint32_t level;
     pte_t *pte = mmu_walk(rv, vaddr, &level);
     bool ok = rw ? MMU_FAULT_CHECK(read, rv, pte, vaddr, PTE_R)
@@ -546,15 +540,15 @@ uint32_t mmu_translate(riscv_t *rv, uint32_t vaddr, bool rw)
         if (need_handle_signal)
             return 0;
 #endif
-        /* Retry walk after trap handler has set up the page */
+        /* 异常处理器建立页面后重试页表遍历。 */
         pte = mmu_walk(rv, vaddr, &level);
-        /* Re-validate permissions after retry */
+        /* 重试后再次校验权限。 */
         ok = rw ? MMU_FAULT_CHECK(read, rv, pte, vaddr, PTE_R)
                 : MMU_FAULT_CHECK(write, rv, pte, vaddr, PTE_W);
         if (!pte || !ok) {
 #if RV32_HAS(ELF_LOADER)
             need_retranslate = true;
-            /* Also set need_handle_signal so RVOP macro returns for retry */
+            /* 同时设置 need_handle_signal，让 RVOP 宏返回解释器重试。 */
             need_handle_signal = true;
 #else
             need_handle_signal = true;
@@ -563,13 +557,13 @@ uint32_t mmu_translate(riscv_t *rv, uint32_t vaddr, bool rw)
         }
     }
 
-    /* Update A/D bits per RISC-V Sv32 spec */
+    /* 按 RISC-V Sv32 规范更新 A/D 位。 */
     if (!(*pte & PTE_A))
         *pte |= PTE_A;
-    if (!rw && !(*pte & PTE_D)) /* Write access needs Dirty bit */
+    if (!rw && !(*pte & PTE_D)) /* 写访问需要 Dirty 位。 */
         *pte |= PTE_D;
 
-    /* Populate dTLB for future accesses */
+    /* 填充 dTLB，服务后续访问。 */
     dtlb_populate(rv, vaddr, pte, level);
 
     get_ppn_and_offset();
@@ -577,21 +571,21 @@ uint32_t mmu_translate(riscv_t *rv, uint32_t vaddr, bool rw)
 }
 
 riscv_io_t mmu_io = {
-    /* memory read interface */
+    /* 内存读取接口。 */
     .mem_ifetch = mmu_ifetch,
     .mem_read_w = mmu_read_w,
     .mem_read_s = mmu_read_s,
     .mem_read_b = mmu_read_b,
 
-    /* memory write interface */
+    /* 内存写入接口。 */
     .mem_write_w = mmu_write_w,
     .mem_write_s = mmu_write_s,
     .mem_write_b = mmu_write_b,
 
-    /* VA2PA handler */
+    /* 虚拟地址到物理地址转换入口。 */
     .mem_translate = mmu_translate,
 
-    /* MMU memory access functions for T2C runtime binding */
+    /* T2C 运行时绑定使用的 MMU 内存访问函数。 */
     .mmu_read_w = mmu_read_w,
     .mmu_read_s = mmu_read_s,
     .mmu_read_b = mmu_read_b,
@@ -599,7 +593,7 @@ riscv_io_t mmu_io = {
     .mmu_write_s = mmu_write_s,
     .mmu_write_b = mmu_write_b,
 
-    /* system services or essential routines */
+    /* 系统服务和必要运行时例程。 */
     .on_ecall = ecall_handler,
     .on_ebreak = ebreak_handler,
     .on_memcpy = memcpy_handler,

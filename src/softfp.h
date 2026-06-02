@@ -3,6 +3,13 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * RV32F 软件浮点辅助接口。
+ *
+ * 当启用 F 扩展时，解释器通过 SoftFloat 完成 IEEE 754 单精度运算。本头文件
+ * 封装浮点寄存器访问、舍入模式、异常标志和常用转换/分类辅助。
+ */
+
 #pragma once
 
 #include <stdint.h>
@@ -29,7 +36,7 @@ enum {
 };
 /* clang-format on */
 
-/* compute the fclass result */
+/* 计算 fclass 结果。 */
 static inline uint32_t calc_fclass(uint32_t f)
 {
     const uint32_t sign = f & FMASK_SIGN;
@@ -39,40 +46,40 @@ static inline uint32_t calc_fclass(uint32_t f)
     uint32_t out = 0;
 
     /*
-     * 0x001    rs1 is -INF
-     * 0x002    rs1 is negative normal
-     * 0x004    rs1 is negative subnormal
-     * 0x008    rs1 is -0
-     * 0x010    rs1 is +0
-     * 0x020    rs1 is positive subnormal
-     * 0x040    rs1 is positive normal
-     * 0x080    rs1 is +INF
-     * 0x100    rs1 is a signaling NaN
-     * 0x200    rs1 is a quiet NaN
+     * 0x001    rs1 为 -INF
+     * 0x002    rs1 为负正规数
+     * 0x004    rs1 为负非正规数
+     * 0x008    rs1 为 -0
+     * 0x010    rs1 为 +0
+     * 0x020    rs1 为正非正规数
+     * 0x040    rs1 为正正规数
+     * 0x080    rs1 为 +INF
+     * 0x100    rs1 为 signaling NaN
+     * 0x200    rs1 为 quiet NaN
      */
 
-    /* Check the exponent bits */
+    /* 检查指数位。 */
     if (expn) {
         if (expn != FMASK_EXPN) {
-            /* Check if it is negative normal or positive normal */
+            /* 检查是否为负正规数或正正规数。 */
             out = sign ? 0x002 : 0x040;
         } else {
-            /* Check if it is NaN */
+            /* 检查是否为 NaN。 */
             if (frac) {
                 out = frac & FMASK_QNAN ? 0x200 : 0x100;
             } else if (!sign) {
-                /* Check if it is +INF */
+                /* 检查是否为 +INF。 */
                 out = 0x080;
             } else {
-                /* Check if it is -INF */
+                /* 检查是否为 -INF。 */
                 out = 0x001;
             }
         }
     } else if (frac) {
-        /* Check if it is negative or positive subnormal */
+        /* 检查是否为负非正规数或正非正规数。 */
         out = sign ? 0x004 : 0x020;
     } else {
-        /* Check if it is +0 or -0 */
+        /* 检查是否为 +0 或 -0。 */
         out = sign ? 0x008 : 0x010;
     }
 

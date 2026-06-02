@@ -1,13 +1,13 @@
-# Unified dependency detection
+# 统一依赖探测
 #
-# Provides helper functions for detecting libraries and packages.
-# Optimized to skip expensive checks for non-build targets (clean, help, etc.)
+# 提供库和包探测的辅助函数。
+# 对 clean、help 等非构建目标会跳过耗时检查。
 
 ifndef _MK_DEPS_INCLUDED
 _MK_DEPS_INCLUDED := 1
 
-# Verbosity control (consistent with mk/common.mk)
-# 'make V=1' equals to 'make VERBOSE=1'
+# 输出详细程度控制；与 mk/common.mk 保持一致。
+# `make V=1` 等价于 `make VERBOSE=1`。
 ifeq ("$(origin V)","command line")
     VERBOSE = $(V)
 endif
@@ -17,16 +17,16 @@ else
     DEVNULL := 2>/dev/null
 endif
 
-# pkg-config for cross-compilation
+# 交叉编译时可通过该变量指定 pkg-config。
 PKG_CONFIG ?= pkg-config
 
-# Dependency Detection Functions (always available)
+# 依赖探测函数（始终可用）。
 
 # dep(type, packages)
-# type: cflags | libs
-# packages: space-separated package names
+# type：cflags 或 libs
+# packages：以空格分隔的包名
 #
-# Usage:
+# 用法：
 #   CFLAGS += $(call dep,cflags,sdl2)
 #   LDFLAGS += $(call dep,libs,sdl2)
 #
@@ -43,7 +43,7 @@ $(shell \
 endef
 
 # pkg-exists(package)
-# Returns "y" if found, empty otherwise
+# 找到包时返回 "y"，否则返回空。
 #
 define pkg-exists
 $(shell \
@@ -55,24 +55,24 @@ $(shell \
 )
 endef
 
-# Skip expensive dependency detection for clean/help/distclean
-# SKIP_DEPS_CHECK is set in mk/common.mk
+# clean/help/distclean 等目标跳过耗时依赖探测。
+# SKIP_DEPS_CHECK 由 mk/common.mk 设置。
 ifeq ($(SKIP_DEPS_CHECK),)
 
-# SDL2 Detection
-# Note: HAVE_SDL2 is exported for Kconfig environment detection (tools/detect-env.py)
-# SDL2_CFLAGS/LIBS are only computed when CONFIG_SDL=y (after .config is loaded)
+# SDL2 探测。
+# HAVE_SDL2 会导出给 Kconfig 环境探测工具 tools/detect-env.py。
+# SDL2_CFLAGS/LIBS 只在 CONFIG_SDL=y 且 .config 已加载后计算。
 HAVE_SDL2 := $(call pkg-exists,sdl2)
 
-# SDL2_mixer
+# SDL2_mixer 探测。
 HAVE_SDL2_MIXER := $(shell $(PKG_CONFIG) --exists SDL2_mixer $(DEVNULL) && echo y)
 
-# Export for Kconfig
+# 导出给 Kconfig。
 export HAVE_SDL2
 export HAVE_SDL2_MIXER
 
-# Compute SDL flags only when SDL is enabled (deferred until after .config)
-# These are used by the build rules, guarded by CONFIG_SDL
+# 仅在 SDL 启用时计算 SDL 编译/链接参数；该计算会延后到 .config 加载后。
+# 构建规则使用这些变量，并由 CONFIG_SDL 控制。
 ifeq ($(CONFIG_SDL),y)
 ifeq ($(HAVE_SDL2),y)
     SDL2_CFLAGS := $(call dep,cflags,sdl2)

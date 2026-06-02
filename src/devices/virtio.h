@@ -3,6 +3,13 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * virtio MMIO 块设备公共定义。
+ *
+ * 包含 virtio-mmio 寄存器偏移、特性位、队列描述符和 virtio-blk 状态结构。
+ * virtio-blk.c 使用这些定义解析客体驱动提交的块设备请求。
+ */
+
 #pragma once
 
 #define VIRTIO_VENDOR_ID 0x12345678
@@ -33,10 +40,10 @@
 #define VIRTIO_BLK_S_IOERR 1
 #define VIRTIO_BLK_S_UNSUPP 2
 
-/* TODO: support more features */
+/* TODO：支持更多 virtio-blk 特性位。 */
 #define VIRTIO_BLK_F_RO (1 << 5)
 
-/* VirtIO MMIO registers */
+/* VirtIO MMIO 寄存器。 */
 #define VIRTIO_REG_LIST                  \
     _(MagicValue, 0x000)        /* R */  \
     _(Version, 0x004)           /* R */  \
@@ -88,23 +95,23 @@ typedef struct {
 } virtio_blk_queue_t;
 
 typedef struct {
-    /* feature negotiation */
+    /* 特性协商状态。 */
     uint32_t device_features;
     uint32_t device_features_sel;
     uint32_t driver_features;
     uint32_t driver_features_sel;
-    /* queue config */
+    /* 当前队列选择和队列配置。 */
     uint32_t queue_sel;
     virtio_blk_queue_t queues[2];
-    /* status */
+    /* 设备状态和待通知中断。 */
     uint32_t status;
     uint32_t interrupt_status;
-    /* supplied by environment */
+    /* 由外部虚拟机环境提供的 RAM、磁盘映射和文件句柄。 */
     uint32_t *ram;
     uint32_t *disk;
     uint64_t disk_size;
     int disk_fd;
-    /* implementation-specific */
+    /* 设备实现私有数据。 */
     void *priv;
 } virtio_blk_state_t;
 

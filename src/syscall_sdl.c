@@ -3,8 +3,16 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * SDL 扩展系统调用。
+ *
+ * 图形 demo 和游戏通过非标准 ecall 调用本文件提供的帧缓冲绘制、输入事件队列、
+ * 音乐和音效控制。它不是 Linux/POSIX ABI 的一部分，而是为 rv32emu 的演示程序
+ * 提供一个轻量的图形、输入和音频宿主接口。
+ */
+
 #if !RV32_HAS(SDL)
-#error "Do not manage to build this file unless you enable SDL support."
+#error "只有启用 SDL 支持时才能构建此文件。"
 #endif
 
 #include <errno.h>
@@ -22,22 +30,21 @@
 #include "riscv.h"
 #include "riscv_private.h"
 
-/* The DSITMBK sound effect in DOOM1.WAD uses a sample rate of 22050, but since
- * the game is played in single-player mode, it is acceptable to stick with
- * 11025.
+/* DOOM1.WAD 中的 DSITMBK 音效采样率是 22050；由于这里只以单人模式运行游戏，
+ * 固定使用 11025 也可以接受。
  *
- * In Quake, most sound effects have a sample rate of 11025.
+ * Quake 中大多数音效采样率也是 11025。
  */
 #define SAMPLE_RATE 11025
 
-/* Most audio device supports stereo */
+/* 大多数音频设备支持立体声。 */
 #define CHANNEL_USED 2
 
 #define CHUNK_SIZE 2048
 
 #define MUSIC_MAX_SIZE 65536
 
-/* Max size of sound is around 18000 bytes */
+/* 音效最大尺寸约为 18000 字节，这里留出更大缓冲。 */
 #define SFX_SAMPLE_SIZE 32768
 
 #define R 1
@@ -76,7 +83,7 @@ static uint32_t curr_data_size;
     GET_DATA_FROM_RANDOM_PAGE(source_vaddr, dest)
 #endif
 
-/* sound-related request type */
+/* 声音相关请求类型。 */
 enum {
     INIT_AUDIO,
     SHUTDOWN_AUDIO,
@@ -93,17 +100,17 @@ typedef struct sound {
     int volume;
 } sound_t;
 
-/* SDL-mixer-related and music-related variables */
+/* SDL_mixer 和音乐相关变量。 */
 static uint8_t *music_midi_data;
 #if RV32_HAS(SDL_MIXER)
 static Mix_Music *mid;
 
-/* SDL-mixer-related and sfx-related variables */
+/* SDL_mixer 和音效相关变量。 */
 static Mix_Chunk *sfx_chunk;
 #endif
 
 #ifdef __EMSCRIPTEN__
-/* Thread handles only needed for EMSCRIPTEN joinable threads */
+/* 仅 EMSCRIPTEN joinable 线程需要这些线程句柄。 */
 static pthread_t music_thread;
 static pthread_t sfx_thread;
 #endif
@@ -111,7 +118,7 @@ static uint8_t *sfx_samples;
 static uint32_t nr_sfx_samples;
 static int chan;
 
-/* Used to properly destroy audio, compatible to process VM emulation */
+/* 用于正确销毁音频资源，并兼容进程级 VM 模拟。 */
 static bool audio_init = false;
 static bool sfx_thread_init = false;
 static bool music_thread_init = false;
@@ -190,12 +197,12 @@ typedef struct {
     size_t start;
 } submission_queue_t;
 
-/* SDL-related variables */
+/* SDL 相关变量。 */
 static SDL_Window *window = NULL;
 static SDL_Renderer *renderer;
 static SDL_Texture *texture;
 
-/* Event queue specific variables */
+/* 事件队列专用变量。 */
 static uint32_t queues_capacity;
 static uint32_t event_count;
 static uint32_t deferred_submissions = 0;
@@ -244,7 +251,7 @@ static inline uint32_t round_pow2(uint32_t x)
 #if defined(__GNUC__) || defined(__clang__)
     x = 1 << (32 - __builtin_clz(x - 1));
 #else
-    /* Bit Twiddling Hack */
+    /* 位运算扩展技巧。 */
     x--;
     x |= x >> 1;
     x |= x >> 2;
@@ -258,19 +265,19 @@ static inline uint32_t round_pow2(uint32_t x)
 
 void syscall_submit_queue(riscv_t *rv);
 
-/* check if SDL needs to be set up and run the event loop */
+/* 检查是否需要初始化 SDL，并运行事件循环。 */
 static bool check_sdl(riscv_t *rv, int width, int height)
 {
-    if (!window) { /* check if video has been initialized. */
+    if (!window) { /* 检查视频子系统是否已经初始化。 */
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
-            rv_log_fatal("Failed to call SDL_Init()");
+            rv_log_fatal("调用 SDL_Init() 失败");
             exit(EXIT_FAILURE);
         }
         window = SDL_CreateWindow("rv32emu", SDL_WINDOWPOS_UNDEFINED,
                                   SDL_WINDOWPOS_UNDEFINED, width, height,
                                   SDL_WINDOW_RESIZABLE);
         if (!window) {
-            rv_log_fatal("Window could not be created! SDL_Error: %s",
+            rv_log_fatal("无法创建窗口！SDL_Error：%s",
                          SDL_GetError());
             exit(EXIT_FAILURE);
         }
@@ -286,7 +293,7 @@ static bool check_sdl(riscv_t *rv, int width, int height)
     }
 
     SDL_Event event;
-    while (SDL_PollEvent(&event)) { /* Run event handler */
+    while (SDL_PollEvent(&event)) { /* 运行事件处理器。 */
         switch (event.type) {
         case SDL_QUIT: {
             event_t new_event = {
@@ -411,7 +418,7 @@ void syscall_setup_queue(riscv_t *rv)
 
     uint32_t event_queue_addr = rv->io.mem_translate(rv, base, R);
 
-    /* now the bases are the gPA and host can access directly */
+    /* 此时 base 已经是 gPA，宿主可直接访问。 */
     event_queue.base = event_queue_addr;
     submission_queue.base = submission_queue_addr;
 #else
@@ -483,11 +490,9 @@ void syscall_submit_queue(riscv_t *rv)
  * 3. This notice may not be removed or altered from any source distribution.
  */
 
-/* This is a simple MUS to MIDI converter designed for programs such as DOOM
- * that utilize MIDI for sound storage.
+/* 这是一个简单的 MUS 到 MIDI 转换器，用于 DOOM 这类使用 MIDI 存储声音的程序。
  *
- * The sfx_handler can also manage Quake's sound effects since they are all in
- * WAV format.
+ * sfx_handler 也能管理 Quake 音效，因为它们都是 WAV 格式。
  */
 
 typedef PACKED(struct {
@@ -542,10 +547,10 @@ static int mus_end_of_track;
 static uint8_t delta_bytes[4];
 static int delta_cnt;
 
-/* maintain a list of channel volume */
+/* 维护通道音量列表。 */
 static uint8_t mus_channel[16];
 
-/* main conversion routine for MUS to MIDI */
+/* MUS 到 MIDI 的主转换例程。 */
 static int convert(void)
 {
     uint8_t data, last, channel;
@@ -665,11 +670,11 @@ uint8_t *mus2midi(uint8_t *data, int *length)
     midi_size = sizeof(midi_header_t);
     memcpy(midi_hdr.id, magic_midi, 4);
     midi_hdr.length = bswap32(6);
-    midi_hdr.type = bswap16(0); /* single track should be type 0 */
+    midi_hdr.type = bswap16(0); /* 单轨 MIDI 应使用 type 0。 */
     midi_hdr.ntracks = bswap16(1);
-    /* maybe, set 140ppqn and set tempo to 1000000µs */
+    /* 近似设置为 140ppqn，并把 tempo 设为 1000000us。 */
     midi_hdr.ticks =
-        bswap16(70); /* 70 ppqn = 140 per second @ tempo = 500000µs (default) */
+        bswap16(70); /* 默认 tempo=500000us 时，70 ppqn = 每秒 140 tick。 */
     midi_data = malloc(midi_size);
     if (unlikely(!midi_data))
         return NULL;
@@ -700,7 +705,7 @@ uint8_t *mus2midi(uint8_t *data, int *length)
         if (unlikely(convert() < 0))
             return NULL;
 
-    /* a final delta time must be added prior to the end of track event */
+    /* track 结束事件前必须追加最后一个 delta time。 */
     midi_data_tmp = realloc(midi_data, midi_size + delta_cnt);
     if (unlikely(!midi_data_tmp)) {
         free(midi_data);
@@ -733,14 +738,14 @@ static void *sfx_handler(void *arg)
     sound_t *sfx = (sound_t *) arg;
     uint8_t *ptr = sfx->data;
 
-    if (*ptr & 0x3) { /* Doom WAV format */
-        ptr += 2;     /* skip format */
-        ptr += 2;     /* skip sample rate since SAMPLE_RATE is defined */
+    if (*ptr & 0x3) { /* Doom WAV 格式。 */
+        ptr += 2;     /* 跳过格式字段。 */
+        ptr += 2;     /* SAMPLE_RATE 已定义，跳过采样率字段。 */
         nr_sfx_samples = *(uint32_t *) ptr;
         ptr += 4;
-        ptr += 4;  /* skip pad bytes */
-    } else {       /* Normal WAV format*/
-        ptr += 44; /* skip RIFF header */
+        ptr += 4;  /* 跳过填充字节。 */
+    } else {       /* 普通 WAV 格式。 */
+        ptr += 44; /* 跳过 RIFF header。 */
         nr_sfx_samples = sfx->size - 44;
     }
 
@@ -758,11 +763,11 @@ static void *sfx_handler(void *arg)
     }
 
     if (*ptr & 0x3) {
-        /* Doom, multiplied by 8 because sfx->volume's max is 15 */
+        /* Doom：sfx->volume 最大为 15，因此乘以 8。 */
         Mix_Volume(chan, sfx->volume * 8);
     } else {
-        /* Quake, + 1 mod by 128 because sfx->volume's max is 255 and
-         * Mix_Volume's max is 128.
+        /* Quake：sfx->volume 最大为 255，而 Mix_Volume 最大为 128，
+         * 因此使用 (volume + 1) % 128 映射。
          */
         Mix_Volume(chan, (sfx->volume + 1) % 128);
     }
@@ -776,11 +781,11 @@ static void *music_handler(void *arg)
     sound_t *music = (sound_t *) arg;
     int looping = music->looping ? -1 : 1;
 
-    /* Free previous MIDI data */
+    /* 释放上一次的 MIDI 数据。 */
     free(music_midi_data);
     music_midi_data = NULL;
 
-    /* Free previous music to prevent memory leak */
+    /* 释放上一次的音乐资源，避免内存泄漏。 */
     if (mid) {
         Mix_HaltMusic();
         Mix_FreeMusic(mid);
@@ -789,32 +794,32 @@ static void *music_handler(void *arg)
 
     music_midi_data = mus2midi(music->data, (int *) &music->size);
     if (!music_midi_data) {
-        rv_log_error("mus2midi() failed");
+        rv_log_error("mus2midi() 失败");
         free(music);
         return NULL;
     }
 
     SDL_RWops *rwops = SDL_RWFromMem(music_midi_data, music->size);
     if (!rwops) {
-        rv_log_error("SDL_RWFromMem failed: %s", SDL_GetError());
+        rv_log_error("SDL_RWFromMem 失败：%s", SDL_GetError());
         free(music);
         return NULL;
     }
 
     mid = Mix_LoadMUSType_RW(rwops, MUS_MID, SDL_TRUE);
     if (!mid) {
-        rv_log_error("Mix_LoadMUSType_RW failed: %s", Mix_GetError());
+        rv_log_error("Mix_LoadMUSType_RW 失败：%s", Mix_GetError());
         free(music);
         return NULL;
     }
 
-    /* multiplied by 8 because sfx->volume's max is 15
-     * further setting volume via syscall_set_music_volume
+    /* sfx->volume 最大为 15，因此乘以 8。
+     * 后续可通过 syscall_set_music_volume 继续设置音量。
      */
     Mix_VolumeMusic(music->volume * 8);
 
     if (Mix_PlayMusic(mid, looping) == -1) {
-        rv_log_error("Mix_PlayMusic failed: %s", Mix_GetError());
+        rv_log_error("Mix_PlayMusic 失败：%s", Mix_GetError());
         free(music);
         return NULL;
     }
@@ -844,25 +849,24 @@ static void play_sfx(riscv_t *rv)
     memory_read(attr->mem, (uint8_t *) &sfxinfo, sfxinfo_addr,
                 sizeof(sfxinfo_t));
 
-    /* The data and size in the application must be positioned in the first two
-     * fields of the structure. This ensures emulator compatibility with
-     * various applications when accessing different sfxinfo_t instances.
+    /* 应用中的 data 和 size 必须位于结构体前两个字段。
+     * 这样模拟器访问不同 sfxinfo_t 实例时可兼容多种应用。
      */
     uint32_t sfx_data_offset = *((uint32_t *) &sfxinfo);
     sfx_data_size = *(uint32_t *) ((uint32_t *) &sfxinfo + 1);
 #endif
 
 #if RV32_HAS(SDL_MIXER)
-    /* Validate size to prevent excessive allocation from untrusted guest */
+    /* 校验大小，避免不可信 guest 触发过量分配。 */
     if (sfx_data_size == 0 || sfx_data_size > SFX_SAMPLE_SIZE)
         return;
 
-    /* Heap allocate sound_t + data buffer together (thread takes ownership) */
+    /* 在堆上同时分配 sound_t 和数据缓冲区；线程接管其所有权。 */
     sound_t *sfx = malloc(sizeof(sound_t) + sfx_data_size);
     if (!sfx)
         return;
 
-    sfx->data = (uint8_t *) (sfx + 1); /* Data follows the struct */
+    sfx->data = (uint8_t *) (sfx + 1); /* 数据紧随结构体之后。 */
     sfx->size = sfx_data_size;
     sfx->volume = volume;
 
@@ -879,15 +883,15 @@ static void play_sfx(riscv_t *rv)
 #endif
 
 #ifdef __EMSCRIPTEN__
-    /* Web browser: use joinable thread and wait for completion */
+    /* Web 浏览器：使用 joinable 线程，并等待播放处理完成。 */
     if (pthread_create(&sfx_thread, NULL, sfx_handler, sfx) != 0) {
         free(sfx);
         return;
     }
     pthread_join(sfx_thread, NULL);
-    /* Thread already joined - don't join again in shutdown_audio */
+    /* 线程已 join，shutdown_audio 中不要再次 join。 */
 #else
-    /* Native: use detached thread for non-blocking playback */
+    /* 原生环境：使用 detached 线程进行非阻塞播放。 */
     pthread_t thread;
     pthread_attr_t thread_attr;
     pthread_attr_init(&thread_attr);
@@ -917,9 +921,8 @@ static void play_music(riscv_t *rv)
     uint32_t addr = rv->io.mem_translate(rv, musicinfo_addr, R);
     memory_read(attr->mem, (uint8_t *) &musicinfo, addr, sizeof(musicinfo_t));
 
-    /* The data and size in the application must be positioned in the first two
-     * fields of the structure. This ensures emulator compatibility with
-     * various applications when accessing different musicinfo_t instances.
+    /* 应用中的 data 和 size 必须位于结构体前两个字段。
+     * 这样模拟器访问不同 musicinfo_t 实例时可兼容多种应用。
      */
     uint32_t music_data_offset =
         *((uint32_t *) ((uint8_t *) attr->mem->mem_base + addr));
@@ -929,25 +932,24 @@ static void play_music(riscv_t *rv)
     memory_read(attr->mem, (uint8_t *) &musicinfo, musicinfo_addr,
                 sizeof(musicinfo_t));
 
-    /* The data and size in the application must be positioned in the first two
-     * fields of the structure. This ensures emulator compatibility with
-     * various applications when accessing different sfxinfo_t instances.
+    /* 应用中的 data 和 size 必须位于结构体前两个字段。
+     * 这样模拟器访问不同 musicinfo_t 实例时可兼容多种应用。
      */
     uint32_t music_data_offset = *((uint32_t *) &musicinfo);
     music_data_size = *(uint32_t *) ((uint32_t *) &musicinfo + 1);
 #endif
 
 #if RV32_HAS(SDL_MIXER)
-    /* Validate size to prevent excessive allocation from untrusted guest */
+    /* 校验大小，避免不可信 guest 触发过量分配。 */
     if (music_data_size == 0 || music_data_size > MUSIC_MAX_SIZE)
         return;
 
-    /* Heap allocate sound_t + data buffer together (thread takes ownership) */
+    /* 在堆上同时分配 sound_t 和数据缓冲区；线程接管其所有权。 */
     sound_t *music = malloc(sizeof(sound_t) + music_data_size);
     if (!music)
         return;
 
-    music->data = (uint8_t *) (music + 1); /* Data follows the struct */
+    music->data = (uint8_t *) (music + 1); /* 数据紧随结构体之后。 */
     music->size = music_data_size;
     music->looping = looping;
     music->volume = volume;
@@ -964,15 +966,15 @@ static void play_music(riscv_t *rv)
 #endif
 
 #ifdef __EMSCRIPTEN__
-    /* Web browser: use joinable thread and wait for completion */
+    /* Web 浏览器：使用 joinable 线程，并等待播放处理完成。 */
     if (pthread_create(&music_thread, NULL, music_handler, music) != 0) {
         free(music);
         return;
     }
     pthread_join(music_thread, NULL);
-    /* Thread already joined - don't join again in shutdown_audio */
+    /* 线程已 join，shutdown_audio 中不要再次 join。 */
 #else
-    /* Native: use detached thread for non-blocking playback */
+    /* 原生环境：使用 detached 线程进行非阻塞播放。 */
     pthread_t thread;
     pthread_attr_t thread_attr;
     pthread_attr_init(&thread_attr);
@@ -997,7 +999,7 @@ static void set_music_volume(riscv_t *rv)
 {
     int volume = rv_get_reg(rv, rv_reg_a1);
 
-    /* multiplied by 8 because volume's max is 15 */
+    /* volume 最大为 15，因此乘以 8。 */
     Mix_VolumeMusic(volume * 8);
 }
 #endif /* RV32_HAS(SDL_MIXER) */
@@ -1006,26 +1008,26 @@ static void init_audio(void)
 {
     if (!(SDL_WasInit(-1) & SDL_INIT_AUDIO)) {
         if (SDL_Init(SDL_INIT_AUDIO) != 0) {
-            rv_log_fatal("Failed to call SDL_Init()");
+            rv_log_fatal("调用 SDL_Init() 失败");
             exit(EXIT_FAILURE);
         }
     }
 
-    /* sfx samples buffer */
+    /* sfx 采样缓冲区。 */
     sfx_samples = malloc(SFX_SAMPLE_SIZE);
     if (unlikely(!sfx_samples)) {
-        rv_log_fatal("Failed to allocate memory for buffer");
+        rv_log_fatal("为缓冲区分配内存失败");
         exit(EXIT_FAILURE);
     }
 
 #if RV32_HAS(SDL_MIXER)
-    /* Initialize SDL2 Mixer */
+    /* 初始化 SDL2 Mixer。 */
     if (Mix_Init(MIX_INIT_MID) != MIX_INIT_MID) {
-        rv_log_fatal("Mix_Init failed: %s", Mix_GetError());
+        rv_log_fatal("Mix_Init 失败：%s", Mix_GetError());
         exit(EXIT_FAILURE);
     }
     if (Mix_OpenAudio(SAMPLE_RATE, AUDIO_U8, CHANNEL_USED, CHUNK_SIZE) == -1) {
-        rv_log_fatal("Mix_OpenAudio failed: %s", Mix_GetError());
+        rv_log_fatal("Mix_OpenAudio 失败：%s", Mix_GetError());
         Mix_Quit();
         exit(EXIT_FAILURE);
     }
@@ -1036,14 +1038,14 @@ static void init_audio(void)
 static void shutdown_audio()
 {
 #if RV32_HAS(SDL_MIXER)
-    /* Stop all playback first */
+    /* 先停止所有播放。 */
     Mix_HaltMusic();
     Mix_HaltChannel(-1);
 
 #ifdef __EMSCRIPTEN__
     /*
-     * For EMSCRIPTEN, threads are joinable. Join them if initialized to ensure
-     * handlers have completed before freeing resources.
+     * EMSCRIPTEN 中线程是 joinable 的；若线程已初始化，需要先 join，确保 handler
+     * 已完成后再释放资源。
      */
     if (music_thread_init)
         pthread_join(music_thread, NULL);
@@ -1051,7 +1053,7 @@ static void shutdown_audio()
         pthread_join(sfx_thread, NULL);
 #endif
 
-    /* Free music resources */
+    /* 释放音乐资源。 */
     if (mid) {
         Mix_FreeMusic(mid);
         mid = NULL;
@@ -1059,7 +1061,7 @@ static void shutdown_audio()
     free(music_midi_data);
     music_midi_data = NULL;
 
-    /* Free sfx resources */
+    /* 释放 sfx 资源。 */
     if (sfx_chunk) {
         Mix_FreeChunk(sfx_chunk);
         sfx_chunk = NULL;
@@ -1084,9 +1086,8 @@ void sdl_video_audio_cleanup()
         window = NULL;
     }
     /*
-     * The sfx_or_music_thread_init flag might not be set if a quick ctrl-c
-     * occurs while the audio configuration is being initialized. Therefore,
-     * need to destroy the audio settings by checking audio_init flag.
+     * 音频配置初始化期间若快速触发 Ctrl-C，sfx_or_music_thread_init 标志可能
+     * 尚未设置。因此需要额外检查 audio_init 标志来销毁音频设置。
      */
     bool sfx_or_music_thread_init = sfx_thread_init | music_thread_init;
     if (sfx_or_music_thread_init || (!sfx_or_music_thread_init && audio_init))
@@ -1107,7 +1108,7 @@ void syscall_setup_audio(riscv_t *rv)
         shutdown_audio();
         break;
     default:
-        rv_log_error("Unknown sound request: %d", request);
+        rv_log_error("未知声音请求：%d", request);
         break;
     }
 }
@@ -1139,7 +1140,7 @@ void syscall_control_audio(riscv_t *rv)
 #endif
         break;
     default:
-        rv_log_error("Unknown sound control request: %d", request);
+        rv_log_error("未知声音控制请求：%d", request);
         break;
     }
 }

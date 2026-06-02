@@ -1,58 +1,50 @@
-/* RV32I Base Instruction Set
+/* RV32I 基础指令集。
  *
- * Conforming to the instructions specified in chapter 2 of the RISC-V
- * unprivileged specification version 20191213.
+ * 语义遵循 RISC-V 非特权规范 20191213 版本第 2 章。
  */
 
-/* Interpreter instruction implementations
+/* 解释器指令语义实现。
  *
- * This file contains the purely semantic implementations of RISC-V instructions
- * for the interpreter. It uses the RVOP macro to define the behavior of each
- * instruction by directly manipulating the emulator state.
+ * 本文件用 RVOP 宏定义每条 RISC-V 指令如何直接修改模拟器状态，是解释器的语义
+ * 来源。JIT 和 T2C 需要与这里保持一致，以避免不同执行层出现行为差异。
  *
- * Architecture:
- * - RVOP(name, { body }): Defines an interpreter handler function.
- * - Parameters: rv (emulator state), ir (decoded instruction),
- *   cycle (cycle counter), PC (program counter).
- * - Return: 'bool' indicating whether to continue execution.
+ * 架构：
+ * - RVOP(name, { body })：定义解释器处理函数。
+ * - 参数：rv（模拟器状态）、ir（已解码指令）、cycle（周期计数）、
+ *   PC（程序计数器）。
+ * - 返回值：bool，表示是否继续执行。
  *
- * Example:
+ * 示例：
  *   RVOP(addi, { rv->X[ir->rd] = rv->X[ir->rs1] + ir->imm; })
  *
- * Implementation notes:
- * - Changes to instruction semantics should be applied here, while JIT-specific
- *   optimizations should be applied in src/rv32_jit.c.
+ * 实现说明：
+ * - 指令语义变更应先改这里；JIT 专用优化放在 src/rv32_jit.c。
  */
 
-/* Internal */
+/* 内部伪操作。 */
 RVOP(nop, { rv->X[rv_reg_zero] = 0; })
 
-/* LUI is used to build 32-bit constants and uses the U-type format. LUI
- * places the U-immediate value in the top 20 bits of the destination
- * register rd, filling in the lowest 12 bits with zeros. The 32-bit
- * result is sign-extended to 64 bits.
+/* LUI 用 U-type 格式构造 32 位常量：U-immediate 放入目标寄存器高 20 位，
+ * 低 12 位填 0，结果按指令语义写回 rd。
  */
 RVOP(lui, { rv->X[ir->rd] = ir->imm; })
 
-/* AUIPC is used to build pc-relative addresses and uses the U-type format.
- * AUIPC forms a 32-bit offset from the 20-bit U-immediate, filling in the
- * lowest 12 bits with zeros, adds this offset to the address of the AUIPC
- * instruction, then places the result in register rd.
+/* AUIPC 用 U-type 格式构造 PC 相对地址：20 位 U-immediate 形成 32 位偏移，
+ * 低 12 位填 0，再加上当前指令 PC 并写入 rd。
  */
 RVOP(auipc, { rv->X[ir->rd] = ir->imm + PC; })
 
-/* JAL: Jump and Link
- * store successor instruction address into rd.
- * add next J imm (offset) to pc.
+/* JAL：跳转并链接。
+ * 把下一条指令地址写入 rd，并把 J-type 立即数偏移加到 PC。
  */
 RVOP(jal, {
     const uint32_t pc = PC;
-    /* Jump */
+    /* 执行跳转。 */
     PC += ir->imm;
-    /* link with return address */
+    /* 写入返回地址。 */
     if (ir->rd)
         rv->X[ir->rd] = pc + 4;
-    /* check instruction misaligned */
+    /* 检查目标地址是否满足指令对齐要求。 */
 #if !RV32_HAS(EXT_C)
     RV_EXC_MISALIGN_HANDLER(pc, INSN, false, 0);
 #endif
@@ -77,15 +69,13 @@ RVOP(jal, {
         if (!rv->is_trapped)
 #endif
         {
-            /* The last_pc should only be updated when not in the trap path.
-             * Updating it during the trap path could lead to incorrect
-             * block chaining in rv_step(). Specifically, an interrupt might
-             * occur before locating the previous block with last_pc, and
-             * since __trap_handler() uses the same RVOP, the last_pc could
-             * be updated incorrectly during the trap path.
+            /* last_pc 只能在非 trap 路径上更新。
+             * 如果在 trap 路径中更新，rv_step() 中的基本块链接可能出错。
+             * 具体来说，中断可能在通过 last_pc 查找上一个基本块之前发生；而
+             * __trap_handler() 也复用同一个 RVOP，因此 trap 路径可能错误更新
+             * last_pc。
              *
-             * This rule also applies to same statements elsewhere in this
-             * file.
+             * 本文件中其他相同语句也遵循这个规则。
              */
             last_pc = PC;
 
@@ -95,28 +85,25 @@ RVOP(jal, {
     goto end_op;
 })
 
-/* The branch history table records historical data pertaining to indirect jump
- * targets. This functionality alleviates the need to invoke block_find() and
- * incurs overhead only when the indirect jump targets are not previously
- * recorded. Additionally, this table lets the interpreter fast-path indirect
- * jumps without repeatedly calling block_find().
+/* 分支历史表记录间接跳转目标的历史数据。
+ * 它可以减少 block_find() 调用；只有间接跳转目标此前未记录时才会产生额外开销。
+ * 同时，该表让解释器可以快速处理间接跳转，而无需反复调用 block_find()。
  */
 #if !RV32_HAS(JIT)
 #define LOOKUP_OR_UPDATE_BRANCH_HISTORY_TABLE()                                \
     /*                                                                         \
-     * Direct-mapped branch history table lookup.                              \
+     * 直接映射分支历史表查找。                                                \
      *                                                                         \
-     * When handling trap, the branch history table should not be lookup since \
-     * it causes return from the trap_handler.                                 \
+     * 处理 trap 时不应查找分支历史表，否则可能从 trap_handler 错误返回。       \
      *                                                                         \
-     * In addition, before relocate_enable_mmu, the block maybe retranslated,  \
-     * thus the branch history lookup table should not be updated too.         \
+     * 此外，在 relocate_enable_mmu 完成前，基本块可能会重新翻译，因此也不应   \
+     * 更新分支历史表。                                                        \
      */                                                                        \
     IIF(RV32_HAS(GDBSTUB)(if (!rv->debug_mode), ))                             \
     {                                                                          \
         IIF(RV32_HAS(SYSTEM)(if (!rv->is_trapped && !reloc_enable_mmu), ))     \
         {                                                                      \
-            /* Direct-mapped lookup: O(1) instead of O(n) linear search */     \
+            /* 直接映射查找：O(1)，避免 O(n) 线性搜索。 */                    \
             const uint32_t bht_idx = (PC >> 2) & (HISTORY_SIZE - 1);           \
             if (ir->branch_table->PC[bht_idx] == PC &&                         \
                 ir->branch_table->target[bht_idx]) {                           \
@@ -125,7 +112,7 @@ RVOP(jal, {
             }                                                                  \
             block_t *block = block_find(&rv->block_map, PC);                   \
             if (block) {                                                       \
-                /* Direct replacement at computed index */                     \
+                /* 在计算出的索引处直接替换。 */                              \
                 ir->branch_table->PC[bht_idx] = PC;                            \
                 ir->branch_table->target[bht_idx] = block->ir_head;            \
                 MUST_TAIL return block->ir_head->impl(rv, block->ir_head,      \
@@ -139,7 +126,7 @@ RVOP(jal, {
     {                                                                        \
         block_t *block = cache_get(rv->block_cache, PC, true);               \
         if (block) {                                                         \
-            /* Direct-mapped lookup: O(1) instead of O(n) linear search */   \
+            /* 直接映射查找：O(1)，避免 O(n) 线性搜索。 */                  \
             const uint32_t bht_idx = (PC >> 2) & (HISTORY_SIZE - 1);         \
             if (ir->branch_table->PC[bht_idx] == PC) {                       \
                 IIF(RV32_HAS(SYSTEM))(                                       \
@@ -150,7 +137,7 @@ RVOP(jal, {
                         goto end_op;                                         \
                 }                                                            \
             }                                                                \
-            /* Direct replacement at computed index */                       \
+            /* 在计算出的索引处直接替换。 */                                \
             ir->branch_table->times[bht_idx] = 1;                            \
             ir->branch_table->PC[bht_idx] = PC;                              \
             IIF(RV32_HAS(SYSTEM))(                                           \
@@ -163,21 +150,19 @@ RVOP(jal, {
     }
 #endif
 
-/* The indirect jump instruction JALR uses the I-type encoding. The target
- * address is obtained by adding the sign-extended 12-bit I-immediate to the
- * register rs1, then setting the least-significant bit of the result to zero.
- * The address of the instruction following the jump (pc+4) is written to
- * register rd. Register x0 can be used as the destination if the result is
- * not required.
+/* 间接跳转指令 JALR 使用 I-type 编码。
+ * 目标地址由寄存器 rs1 加上符号扩展后的 12 位 I-immediate 得到，然后把结果最低位
+ * 清零。跳转后一条指令地址（pc+4）写入 rd。如果不需要返回地址，可以把 x0 作为
+ * 目标寄存器。
  */
 RVOP(jalr, {
     const uint32_t pc = PC;
-    /* jump */
+    /* 跳转。 */
     PC = (rv->X[ir->rs1] + ir->imm) & ~1U;
-    /* link */
+    /* 链接返回地址。 */
     if (ir->rd)
         rv->X[ir->rd] = pc + 4;
-    /* check instruction misaligned */
+    /* 检查指令地址是否未对齐。 */
 #if !RV32_HAS(EXT_C)
     RV_EXC_MISALIGN_HANDLER(pc, INSN, false, 0);
 #endif
@@ -185,17 +170,14 @@ RVOP(jalr, {
 
 #if RV32_HAS(SYSTEM)
     /*
-     * relocate_enable_mmu is the first function called to set up the MMU.
-     * Inside the function, at address 0x98, an invalid PTE is accessed,
-     * causing a fetch page fault and trapping into the trap_handler, and
-     * it will not return via sret.
+     * relocate_enable_mmu 是设置 MMU 时调用的第一个函数。
+     * 该函数内部在地址 0x98 会访问无效 PTE，导致取指页错误并陷入 trap_handler，
+     * 且不会通过 sret 返回。
      *
-     * After the jalr instruction at physical address 0xc00000b4
-     * (the final instruction of relocate_enable_mmu), the MMU becomes
-     * available.
+     * 执行物理地址 0xc00000b4 处的 jalr 指令后（relocate_enable_mmu 的最后一条
+     * 指令），MMU 变为可用。
      *
-     * Based on this, we need to manually escape from the trap_handler after
-     * the jalr instruction is executed.
+     * 因此，该 jalr 执行完成后需要手动从 trap_handler 中退出。
      */
     if (!reloc_enable_mmu && reloc_enable_mmu_jalr_addr == 0xc00000b4) {
         reloc_enable_mmu = true;
@@ -255,7 +237,7 @@ RVOP(jalr, {
         },                                                                     \
         is_branch_taken = true;);                                              \
     PC += ir->imm;                                                             \
-    /* check instruction misaligned */                                         \
+    /* 检查指令地址是否未对齐。 */                                             \
     IIF(RV32_HAS(EXT_C))(, RV_EXC_MISALIGN_HANDLER(pc, INSN, false, 0););      \
     struct rv_insn *taken = ir->branch_taken;                                  \
     if (taken) {                                                               \
@@ -280,52 +262,47 @@ RVOP(jalr, {
     }                                                                          \
     goto end_op;
 
-/* In RV32I and RV64I, if the branch is taken, set pc = pc + offset, where
- * offset is a multiple of two; else do nothing. The offset is 13 bits long.
+/* 在 RV32I 和 RV64I 中，若分支成立，则设置 pc = pc + offset；offset 是 2 的
+ * 倍数，长度为 13 位。若分支不成立，则不修改 PC。
  *
- * The condition for branch taken depends on the value in mnemonic, which is
- * one of:
- * - "beq": src1 == src2
- * - "bne": src1 != src2
- * - "blt": src1 < src2 as signed integers
- * - "bge": src1 >= src2 as signed integers
- * - "bltu": src1 < src2 as unsigned integers
- * - "bgeu": src1 >= src2 as unsigned integers
+ * 分支成立条件由助记符决定：
+ * - "beq"：src1 == src2
+ * - "bne"：src1 != src2
+ * - "blt"：按有符号整数比较，src1 < src2
+ * - "bge"：按有符号整数比较，src1 >= src2
+ * - "bltu"：按无符号整数比较，src1 < src2
+ * - "bgeu"：按无符号整数比较，src1 >= src2
  *
- * On branch taken, an instruction-address-misaligned exception is generated
- * if the target pc is not 4-byte aligned.
+ * 分支成立时，如果目标 PC 不是 4 字节对齐，则产生指令地址未对齐异常。
  */
 
-/* BEQ: Branch if Equal */
+/* BEQ：相等则分支。 */
 RVOP(beq, { BRANCH_FUNC(uint32_t, !=); })
 
-/* BNE: Branch if Not Equal */
+/* BNE：不相等则分支。 */
 RVOP(bne, { BRANCH_FUNC(uint32_t, ==); })
 
-/* BLT: Branch if Less Than */
+/* BLT：有符号小于则分支。 */
 RVOP(blt, { BRANCH_FUNC(int32_t, >=); })
 
-/* BGE: Branch if Greater Than */
+/* BGE：有符号大于等于则分支。 */
 RVOP(bge, { BRANCH_FUNC(int32_t, <); })
 
-/* BLTU: Branch if Less Than Unsigned */
+/* BLTU：无符号小于则分支。 */
 RVOP(bltu, { BRANCH_FUNC(uint32_t, >=); })
 
-/* BGEU: Branch if Greater Than Unsigned */
+/* BGEU：无符号大于等于则分支。 */
 RVOP(bgeu, { BRANCH_FUNC(uint32_t, <); })
 
-/* There are 5 types of loads: two for byte and halfword sizes, and one for word
- * size. Two instructions are required for byte and halfword loads because they
- * can be either zero-extended or sign-extended to fill the register. However,
- * for word-sized loads, an entire register's worth of data is read from memory,
- * and no extension is needed.
+/* 加载指令共有 5 种：字节和半字各有两种，字有一种。
+ * 字节和半字加载需要分别支持零扩展和符号扩展；字加载会从内存读取完整寄存器宽度的
+ * 数据，因此不需要扩展。
  */
 
-/* RAM fast-path memory access macros
+/* RAM 快路径内存访问宏。
  *
- * In non-SYSTEM mode, bypass io callback indirection for direct RAM access.
- * This eliminates function pointer dispatch overhead per memory operation.
- * In SYSTEM mode, use io callbacks for MMU/TLB handling.
+ * 非 SYSTEM 模式下，绕过 io 回调间接层，直接访问 RAM，消除每次内存操作的函数
+ * 指针分派开销。SYSTEM 模式下则继续使用 io 回调处理 MMU/TLB。
  */
 #if !RV32_HAS(SYSTEM)
 #define MEM_READ_W(rv, addr) ram_read_w(rv, addr)
@@ -343,46 +320,45 @@ RVOP(bgeu, { BRANCH_FUNC(uint32_t, <); })
 #define MEM_WRITE_B(rv, addr, val) (rv)->io.mem_write_b(rv, addr, val)
 #endif
 
-/* LB: Load Byte */
+/* LB：加载字节并符号扩展。 */
 RVOP(lb, {
     uint32_t addr = rv->X[ir->rs1] + ir->imm;
     rv->X[ir->rd] = sign_extend_b(MEM_READ_B(rv, addr));
 })
 
-/* LH: Load Halfword */
+/* LH：加载半字并符号扩展。 */
 RVOP(lh, {
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     RV_EXC_MISALIGN_HANDLER(1, LOAD, false, 1);
     rv->X[ir->rd] = sign_extend_h(MEM_READ_S(rv, addr));
 })
 
-/* LW: Load Word */
+/* LW：加载字。 */
 RVOP(lw, {
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
     rv->X[ir->rd] = MEM_READ_W(rv, addr);
 })
 
-/* LBU: Load Byte Unsigned */
+/* LBU：加载字节并零扩展。 */
 RVOP(lbu, {
     uint32_t addr = rv->X[ir->rs1] + ir->imm;
     rv->X[ir->rd] = MEM_READ_B(rv, addr);
 })
 
-/* LHU: Load Halfword Unsigned */
+/* LHU：加载半字并零扩展。 */
 RVOP(lhu, {
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     RV_EXC_MISALIGN_HANDLER(1, LOAD, false, 1);
     rv->X[ir->rd] = MEM_READ_S(rv, addr);
 })
 
-/* There are 3 types of stores: byte, halfword, and word-sized. Unlike loads,
- * there are no signed or unsigned variants, as stores to memory write exactly
- * the number of bytes specified, and there is no sign or zero extension
- * involved.
+/* 存储指令共有 3 种：字节、半字和字。
+ * 与加载不同，存储没有有符号/无符号变体，因为写入内存时只写指定字节数，不涉及
+ * 符号扩展或零扩展。
  */
 
-/* SB: Store Byte */
+/* SB：存储字节。 */
 RVOP(sb, {
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     const uint32_t value = rv->X[ir->rs2];
@@ -392,7 +368,7 @@ RVOP(sb, {
 #endif
 })
 
-/* SH: Store Halfword */
+/* SH：存储半字。 */
 RVOP(sh, {
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     RV_EXC_MISALIGN_HANDLER(1, STORE, false, 1);
@@ -403,7 +379,7 @@ RVOP(sh, {
 #endif
 })
 
-/* SW: Store Word */
+/* SW：存储字。 */
 RVOP(sw, {
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     RV_EXC_MISALIGN_HANDLER(3, STORE, false, 1);
@@ -414,32 +390,29 @@ RVOP(sw, {
 #endif
 })
 
-/* ADDI adds the sign-extended 12-bit immediate to register rs1. Arithmetic
- * overflow is ignored and the result is simply the low XLEN bits of the
- * result. ADDI rd, rs1, 0 is used to implement the MV rd, rs1 assembler
- * pseudo-instruction.
+/* ADDI 把符号扩展后的 12 位立即数加到寄存器 rs1。
+ * 算术溢出会被忽略，结果取低 XLEN 位。ADDI rd, rs1, 0 常用于实现汇编伪指令
+ * MV rd, rs1。
  */
 RVOP(addi, { rv->X[ir->rd] = rv->X[ir->rs1] + ir->imm; })
 
-/* SLTI place the value 1 in register rd if register rs1 is less than the
- * signextended immediate when both are treated as signed numbers, else 0 is
- * written to rd.
+/* SLTI 把 rs1 和符号扩展立即数都当作有符号数比较；若 rs1 小于立即数，则 rd=1，
+ * 否则 rd=0。
  */
 RVOP(slti, { rv->X[ir->rd] = ((int32_t) (rv->X[ir->rs1]) < ir->imm) ? 1 : 0; })
 
-/* SLTIU places the value 1 in register rd if register rs1 is less than the
- * immediate when both are treated as unsigned numbers, else 0 is written to rd.
+/* SLTIU 把 rs1 和立即数都当作无符号数比较；若 rs1 小于立即数，则 rd=1，
+ * 否则 rd=0。
  */
 RVOP(sltiu, { rv->X[ir->rd] = (rv->X[ir->rs1] < (uint32_t) ir->imm) ? 1 : 0; })
 
-/* XORI: Exclusive OR Immediate */
+/* XORI：立即数异或。 */
 RVOP(xori, { rv->X[ir->rd] = rv->X[ir->rs1] ^ ir->imm; })
 
-/* ORI: OR Immediate */
+/* ORI：立即数或。 */
 RVOP(ori, { rv->X[ir->rd] = rv->X[ir->rs1] | ir->imm; })
 
-/* ANDI performs bitwise AND on register rs1 and the sign-extended 12-bit
- * immediate and place the result in rd.
+/* ANDI 对寄存器 rs1 和符号扩展后的 12 位立即数执行按位与，并把结果写入 rd。
  */
 RVOP(andi, { rv->X[ir->rd] = rv->X[ir->rs1] & ir->imm; })
 
@@ -461,48 +434,45 @@ FORCE_INLINE void shift_func(riscv_t *rv, const rv_insn_t *ir)
     }
 };
 
-/* SLLI performs logical left shift on the value in register rs1 by the shift
- * amount held in the lower 5 bits of the immediate.
+/* SLLI 对 rs1 的值执行逻辑左移，移位量来自立即数低 5 位。
  */
 RVOP(slli, { shift_func(rv, ir); })
 
-/* SRLI performs logical right shift on the value in register rs1 by the shift
- * amount held in the lower 5 bits of the immediate.
+/* SRLI 对 rs1 的值执行逻辑右移，移位量来自立即数低 5 位。
  */
 RVOP(srli, { shift_func(rv, ir); })
 
-/* SRAI performs arithmetic right shift on the value in register rs1 by the
- * shift amount held in the lower 5 bits of the immediate.
+/* SRAI 对 rs1 的值执行算术右移，移位量来自立即数低 5 位。
  */
 RVOP(srai, { shift_func(rv, ir); })
 
 /* ADD */
 RVOP(add, { rv->X[ir->rd] = rv->X[ir->rs1] + rv->X[ir->rs2]; })
 
-/* SUB: Subtract */
+/* SUB：减法。 */
 RVOP(sub, { rv->X[ir->rd] = rv->X[ir->rs1] - rv->X[ir->rs2]; })
 
-/* SLL: Shift Left Logical */
+/* SLL：逻辑左移。 */
 RVOP(sll, { rv->X[ir->rd] = rv->X[ir->rs1] << (rv->X[ir->rs2] & 0x1f); })
 
-/* SLT: Set on Less Than */
+/* SLT：有符号小于则置位。 */
 RVOP(slt, {
     rv->X[ir->rd] =
         ((int32_t) (rv->X[ir->rs1]) < (int32_t) (rv->X[ir->rs2])) ? 1 : 0;
 })
 
-/* SLTU: Set on Less Than Unsigned */
+/* SLTU：无符号小于则置位。 */
 RVOP(sltu, { rv->X[ir->rd] = (rv->X[ir->rs1] < rv->X[ir->rs2]) ? 1 : 0; })
 
-/* XOR: Exclusive OR */
+/* XOR：按位异或。 */
 RVOP(xor, {
   rv->X[ir->rd] = rv->X[ir->rs1] ^ rv->X[ir->rs2];
 })
 
-/* SRL: Shift Right Logical */
+/* SRL：逻辑右移。 */
 RVOP(srl, { rv->X[ir->rd] = rv->X[ir->rs1] >> (rv->X[ir->rs2] & 0x1f); })
 
-/* SRA: Shift Right Arithmetic */
+/* SRA：算术右移。 */
 RVOP(sra,
      { rv->X[ir->rd] = ((int32_t) rv->X[ir->rs1]) >> (rv->X[ir->rs2] & 0x1f); })
 
@@ -517,16 +487,15 @@ RVOP(
 /* clang-format on */
 
 /*
- * FENCE: order device I/O and memory accesses as viewed by other
- * RISC-V harts and external devices or coprocessors
+ * FENCE：约束其他 RISC-V hart、外部设备或协处理器观察到的设备 I/O 和内存访问顺序。
  */
 RVOP(fence, {
     PC += 4;
-    /* FIXME: fill real implementations */
+    /* FIXME：补充真实实现。 */
     goto end_op;
 })
 
-/* ECALL: Environment Call */
+/* ECALL：环境调用。 */
 RVOP(ecall, {
     rv->compressed = false;
     rv->csr_cycle = cycle;
@@ -535,7 +504,7 @@ RVOP(ecall, {
     return true;
 })
 
-/* EBREAK: Environment Break */
+/* EBREAK：环境断点。 */
 RVOP(ebreak, {
     rv->compressed = false;
     rv->csr_cycle = cycle;
@@ -544,20 +513,20 @@ RVOP(ebreak, {
     return true;
 })
 
-/* WFI: Wait for Interrupt */
+/* WFI：等待中断。 */
 RVOP(wfi, {
     PC += 4;
-    /* FIXME: Implement */
+    /* FIXME：补充实现。 */
     goto end_op;
 })
 
-/* URET: return from traps in U-mode */
+/* URET：从 U-mode trap 返回。 */
 RVOP(uret, {
-    /* FIXME: Implement */
+    /* FIXME：补充实现。 */
     return false;
 })
 
-/* SRET: return from traps in S-mode */
+/* SRET：从 S-mode trap 返回。 */
 #if RV32_HAS(SYSTEM)
 RVOP(sret, {
     rv->is_trapped = false;
@@ -575,13 +544,13 @@ RVOP(sret, {
 })
 #endif
 
-/* HRET: return from traps in H-mode */
+/* HRET：从 H-mode trap 返回。 */
 RVOP(hret, {
-    /* FIXME: Implement */
+    /* FIXME：补充实现。 */
     return false;
 })
 
-/* MRET: return from traps in M-mode */
+/* MRET：从 M-mode trap 返回。 */
 RVOP(mret, {
     rv->priv_mode = (rv->csr_mstatus & MSTATUS_MPP) >> MSTATUS_MPP_SHIFT;
     rv->csr_mstatus &= ~(MSTATUS_MPP);
@@ -595,32 +564,30 @@ RVOP(mret, {
     return true;
 })
 
-/* SFENCE.VMA: synchronize updates to in-memory memory-management data
- * structures with current execution.
- * This instruction invalidates TLB entries:
- * - rs1 = 0: all TLB entries (global flush)
- * - rs1 != 0: only the entry for virtual address in rs1
- * The rs2 field specifies ASID (not implemented, treated as global).
+/* SFENCE.VMA：同步内存中内存管理数据结构的更新与当前执行流。
+ * 该指令会失效 TLB 条目：
+ * - rs1 = 0：所有 TLB 条目（全局刷新）
+ * - rs1 != 0：仅刷新 rs1 中虚拟地址对应的条目
+ * rs2 字段指定 ASID（当前未实现，按全局处理）。
  *
- * For JIT mode, we also invalidate compiled blocks that may contain stale
- * VA→PA mappings. This is necessary when PTEs are modified without changing
- * SATP (e.g., munmap + mmap to different PA, or mprotect changes).
+ * 在 JIT 模式下，还需要失效可能包含过期 VA 到 PA 映射的已编译基本块。
+ * 当 PTE 被修改但 SATP 未改变时（例如 munmap 后 mmap 到不同 PA，或 mprotect
+ * 修改权限），这一步是必要的。
  */
 RVOP(sfencevma, {
     PC += 4;
 #if RV32_HAS(SYSTEM)
     if (ir->rs1 == 0) {
-        /* Global flush: invalidate all TLB entries */
+        /* 全局刷新：失效所有 TLB 条目。 */
         mmu_tlb_flush_all(rv);
 #if RV32_HAS(JIT)
 #if RV32_HAS(T2C)
-        /* Hold cache_lock during invalidation to prevent race with T2C
-         * compilation thread. This ensures the invalidated flag and hot2 reset
-         * are seen atomically by the T2C thread.
+        /* 失效期间持有 cache_lock，避免与 T2C 编译线程竞争。
+         * 这能保证 T2C 线程以原子方式观察到 invalidated 标志和 hot2 重置。
          */
         pthread_mutex_lock(&rv->cache_lock);
 #endif
-        /* Invalidate JIT blocks with current SATP */
+        /* 失效当前 SATP 下的 JIT 基本块。 */
         cache_invalidate_satp(rv->block_cache, rv->csr_satp);
 #if RV32_HAS(T2C)
         jit_cache_clear(rv->jit_cache);
@@ -629,20 +596,19 @@ RVOP(sfencevma, {
 #endif
 #endif
     } else {
-        /* Selective flush: invalidate TLB entry for specific VA */
+        /* 选择性刷新：失效指定 VA 对应的 TLB 条目。 */
         uint32_t va = rv->X[ir->rs1];
         mmu_tlb_flush(rv, va);
 #if RV32_HAS(JIT)
 #if RV32_HAS(T2C)
-        /* Hold cache_lock during invalidation to prevent race with T2C
-         * compilation thread.
+        /* 失效期间持有 cache_lock，避免与 T2C 编译线程竞争。
          */
         pthread_mutex_lock(&rv->cache_lock);
 #endif
-        /* Invalidate JIT blocks in the target VA page */
+        /* 失效目标 VA 页内的 JIT 基本块。 */
         cache_invalidate_va(rv->block_cache, va, rv->csr_satp);
 #if RV32_HAS(T2C)
-        /* Selectively clear only jit_cache entries matching the VA page */
+        /* 只选择性清理匹配该 VA 页的 jit_cache 条目。 */
         jit_cache_clear_page(rv->jit_cache, va, rv->csr_satp);
         inline_cache_clear_page(rv->inline_cache, va, rv->csr_satp);
         pthread_mutex_unlock(&rv->cache_lock);
@@ -653,29 +619,26 @@ RVOP(sfencevma, {
     goto end_op;
 })
 
-#if RV32_HAS(Zifencei) /* RV32 Zifencei Standard Extension */
-/* FENCE.I: Instruction fence for self-modifying code synchronization.
- * Ensures that stores to instruction memory are visible to instruction fetches.
- * Must invalidate all cached/JITed code since instruction stream may have
- * changed.
+#if RV32_HAS(Zifencei) /* RV32 Zifencei 标准扩展。 */
+/* FENCE.I：用于自修改代码同步的指令栅栏。
+ * 保证写入指令内存的 store 对后续取指可见。由于指令流可能已改变，必须失效所有
+ * 缓存/JIT 后的代码。
  *
- * Unlike SFENCE.VMA which handles virtual memory changes, FENCE.I handles
- * instruction cache coherence - required when code modifies itself or loads
- * new code (e.g., dynamic linkers, JIT compilers running inside the guest).
+ * SFENCE.VMA 处理虚拟内存变化，而 FENCE.I 处理指令缓存一致性。客体代码自修改或
+ * 加载新代码（例如动态链接器、客体内部运行的 JIT 编译器）时需要它。
  */
 RVOP(fencei, {
     PC += 4;
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM)
 #if RV32_HAS(T2C)
-    /* Hold cache_lock during invalidation to prevent race with T2C
-     * compilation thread. Same locking protocol as SFENCE.VMA.
+    /* 失效期间持有 cache_lock，避免与 T2C 编译线程竞争。
+     * 锁协议与 SFENCE.VMA 相同。
      */
     pthread_mutex_lock(&rv->cache_lock);
 #endif
-    /* Invalidate all JIT blocks for current address space.
-     * FENCE.I is a global instruction cache barrier - must clear all cached
-     * code since we don't know which addresses were modified.
-     * Uses same invalidation as global SFENCE.VMA (rs1=0).
+    /* 失效当前地址空间中的全部 JIT 基本块。
+     * FENCE.I 是全局指令缓存屏障；由于不知道哪些地址被修改，必须清除所有缓存代码。
+     * 这里使用与全局 SFENCE.VMA（rs1=0）相同的失效方式。
      */
     cache_invalidate_satp(rv->block_cache, rv->csr_satp);
 #if RV32_HAS(T2C)
@@ -684,9 +647,8 @@ RVOP(fencei, {
     pthread_mutex_unlock(&rv->cache_lock);
 #endif
 #endif
-    /* Note: In non-system JIT mode, self-modifying code is rare and blocks
-     * will be naturally evicted. Full cache invalidation is not implemented
-     * for this case as it would require additional infrastructure.
+    /* 注意：非系统 JIT 模式中，自修改代码较少见，基本块会自然淘汰。
+     * 该场景未实现全缓存失效，因为这需要额外基础设施。
      */
     rv->csr_cycle = cycle;
     rv->PC = PC;
@@ -694,21 +656,19 @@ RVOP(fencei, {
 })
 #endif
 
-#if RV32_HAS(Zicsr) /* RV32 Zicsr Standard Extension */
-/* CSRRW: Atomic Read/Write CSR */
+#if RV32_HAS(Zicsr) /* RV32 Zicsr 标准扩展。 */
+/* CSRRW：原子读写 CSR。 */
 RVOP(csrrw, {
     uint32_t tmp = csr_csrrw(rv, ir->imm, rv->X[ir->rs1], cycle);
     rv->X[ir->rd] = ir->rd ? tmp : rv->X[ir->rd];
 })
 
-/* CSRRS: Atomic Read and Set Bits in CSR */
-/* The initial value in integer register rs1 is treated as a bit mask that
- * specifies the bit positions to be set in the CSR. Any bit that is set in
- * rs1 will result in the corresponding bit being set in the CSR, provided
- * that the CSR bit is writable. Other bits in the CSR remain unaffected,
- * although some CSRs might exhibit side effects when written to.
+/* CSRRS：原子读取 CSR 并置位。 */
+/* 整数寄存器 rs1 的初始值被视为位掩码，用于指定 CSR 中要置位的比特位置。
+ * 如果 rs1 中某位为 1，且对应 CSR 位可写，则该 CSR 位会被置位。CSR 中其他位保持
+ * 不变，不过某些 CSR 在写入时可能有副作用。
  *
- * See Page 56 of the RISC-V Unprivileged Specification.
+ * 见 RISC-V 非特权规范第 56 页。
  */
 RVOP(csrrs, {
     uint32_t tmp = csr_csrrs(
@@ -716,7 +676,7 @@ RVOP(csrrs, {
     rv->X[ir->rd] = ir->rd ? tmp : rv->X[ir->rd];
 })
 
-/* CSRRC: Atomic Read and Clear Bits in CSR */
+/* CSRRC：原子读取 CSR 并清位。 */
 RVOP(csrrc, {
     uint32_t tmp = csr_csrrc(
         rv, ir->imm, (ir->rs1 == rv_reg_zero) ? 0U : rv->X[ir->rs1], cycle);
@@ -742,10 +702,10 @@ RVOP(csrrci, {
 })
 #endif
 
-/* RV32M Standard Extension */
+/* RV32M 标准扩展。 */
 
 #if RV32_HAS(EXT_M)
-/* MUL: Multiply */
+/* MUL：乘法，返回低 32 位。 */
 RVOP(mul, {
     const int64_t multiplicand = (int32_t) rv->X[ir->rs1];
     const int64_t multiplier = (int32_t) rv->X[ir->rs2];
@@ -753,9 +713,8 @@ RVOP(mul, {
         ((uint64_t) (multiplicand * multiplier)) & ((1ULL << 32) - 1);
 })
 
-/* MULH: Multiply High Signed Signed */
-/* It is important to first cast rs1 and rs2 to i32 so that the subsequent
- * cast to i64 sign-extends the register values.
+/* MULH：有符号 x 有符号乘法高位。 */
+/* 需要先把 rs1 和 rs2 转为 i32，这样后续转为 i64 时会对寄存器值做符号扩展。
  */
 RVOP(mulh, {
     const int64_t multiplicand = (int32_t) rv->X[ir->rs1];
@@ -763,10 +722,9 @@ RVOP(mulh, {
     rv->X[ir->rd] = ((uint64_t) (multiplicand * multiplier)) >> 32;
 })
 
-/* MULHSU: Multiply High Signed Unsigned */
-/* It is essential to perform an initial cast of rs1 to i32, ensuring that the
- * subsequent cast to i64 results in sign extension of the register value.
- * Additionally, rs2 should not undergo sign extension.
+/* MULHSU：有符号 x 无符号乘法高位。 */
+/* 必须先把 rs1 转为 i32，确保后续转为 i64 时对寄存器值符号扩展。
+ * rs2 则不应进行符号扩展。
  */
 RVOP(mulhsu, {
     const int64_t multiplicand = (int32_t) rv->X[ir->rs1];
@@ -774,18 +732,18 @@ RVOP(mulhsu, {
     rv->X[ir->rd] = ((uint64_t) (multiplicand * umultiplier)) >> 32;
 })
 
-/* MULHU: Multiply High Unsigned Unsigned */
+/* MULHU：无符号 x 无符号乘法高位。 */
 RVOP(mulhu, {
     rv->X[ir->rd] =
         ((uint64_t) rv->X[ir->rs1] * (uint64_t) rv->X[ir->rs2]) >> 32;
 })
 
-/* DIV: Divide Signed */
+/* DIV：有符号除法。 */
 /* +------------------------+-----------+----------+-----------+
- * |       Condition        |  Dividend |  Divisor |   DIV[W]  |
+ * |        条件            |   被除数  |   除数   |   DIV[W]  |
  * +------------------------+-----------+----------+-----------+
- * | Division by zero       |  x        |  0       |  −1       |
- * | Overflow (signed only) |  −2^{L−1} |  −1      |  −2^{L−1} |
+ * | 除零                   |  x        |  0       |  −1       |
+ * | 溢出（仅有符号）       |  −2^{L−1} |  −1      |  −2^{L−1} |
  * +------------------------+-----------+----------+-----------+
  */
 RVOP(div, {
@@ -793,15 +751,15 @@ RVOP(div, {
     const int32_t divisor = (int32_t) rv->X[ir->rs2];
     rv->X[ir->rd] = !divisor ? ~0U
                     : (divisor == -1 && rv->X[ir->rs1] == 0x80000000U)
-                        ? rv->X[ir->rs1] /* overflow */
+                        ? rv->X[ir->rs1] /* 溢出。 */
                         : (unsigned int) (dividend / divisor);
 })
 
-/* DIVU: Divide Unsigned */
+/* DIVU：无符号除法。 */
 /* +------------------------+-----------+----------+----------+
- * |       Condition        |  Dividend |  Divisor |  DIVU[W] |
+ * |        条件            |   被除数  |   除数   |  DIVU[W] |
  * +------------------------+-----------+----------+----------+
- * | Division by zero       |  x        |  0       |  2^L − 1 |
+ * | 除零                   |  x        |  0       |  2^L − 1 |
  * +------------------------+-----------+----------+----------+
  */
 RVOP(divu, {
@@ -811,12 +769,12 @@ RVOP(divu, {
 })
 
 /* clang-format off */
-/* REM: Remainder Signed */
+/* REM：有符号取余。 */
 /* +------------------------+-----------+----------+---------+
- * |       Condition        |  Dividend |  Divisor |  REM[W] |
+ * |        条件            |   被除数  |   除数   |  REM[W] |
  * +------------------------+-----------+----------+---------+
- * | Division by zero       |  x        |  0       |  x      |
- * | Overflow (signed only) |  −2^{L−1} |  −1      |  0      |
+ * | 除零                   |  x        |  0       |  x      |
+ * | 溢出（仅有符号）       |  −2^{L−1} |  −1      |  0      |
  * +------------------------+-----------+----------+---------+
  */
 RVOP(rem, {
@@ -828,11 +786,11 @@ RVOP(rem, {
                         % divisor);
 })
 
-/* REMU: Remainder Unsigned */
+/* REMU：无符号取余。 */
 /* +------------------------+-----------+----------+----------+
- * |       Condition        |  Dividend |  Divisor |  REMU[W] |
+ * |        条件            |   被除数  |   除数   |  REMU[W] |
  * +------------------------+-----------+----------+----------+
- * | Division by zero       |  x        |  0       |  x       |
+ * | 除零                   |  x        |  0       |  x       |
  * +------------------------+-----------+----------+----------+
  */
 RVOP(remu, {
@@ -844,45 +802,38 @@ RVOP(remu, {
 /* clang-format on */
 #endif
 
-/* RV32A Standard Extension */
+/* RV32A 标准扩展。 */
 
 #if RV32_HAS(EXT_A)
-/* The Atomic Memory Operation (AMO) instructions execute read-modify-write
- * operations to synchronize multiple processors and are encoded in an R-type
- * instruction format.
+/* AMO（Atomic Memory Operation）指令执行读-改-写操作，用于同步多个处理器；
+ * 它们采用 R-type 指令格式编码。
  *
- * These AMO instructions guarantee atomicity when loading a data value from
- * the memory address stored in the register rs1. The loaded value is then
- * transferred to the register rd, where a binary operator is applied to this
- * value and the original value stored in the register rs2. Finally, the
- * resulting value is stored back to the memory address in rs1, ensuring
- * atomicity.
+ * 这些 AMO 指令保证从 rs1 指向的内存地址加载数据值时的原子性。加载出的原值会写入
+ * rd，同时与 rs2 中的原值执行某个二元运算；最终运算结果再写回 rs1 指向的内存地址，
+ * 从而保证整个过程原子。
  *
- * AMOs support the manipulation of 64-bit words exclusively in RV64, whereas
- * both 64-bit and 32-bit words can be manipulated in other systems. In RV64,
- * when performing 32-bit AMOs, the value placed in the register rd is always
- * sign-extended.
+ * RV64 中 AMO 支持 64 位字操作；其他系统中还支持 32 位字操作。在 RV64 中执行
+ * 32 位 AMO 时，写入 rd 的值总是符号扩展后的结果。
  *
- * At present, AMO is not implemented atomically because the emulated RISC-V
- * core just runs on single thread, and no out-of-order execution happens.
- * In addition, rl/aq are not handled.
+ * 当前 AMO 没有真正做原子实现，因为模拟的 RISC-V 核只在单线程中运行，也不会发生
+ * 乱序执行。另外，rl/aq 位目前未处理。
  */
 
-/* LR.W: Load Reserved */
+/* LR.W：保留加载。 */
 RVOP(lrw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
     if (ir->rd)
         rv->X[ir->rd] = MEM_READ_W(rv, addr);
-    /* skip registration of the 'reservation set'
-     * FIXME: unimplemented
+    /* 跳过 reservation set 注册。
+     * FIXME：尚未实现。
      */
 })
 
-/* SC.W: Store Conditional */
+/* SC.W：条件存储。 */
 RVOP(scw, {
-    /* assume the 'reservation set' is valid
-     * FIXME: unimplemented
+    /* 暂时假设 reservation set 有效。
+     * FIXME：尚未实现。
      */
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, STORE, false, 1);
@@ -894,7 +845,7 @@ RVOP(scw, {
 #endif
 })
 
-/* AMOSWAP.W: Atomic Swap */
+/* AMOSWAP.W：原子交换。 */
 RVOP(amoswapw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
@@ -908,7 +859,7 @@ RVOP(amoswapw, {
 #endif
 })
 
-/* AMOADD.W: Atomic ADD */
+/* AMOADD.W：原子加。 */
 RVOP(amoaddw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
@@ -923,7 +874,7 @@ RVOP(amoaddw, {
 #endif
 })
 
-/* AMOXOR.W: Atomic XOR */
+/* AMOXOR.W：原子异或。 */
 RVOP(amoxorw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
@@ -938,7 +889,7 @@ RVOP(amoxorw, {
 #endif
 })
 
-/* AMOAND.W: Atomic AND */
+/* AMOAND.W：原子与。 */
 RVOP(amoandw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
@@ -953,7 +904,7 @@ RVOP(amoandw, {
 #endif
 })
 
-/* AMOOR.W: Atomic OR */
+/* AMOOR.W：原子或。 */
 RVOP(amoorw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
@@ -968,7 +919,7 @@ RVOP(amoorw, {
 #endif
 })
 
-/* AMOMIN.W: Atomic MIN */
+/* AMOMIN.W：原子有符号最小值。 */
 RVOP(amominw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
@@ -985,7 +936,7 @@ RVOP(amominw, {
 #endif
 })
 
-/* AMOMAX.W: Atomic MAX */
+/* AMOMAX.W：原子有符号最大值。 */
 RVOP(amomaxw, {
     const uint32_t addr = rv->X[ir->rs1];
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
@@ -1033,12 +984,12 @@ RVOP(amomaxuw, {
 })
 #endif /* RV32_HAS(EXT_A) */
 
-/* RV32F Standard Extension */
+/* RV32F 标准扩展。 */
 
 #if RV32_HAS(EXT_F)
 /* FLW */
 RVOP(flw, {
-    /* copy into the float register */
+    /* 拷贝到浮点寄存器。 */
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     RV_EXC_MISALIGN_HANDLER(3, LOAD, false, 1);
     rv->F[ir->rd].v = MEM_READ_W(rv, addr);
@@ -1046,7 +997,7 @@ RVOP(flw, {
 
 /* FSW */
 RVOP(fsw, {
-    /* copy from float registers */
+    /* 从浮点寄存器拷贝。 */
     const uint32_t addr = rv->X[ir->rs1] + ir->imm;
     RV_EXC_MISALIGN_HANDLER(3, STORE, false, 1);
     const uint32_t value = rv->F[ir->rs2].v;
@@ -1144,11 +1095,11 @@ RVOP(fsgnjxs,
      { rv->F[ir->rd].v = rv->F[ir->rs1].v ^ (rv->F[ir->rs2].v & FMASK_SIGN); })
 
 /* FMIN.S
- * In IEEE754-201x, fmin(x, y) return
- * - min(x,y) if both numbers are not NaN
- * - if one is NaN and another is a number, return the number
- * - if both are NaN, return NaN
- * When input is signaling NaN, raise invalid operation
+ * 在 IEEE754-201x 中，fmin(x, y) 返回：
+ * - 若两者都不是 NaN，则返回 min(x, y)
+ * - 若一个是 NaN、另一个是数值，则返回该数值
+ * - 若两者都是 NaN，则返回 NaN
+ * 若输入为 signaling NaN，则置 invalid operation 异常标志。
  */
 RVOP(fmins, {
     if (f32_isSignalingNaN(rv->F[ir->rs1]) ||
@@ -1179,8 +1130,7 @@ RVOP(fmaxs, {
                                                              : rv->F[ir->rs2]);
 })
 
-/* FCVT.W.S and FCVT.WU.S convert a floating point number to an integer,
- * the rounding mode is specified in rm field.
+/* FCVT.W.S 和 FCVT.WU.S 把浮点数转换为整数，舍入模式由 rm 字段指定。
  */
 
 /* FCVT.W.S */
@@ -1207,8 +1157,8 @@ RVOP(fmvxw, {
         rv->X[ir->rd] = rv->F[ir->rs1].v;
 })
 
-/* FEQ.S performs a quiet comparison: it only sets the invalid operation
- * exception flag if either input is a signaling NaN.
+/* FEQ.S 执行静默比较：仅当任一输入为 signaling NaN 时才设置 invalid operation
+ * 异常标志。
  */
 RVOP(feqs, {
     uint32_t ret = f32_eq(rv->F[ir->rs1], rv->F[ir->rs2]);
@@ -1217,9 +1167,8 @@ RVOP(feqs, {
     set_fflag(rv);
 })
 
-/* FLT.S and FLE.S perform what the IEEE 754-2008 standard refers to as
- * signaling comparisons: that is, they set the invalid operation exception
- * flag if either input is NaN.
+/* FLT.S 和 FLE.S 执行 IEEE 754-2008 所称的 signaling comparisons：
+ * 只要任一输入为 NaN，就会设置 invalid operation 异常标志。
  */
 RVOP(flts, {
     uint32_t ret = f32_lt(rv->F[ir->rs1], rv->F[ir->rs2]);
@@ -1259,20 +1208,18 @@ RVOP(fcvtswu, {
 RVOP(fmvwx, { rv->F[ir->rd].v = rv->X[ir->rs1]; })
 #endif
 
-/* RV32C Standard Extension */
+/* RV32C 标准扩展。 */
 
 #if RV32_HAS(EXT_C)
-/* C.ADDI4SPN is a CIW-format instruction that adds a zero-extended non-zero
- * immediate, scaledby 4, to the stack pointer, x2, and writes the result to
- * rd'.
- * This instruction is used to generate pointers to stack-allocated variables,
- * and expands to addi rd', x2, nzuimm[9:2].
+/* C.ADDI4SPN 是 CIW 格式指令。
+ * 它把零扩展且非零的立即数（按 4 缩放）加到栈指针 x2，并把结果写入 rd'。
+ * 该指令用于生成指向栈分配变量的指针，可展开为 addi rd', x2, nzuimm[9:2]。
  */
 RVOP(caddi4spn, { rv->X[ir->rd] = rv->X[rv_reg_sp] + (uint16_t) ir->imm; })
 
-/* C.LW loads a 32-bit value from memory into register rd'. It computes an
- * effective address by adding the zero-extended offset, scaled by 4, to the
- * base address in register rs1'. It expands to lw rd', offset[6:2](rs1').
+/* C.LW 从内存加载 32 位值到 rd'。
+ * 有效地址由 rs1' 中的基地址加上零扩展且按 4 缩放的偏移得到。它可展开为
+ * lw rd', offset[6:2](rs1')。
  */
 RVOP(clw, {
     const uint32_t addr = rv->X[ir->rs1] + (uint32_t) ir->imm;
@@ -1280,10 +1227,9 @@ RVOP(clw, {
     rv->X[ir->rd] = MEM_READ_W(rv, addr);
 })
 
-/* C.SW stores a 32-bit value in register rs2' to memory. It computes an
- * effective address by adding the zero-extended offset, scaled by 4, to the
- * base address in register rs1'.
- * It expands to sw rs2', offset[6:2](rs1').
+/* C.SW 把寄存器 rs2' 中的 32 位值存入内存。
+ * 有效地址由 rs1' 中的基地址加上零扩展且按 4 缩放的偏移得到。
+ * 它可展开为 sw rs2', offset[6:2](rs1')。
  */
 RVOP(csw, {
     const uint32_t addr = rv->X[ir->rs1] + (uint32_t) ir->imm;
@@ -1295,14 +1241,12 @@ RVOP(csw, {
 #endif
 })
 
-/* C.NOP */
-RVOP(cnop, {/* no operation */})
+/* C.NOP：空操作。 */
+RVOP(cnop, {/* 空操作。 */})
 
-/* C.ADDI adds the non-zero sign-extended 6-bit immediate to the value in
- * register rd then writes the result to rd. C.ADDI expands into
- * addi rd, rd, nzimm[5:0]. C.ADDI is only valid when rd'=x0. The code point
- * with both rd=x0 and nzimm=0 encodes the C.NOP instruction; the remaining
- * code points with either rd=x0 or nzimm=0 encode HINTs.
+/* C.ADDI 把非零且符号扩展后的 6 位立即数加到寄存器 rd，并把结果写回 rd。
+ * C.ADDI 可展开为 addi rd, rd, nzimm[5:0]。C.ADDI 仅在 rd' != x0 时有效。
+ * rd=x0 且 nzimm=0 的编码点表示 C.NOP；rd=x0 或 nzimm=0 的其他编码点表示 HINT。
  */
 RVOP(caddi, { rv->X[ir->rd] += (int16_t) ir->imm; })
 
@@ -1336,37 +1280,33 @@ RVOP(cjal, {
     goto end_op;
 })
 
-/* C.LI loads the sign-extended 6-bit immediate, imm, into register rd.
- * C.LI expands into addi rd, x0, imm[5:0].
- * C.LI is only valid when rd=x0; the code points with rd=x0 encode HINTs.
+/* C.LI 把符号扩展后的 6 位立即数 imm 加载到寄存器 rd。
+ * C.LI 可展开为 addi rd, x0, imm[5:0]。
+ * C.LI 仅在 rd != x0 时有效；rd=x0 的编码点表示 HINT。
  */
 RVOP(cli, { rv->X[ir->rd] = ir->imm; })
 
-/* C.ADDI16SP is used to adjust the stack pointer in procedure prologues
- * and epilogues. It expands into addi x2, x2, nzimm[9:4].
- * C.ADDI16SP is only valid when nzimm'=0; the code point with nzimm=0 is
- * reserved.
+/* C.ADDI16SP 用于在过程序言和尾声中调整栈指针。
+ * 它可展开为 addi x2, x2, nzimm[9:4]。
+ * C.ADDI16SP 仅在 nzimm != 0 时有效；nzimm=0 的编码点为保留编码。
  */
 RVOP(caddi16sp, { rv->X[ir->rd] += ir->imm; })
 
-/* C.LUI loads the non-zero 6-bit immediate field into bits 17–12 of the
- * destination register, clears the bottom 12 bits, and sign-extends bit
- * 17 into all higher bits of the destination.
- * C.LUI expands into lui rd, nzimm[17:12].
- * C.LUI is only valid when rd'={x0, x2}, and when the immediate is not equal
- * to zero.
+/* C.LUI 把非零 6 位立即数字段加载到目标寄存器的 17-12 位，清零低 12 位，并把
+ * 第 17 位符号扩展到目标寄存器更高位。
+ * C.LUI 可展开为 lui rd, nzimm[17:12]。
+ * C.LUI 仅在 rd 不为 x0/x2 且立即数非零时有效。
  */
 RVOP(clui, { rv->X[ir->rd] = ir->imm; })
 
-/* C.SRLI is a CB-format instruction that performs a logical right shift
- * of the value in register rd' then writes the result to rd'. The shift
- * amount is encoded in the shamt field. C.SRLI expands into srli rd',
- * rd', shamt[5:0].
+/* C.SRLI 是 CB 格式指令。
+ * 它对寄存器 rd' 的值执行逻辑右移，并把结果写回 rd'。移位量编码在 shamt 字段。
+ * C.SRLI 可展开为 srli rd', rd', shamt[5:0]。
  */
 RVOP(csrli, { rv->X[ir->rs1] >>= ir->shamt; })
 
-/* C.SRAI is defined analogously to C.SRLI, but instead performs an
- * arithmetic right shift. C.SRAI expands to srai rd', rd', shamt[5:0].
+/* C.SRAI 与 C.SRLI 类似，但执行算术右移。
+ * C.SRAI 可展开为 srai rd', rd', shamt[5:0]。
  */
 RVOP(csrai, {
     const uint32_t mask = 0x80000000 & rv->X[ir->rs1];
@@ -1375,9 +1315,9 @@ RVOP(csrai, {
         rv->X[ir->rs1] |= mask >> i;
 })
 
-/* C.ANDI is a CB-format instruction that computes the bitwise AND of the
- * value in register rd' and the sign-extended 6-bit immediate, then writes
- * the result to rd'. C.ANDI expands to andi rd', rd', imm[5:0].
+/* C.ANDI 是 CB 格式指令。
+ * 它对寄存器 rd' 的值和符号扩展后的 6 位立即数执行按位与，并把结果写回 rd'。
+ * C.ANDI 可展开为 andi rd', rd', imm[5:0]。
  */
 RVOP(candi, { rv->X[ir->rs1] &= ir->imm; })
 
@@ -1391,10 +1331,9 @@ RVOP(cor, { rv->X[ir->rd] = rv->X[ir->rs1] | rv->X[ir->rs2]; })
 
 RVOP(cand, { rv->X[ir->rd] = rv->X[ir->rs1] & rv->X[ir->rs2]; })
 
-/* C.J performs an unconditional control transfer. The offset is sign-extended
- * and added to the pc to form the jump target address.
- * C.J can therefore target a ±2 KiB range.
- * C.J expands to jal x0, offset[11:1].
+/* C.J 执行无条件控制转移。
+ * 偏移经过符号扩展后加到 PC，形成跳转目标地址。因此 C.J 可跳转到 ±2 KiB 范围。
+ * C.J 可展开为 jal x0, offset[11:1]。
  */
 RVOP(cj, {
     PC += ir->imm;
@@ -1423,10 +1362,10 @@ RVOP(cj, {
     goto end_op;
 })
 
-/* C.BEQZ performs conditional control transfers. The offset is sign-extended
- * and added to the pc to form the branch target address.
- * It can therefore target a ±256 B range. C.BEQZ takes the branch if the
- * value in register rs1' is zero. It expands to beq rs1', x0, offset[8:1].
+/* C.BEQZ 执行条件控制转移。
+ * 偏移经过符号扩展后加到 PC，形成分支目标地址，因此可跳转到 ±256 B 范围。
+ * 若寄存器 rs1' 的值为零，C.BEQZ 选择分支。它可展开为
+ * beq rs1', x0, offset[8:1]。
  */
 RVOP(cbeqz, {
     if (rv->X[ir->rs1]) {
@@ -1484,7 +1423,7 @@ RVOP(cbeqz, {
     goto end_op;
 })
 
-/* C.BEQZ */
+/* C.BNEZ */
 RVOP(cbnez, {
     if (!rv->X[ir->rs1]) {
         is_branch_taken = false;
@@ -1541,9 +1480,9 @@ RVOP(cbnez, {
     goto end_op;
 })
 
-/* C.SLLI is a CI-format instruction that performs a logical left shift of
- * the value in register rd then writes the result to rd. The shift amount
- * is encoded in the shamt field. C.SLLI expands into slli rd, rd, shamt[5:0].
+/* C.SLLI 是 CI 格式指令。
+ * 它对寄存器 rd 的值执行逻辑左移，并把结果写回 rd。移位量编码在 shamt 字段。
+ * C.SLLI 可展开为 slli rd, rd, shamt[5:0]。
  */
 RVOP(cslli, { rv->X[ir->rd] <<= (uint8_t) ir->imm; })
 
@@ -1575,7 +1514,7 @@ RVOP(cebreak, {
 
 /* C.JALR */
 RVOP(cjalr, {
-    /* Unconditional jump and store PC+2 to ra */
+    /* 无条件跳转，并把 PC+2 保存到 ra。 */
     const int32_t jump_to = rv->X[ir->rs1];
     rv->X[rv_reg_ra] = PC + 2;
     PC = jump_to;
@@ -1583,12 +1522,10 @@ RVOP(cjalr, {
     goto end_op;
 })
 
-/* C.ADD adds the values in registers rd and rs2 and writes the result to
- * register rd.
- * C.ADD expands into add rd, rd, rs2.
- * C.ADD is only valid when rs2=x0; the code points with rs2=x0 correspond to
- * the C.JALR and C.EBREAK instructions. The code points with rs2=x0 and rd=x0
- * are HINTs.
+/* C.ADD 把寄存器 rd 和 rs2 的值相加，并把结果写回 rd。
+ * C.ADD 可展开为 add rd, rd, rs2。
+ * C.ADD 仅在 rs2 != x0 时有效；rs2=x0 的编码点对应 C.JALR 和 C.EBREAK。
+ * rs2=x0 且 rd=x0 的编码点表示 HINT。
  */
 RVOP(cadd, { rv->X[ir->rd] = rv->X[ir->rs1] + rv->X[ir->rs2]; })
 
@@ -1642,7 +1579,7 @@ RVOP(cfsw, {
 })
 #endif
 
-/* RV32Zba Standard Extension */
+/* RV32Zba 标准扩展。 */
 
 #if RV32_HAS(Zba)
 
@@ -1657,7 +1594,7 @@ RVOP(sh3add, { rv->X[ir->rd] = (rv->X[ir->rs1] << 3) + rv->X[ir->rs2]; })
 
 #endif
 
-/* RV32Zbb Standard Extension */
+/* RV32Zbb 标准扩展。 */
 
 #if RV32_HAS(Zbb)
 
@@ -1774,7 +1711,7 @@ RVOP(rev8, {
 
 #endif
 
-/* RV32Zbc Standard Extension */
+/* RV32Zbc 标准扩展。 */
 
 #if RV32_HAS(Zbc)
 
@@ -1807,7 +1744,7 @@ RVOP(clmulr, {
 
 #endif
 
-/* RV32Zbs Standard Extension */
+/* RV32Zbs 标准扩展。 */
 
 #if RV32_HAS(Zbs)
 

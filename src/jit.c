@@ -1,26 +1,30 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
  */
 
-/* This JIT implementation has undergone extensive modifications, heavily
- * relying on the ubpf_jit_[x86_64|arm64].[c|h] from ubpf. The original
- * ubpf_jit_[x86_64|arm64].[c|h] file served as the foundation and source of
- * inspiration for adapting and tailoring it specifically for this JIT
- * implementation. Therefore, credit and sincere thanks are extended to ubpf for
- * their invaluable work.
+/*
+ * 一级模板 JIT 实现。
  *
- * Reference:
+ * 本文件负责宿主机器码缓冲区、x86-64/Arm64 指令发射、寄存器分配、跳转修补、
+ * MMIO/MMU 运行时辅助、宏操作融合和代码缓存刷新。rv32_jit.c 通过 GEN 宏包含
+ * 具体 RISC-V 指令的发射逻辑，而这里提供公共的底层发射 API 和状态管理。
+ */
+
+/* 该 JIT 实现经过了大量改造，底层发射器很大程度参考 ubpf 的
+ * ubpf_jit_[x86_64|arm64].[c|h]。原始 ubpf JIT 文件为本项目适配一级 JIT 提供
+ * 了基础和灵感，特此致谢。
+ *
+ * 参考：
  *   https://github.com/iovisor/ubpf/blob/main/vm/ubpf_jit_x86_64.c
  *   https://github.com/iovisor/ubpf/blob/main/vm/ubpf_jit_arm64.c
  */
 
 #if !RV32_HAS(JIT)
-#error "Do not manage to build this file unless you enable JIT support."
+#error "只有启用 JIT 支持时才能构建此文件。"
 #endif
 
 #if !defined(__x86_64__) && !defined(__aarch64__)
-#error "This implementation is dedicated to x64 and arm64."
+#error "此实现仅支持 x64 和 arm64。"
 #endif
 
 #include <assert.h>
@@ -68,7 +72,7 @@
 #define MAX_BLOCKS 8192
 #define IN_JUMP_THRESHOLD 256
 
-/* Check if branch history table entry should trigger JIT translation */
+/* 判断分支历史表条目是否应触发 JIT 翻译。 */
 static inline bool bht_should_translate(const branch_history_table_t *bt,
                                         int idx
 #if RV32_HAS(SYSTEM)
@@ -87,10 +91,9 @@ static inline bool bht_should_translate(const branch_history_table_t *bt,
 }
 
 #if defined(__x86_64__)
-/* indicate where the immediate value is in the emitted jump instruction.
- * For conditional jumps (JNE, JE, etc.), add 2 to skip the 2-byte opcode
- * (0x0f + condition). For unconditional jumps (JMP), add 1 to skip the
- * 1-byte opcode (0xe9).
+/* 标出已发射跳转指令中立即数所在位置。
+ * 条件跳转（JNE、JE 等）需加 2 跳过 2 字节 opcode（0x0f + condition）；
+ * 无条件跳转（JMP）需加 1 跳过 1 字节 opcode（0xe9）。
  */
 #define JUMP_LOC_0 jump_loc_0 + 2
 #define JUMP_TRAP jump_trap + 2
@@ -98,7 +101,7 @@ static inline bool bht_should_translate(const branch_history_table_t *bt,
 #if RV32_HAS(SYSTEM)
 #define JUMP_LOC_1 jump_loc_1 + 1
 #endif
-/* Special values for target_pc in struct jump */
+/* struct jump 中 target_pc 的特殊值。 */
 #define TARGET_PC_EXIT -1U
 #define TARGET_PC_RETPOLINE -3U
 enum x64_reg {
@@ -122,9 +125,8 @@ enum x64_reg {
 };
 
 #elif defined(__aarch64__)
-/* indicate where the immediate value is in the emitted jump instruction.
- * For ARM64, the offset is embedded within the instruction word itself,
- * so no additional offset adjustment is needed.
+/* 标出已发射跳转指令中立即数所在位置。ARM64 的偏移嵌入指令字本身，因此不需要
+ * 额外偏移调整。
  */
 #define JUMP_LOC_0 jump_loc_0
 #define JUMP_TRAP jump_trap
@@ -132,10 +134,10 @@ enum x64_reg {
 #if RV32_HAS(SYSTEM)
 #define JUMP_LOC_1 jump_loc_1
 #endif
-/* Special values for target_pc in struct jump */
+/* struct jump 中 target_pc 的特殊值。 */
 #define TARGET_PC_EXIT ~UINT32_C(0)
 #define TARGET_PC_ENTER (~UINT32_C(0) & 0x0101)
-/* This is guaranteed to be an illegal A64 instruction. */
+/* 该值保证是一条非法 A64 指令。 */
 #define BAD_OPCODE ~UINT32_C(0)
 
 enum a64_reg {
@@ -233,8 +235,8 @@ enum condition {
 };
 
 enum {
-    temp_imm_reg = R24, /* Temp register for immediate generation */
-    temp_div_reg = R25, /* Temp register for division results */
+    temp_imm_reg = R24, /* 生成立即数使用的临时寄存器。 */
+    temp_div_reg = R25, /* 保存除法结果使用的临时寄存器。 */
 };
 #endif
 
@@ -246,12 +248,11 @@ enum operand_size {
 };
 
 #if defined(__x86_64__)
-/* There are two common x86-64 calling conventions, discussed at:
+/* x86-64 常见调用约定有两种，参考：
  * https://en.wikipedia.org/wiki/X64_calling_conventions#x86-64_calling_conventions
  *
- * Please note: R12 is an exception and is *not* being used. Consequently, it
- * is omitted from the list of non-volatile registers for both platforms,
- * despite being non-volatile.
+ * 注意：R12 是例外，本实现不使用它。因此虽然 R12 是非易失寄存器，但两个平台的
+ * nonvolatile_reg 列表都故意省略它。
  */
 #if defined(_WIN32)
 static const int nonvolatile_reg[] = {RBP, RBX, RDI, RSI, R13, R14, R15};
@@ -273,27 +274,23 @@ static struct host_reg register_map[] = {
 static int temp_reg = RCX;
 #endif
 #elif defined(__aarch64__)
-/* callee_reg - this must be a multiple of two because of how we save the stack
- * later on.
- */
+/* callee_reg 的数量必须是 2 的倍数，因为后续栈保存逻辑按寄存器对处理。 */
 static const int callee_reg[] = {R19, R20, R21, R22, R23, R24, R25, R26};
-/* parameter_reg (Caller saved registers) */
+/* parameter_reg：调用者保存寄存器。 */
 static const int parameter_reg[] = {R0, R1, R2, R3, R4};
 static int temp_reg = R8;
 
-/* Register assignments:
- * Arm64       Usage
- *   r0 - r4   Function parameters, caller-saved
- *   r6 - r8   Temp - used for storing calculated value during execution
- *   r19 - r23 Callee-saved registers
- *   r24       Temp - used for generating 32-bit immediates
- *   r25       Temp - used for modulous calculations
+/* 寄存器分配：
+ * Arm64       用途
+ *   r0 - r4   函数参数，调用者保存。
+ *   r6 - r8   临时寄存器，保存执行期间计算出的值。
+ *   r19-r23   被调用者保存寄存器。
+ *   r24       临时寄存器，用于生成 32 位立即数。
+ *   r25       临时寄存器，用于取模计算。
  *
- * Note: R18 is reserved on Apple and Windows platforms (platform register) and
- * must not be used. R16/R17 (IP0/IP1) are intra-procedure-call scratch
- * registers that may be corrupted by linker veneers across BLR calls; they are
- * safe for use within straight-line JIT code but values must not be expected to
- * survive function calls.
+ * 注意：Apple 和 Windows 平台保留 R18（platform register），不能使用。R16/R17
+ *（IP0/IP1）是过程内调用临时寄存器，跨 BLR 调用时可能被链接器 veneer 破坏；
+ * 它们可用于直线 JIT 代码，但不能假设其值在函数调用后仍然保留。
  */
 static struct host_reg register_map[] = {
     {R5, -1, 0, 0},  {R6, -1, 0, 0},  {R7, -1, 0, 0},  {R9, -1, 0, 0},
@@ -303,12 +300,12 @@ static struct host_reg register_map[] = {
 #endif
 
 static const int n_host_regs =
-    ARRAY_SIZE(register_map); /* the number of avavliable host register */
+    ARRAY_SIZE(register_map); /* 可用宿主寄存器数量。 */
 
 static inline void set_dirty(int reg_idx, bool is_dirty)
 {
     for (int i = 0; i < n_host_regs; i++) {
-        /* ignore nonvolatile and parameter registers */
+        /* 忽略非易失寄存器和参数寄存器。 */
         if (register_map[i].reg_idx != reg_idx)
             continue;
 
@@ -337,15 +334,12 @@ static inline void offset_map_insert(struct jit_state *state, block_t *block)
 static bool should_flush = false;
 
 #if defined(__APPLE__) && defined(__aarch64__)
-/* Track JIT write mode to batch write protection toggling.
- * On Apple Silicon, rapid toggling of write protection can cause
- * cache coherency issues. We enable write mode at the start of
- * translation and disable it only after all code generation and
- * jump patching is complete.
+/* 跟踪 JIT 写入模式，以批量切换写保护。
+ * Apple Silicon 上频繁切换写保护可能导致缓存一致性问题。翻译开始时启用写模式，
+ * 所有代码生成和跳转修补完成后才关闭。
  *
- * Must be thread-local because pthread_jit_write_protect_np operates
- * per-thread. A shared flag would cause race conditions if multiple
- * threads translate simultaneously.
+ * 该标志必须是线程局部的，因为 pthread_jit_write_protect_np 按线程生效。若使用
+ * 共享标志，多个线程同时翻译时会产生竞态。
  */
 static __thread bool jit_write_mode = false;
 
@@ -377,9 +371,8 @@ static void emit_bytes(struct jit_state *state, void *data, uint32_t len)
         return;
     }
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* If not in write mode (e.g., during initial setup), toggle temporarily.
-     * During normal translation, jit_translate maintains write mode to avoid
-     * rapid toggling which can cause cache coherency issues.
+    /* 若当前不在写模式（例如初始设置阶段），临时切换写保护。常规翻译期间由
+     * jit_translate 保持写模式，以避免频繁切换导致缓存一致性问题。
      */
     bool need_toggle = !jit_write_mode;
     if (need_toggle)
@@ -448,8 +441,8 @@ static inline void emit_rex(struct jit_state *state, int w, int r, int x, int b)
     emit1(state, 0x40 | (w << 3) | (r << 2) | (x << 1) | b);
 }
 
-/* Emit a REX prefix incorporating the top bit of both src and dst. This step is
- * skipped if no bits are set.
+/* 发射 REX 前缀，并把 src/dst 的高位编码进去。
+ * 若没有任何高位需要设置，则跳过该步骤。
  */
 static inline void emit_basic_rex(struct jit_state *state,
                                   int w,
@@ -499,18 +492,18 @@ static void emit_a64(struct jit_state *state, uint32_t insn)
     emit_bytes(state, &insn, 4);
 }
 
-/* Get the value of the size bit in most instruction encodings (bit 31). */
+/* 获取多数指令编码中的 size 位（第 31 位）。 */
 static inline uint32_t sz(bool is64)
 {
     return (is64 ? UINT32_C(1) : UINT32_C(0)) << 31;
 }
 
-/* For details on Arm instructions, users can refer to
+/* Arm 指令细节可参考：
  * https://developer.arm.com/documentation/ddi0487/ha (Arm Architecture
  * Reference Manual for A-profile architecture).
  */
 
-/* [ARM-A]: C4.1.64: Add/subtract (immediate).  */
+/* [ARM-A] C4.1.64：Add/subtract (immediate)。 */
 static void emit_addsub_imm(struct jit_state *state,
                             bool is64,
                             a64opcode_t op,
@@ -524,7 +517,7 @@ static void emit_addsub_imm(struct jit_state *state,
     set_dirty(rd, true);
 }
 
-/* [ARM-A]: C4.1.67: Logical (shifted register).  */
+/* [ARM-A] C4.1.67：Logical (shifted register)。 */
 static void emit_logical_register(struct jit_state *state,
                                   bool is64,
                                   a64opcode_t op,
@@ -537,7 +530,7 @@ static void emit_logical_register(struct jit_state *state,
     set_dirty(rd, true);
 }
 
-/* [ARM-A]: C4.1.67: Add/subtract (shifted register).  */
+/* [ARM-A] C4.1.67：Add/subtract (shifted register)。 */
 static inline void emit_addsub_register(struct jit_state *state,
                                         bool is64,
                                         a64opcode_t op,
@@ -551,16 +544,15 @@ static inline void emit_addsub_register(struct jit_state *state,
     set_dirty(rd, true);
 }
 
-/* [ARM-A]: C4.1.64: Move wide (Immediate).  */
+/* [ARM-A] C4.1.64：Move wide (Immediate)。 */
 static inline void emit_movewide_imm(struct jit_state *state,
                                      bool is64,
                                      int rd,
                                      uint64_t imm)
 {
-    /* Emit a MOVZ or MOVN followed by a sequence of MOVKs to generate the
-     * 64-bit constant in imm. See whether the 0x0000 or 0xffff pattern is more
-     * common in the immediate.  This ensures we produce the fewest number of
-     * immediates.
+    /* 先发射 MOVZ 或 MOVN，再追加一串 MOVK 以生成 imm 中的 64 位常量。
+     * 通过比较立即数中 0x0000 与 0xffff 模式哪个更常见，选择能生成最少立即数
+     * 片段的编码。
      */
     unsigned count0000 = is64 ? 0 : 2;
     unsigned countffff = 0;
@@ -573,9 +565,7 @@ static inline void emit_movewide_imm(struct jit_state *state,
         }
     }
 
-    /* Iterate over 16-bit elements of imm, outputting an appropriate move
-     * instruction.
-     */
+    /* 遍历 imm 的 16 位片段，输出相应的 move 指令。 */
     bool invert = (count0000 < countffff);
     a64opcode_t op = invert ? MW_MOVN : MW_MOVZ;
     uint64_t skip_pattern = invert ? 0xffff : 0;
@@ -592,14 +582,14 @@ static inline void emit_movewide_imm(struct jit_state *state,
         }
     }
 
-    /* Tidy up for the case imm = 0 or imm == -1.  */
+    /* 处理 imm = 0 或 imm == -1 的特殊情况。 */
     if (op != MW_MOVK)
         emit_a64(state, sz(is64) | op | (0 << 21) | (0 << 5) | rd);
 
     set_dirty(rd, true);
 }
 
-/* [ARM-A]: C4.1.66: Load/store register (unscaled immediate).  */
+/* [ARM-A] C4.1.66：Load/store register (unscaled immediate)。 */
 static void emit_loadstore_imm(struct jit_state *state,
                                a64opcode_t op,
                                int rt,
@@ -612,7 +602,7 @@ static void emit_loadstore_imm(struct jit_state *state,
     emit_a64(state, imm_op_base | op | (imm9 << 12) | (rn << 5) | rt);
 }
 
-/* [ARM-A]: C4.1.66: Load/store register pair (offset).  */
+/* [ARM-A] C4.1.66：Load/store register pair (offset)。 */
 static void emit_loadstorepair_imm(struct jit_state *state,
                                    a64opcode_t op,
                                    int rt,
@@ -626,7 +616,7 @@ static void emit_loadstorepair_imm(struct jit_state *state,
     emit_a64(state, op | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt);
 }
 
-/* [ARM-A]: C4.1.65: Unconditional branch (register).  */
+/* [ARM-A] C4.1.65：Unconditional branch (register)。 */
 static void emit_uncond_branch_reg(struct jit_state *state,
                                    a64opcode_t op,
                                    int rn)
@@ -634,7 +624,7 @@ static void emit_uncond_branch_reg(struct jit_state *state,
     emit_a64(state, op | (rn << 5));
 }
 
-/* [ARM-A]: C4.1.67: Data-processing (2 source).  */
+/* [ARM-A] C4.1.67：Data-processing (2 source)。 */
 static void emit_dataproc_2source(struct jit_state *state,
                                   bool is64,
                                   a64opcode_t op,
@@ -648,7 +638,7 @@ static void emit_dataproc_2source(struct jit_state *state,
 
 
 #if RV32_HAS(EXT_M)
-/* [ARM-A]: C4.1.67: Data-processing (3 source).  */
+/* [ARM-A] C4.1.67：Data-processing (3 source)。 */
 static void emit_dataproc_3source(struct jit_state *state,
                                   bool is64,
                                   a64opcode_t op,
@@ -662,8 +652,8 @@ static void emit_dataproc_3source(struct jit_state *state,
 }
 #endif
 
-/* Patch branch instruction without write protection toggle.
- * Caller must handle write protection and cache maintenance.
+/* 在不切换写保护的情况下修补分支指令。
+ * 调用方必须负责写保护和 cache 维护。
  */
 static void patch_branch_imm(struct jit_state *state,
                              uint32_t offset,
@@ -673,13 +663,13 @@ static void patch_branch_imm(struct jit_state *state,
     uint32_t insn;
     imm >>= 2;
     memcpy(&insn, state->buf + offset, sizeof(uint32_t));
-    if ((insn & 0xfe000000U) == 0x54000000U /* Conditional branch immediate. */
+    if ((insn & 0xfe000000U) == 0x54000000U /* 条件立即数分支。 */
         || (insn & 0x7e000000U) ==
-               0x34000000U) { /* Compare and branch immediate. */
+               0x34000000U) { /* 比较并按立即数分支。 */
         assert((imm >> 19) == INT64_C(-1) || (imm >> 19) == 0);
         insn |= (imm & 0x7ffff) << 5;
     } else if ((insn & 0x7c000000U) == 0x14000000U) {
-        /* Unconditional branch immediate.  */
+        /* 无条件立即数分支。 */
         assert((imm >> 26) == INT64_C(-1) || (imm >> 26) == 0);
         insn |= (imm & 0x03ffffffU) << 0;
     } else {
@@ -705,9 +695,8 @@ static inline void emit_jump_target_offset(struct jit_state *state,
 static inline void emit_alu32(struct jit_state *state, int op, int src, int dst)
 {
 #if defined(__x86_64__)
-    /* The REX prefix and ModRM byte are emitted.
-     * The MR encoding is utilized when a choice is available. The 'src' is
-     * often used as an opcode extension.
+    /* 发射 REX 前缀和 ModRM 字节。
+     * 有编码选择时优先使用 MR 编码；src 经常作为 opcode 扩展位使用。
      */
     if (src & 8 || dst & 8)
         emit_basic_rex(state, 0, src, dst);
@@ -755,7 +744,7 @@ static inline void emit_alu32_imm32(struct jit_state *state,
                                     int32_t imm)
 {
 #if defined(__x86_64__)
-    /* REX prefix, ModRM byte, and 32-bit immediate */
+    /* REX 前缀、ModRM 字节和 32 位立即数。 */
     emit_alu32(state, op, src, dst);
     emit4(state, imm);
 #elif defined(__aarch64__)
@@ -791,7 +780,7 @@ static inline void emit_alu32_imm8(struct jit_state *state,
                                    int8_t imm)
 {
 #if defined(__x86_64__)
-    /* REX prefix, ModRM byte, and 8-bit immediate */
+    /* REX 前缀、ModRM 字节和 8 位立即数。 */
     emit_alu32(state, op, src, dst);
     emit1(state, imm);
 #elif defined(__aarch64__)
@@ -819,9 +808,8 @@ static inline void emit_alu32_imm8(struct jit_state *state,
 static inline void emit_alu64(struct jit_state *state, int op, int src, int dst)
 {
 #if defined(__x86_64__)
-    /* The REX.W prefix and ModRM byte are emitted.
-     * The MR encoding is used when there is a choice. 'src' is often used as
-     * an opcode extension.
+    /* 发射 REX.W 前缀和 ModRM 字节。
+     * 有编码选择时优先使用 MR 编码；src 经常作为 opcode 扩展位使用。
      */
     emit_basic_rex(state, 1, src, dst);
     emit1(state, op);
@@ -842,7 +830,7 @@ static inline void emit_alu64_imm8(struct jit_state *state,
                                    int8_t imm)
 {
 #if defined(__x86_64__)
-    /* REX.W prefix, ModRM byte, and 8-bit immediate */
+    /* REX.W 前缀、ModRM 字节和 8 位立即数。 */
     emit_alu64(state, op, src, dst);
     emit1(state, imm);
 #elif defined(__aarch64__)
@@ -857,15 +845,15 @@ static inline void emit_alu64_imm8(struct jit_state *state,
 }
 #endif
 
-/* Register to register mov (preserves all 64 bits including sign extension) */
+/* 寄存器到寄存器 mov：保留全部 64 位，包括符号扩展位。 */
 static inline void emit_mov(struct jit_state *state, int src, int dst)
 {
 #if defined(__x86_64__)
     emit_alu64(state, 0x89, src, dst);
 #elif defined(__aarch64__)
-    /* Use 64-bit ORR with zero register: MOV Xd, Xm = ORR Xd, XZR, Xm
-     * This preserves all 64 bits including any sign extension in the upper 32.
-     * Previous implementation used 32-bit ADD which zero-extended the result.
+    /* 使用零寄存器上的 64 位 ORR：MOV Xd, Xm = ORR Xd, XZR, Xm。
+     * 这样可保留全部 64 位，包括高 32 位上的符号扩展。
+     * 旧实现使用 32 位 ADD，会把结果零扩展。
      */
     emit_logical_register(state, true, LOG_ORR, dst, RZ, src);
     set_dirty(dst, true);
@@ -873,7 +861,7 @@ static inline void emit_mov(struct jit_state *state, int src, int dst)
 }
 
 #if defined(__x86_64__)
-/* REX.W prefix, ModRM byte, and 32-bit immediate */
+/* REX.W 前缀、ModRM 字节和 32 位立即数。 */
 static inline void emit_alu64_imm32(struct jit_state *state,
                                     int op,
                                     int src,
@@ -907,7 +895,7 @@ static inline void emit_cmp32(struct jit_state *state, int src, int dst)
 static inline void emit_jcc_offset(struct jit_state *state, int code)
 {
 #if defined(__x86_64__)
-    /* unconditional jump instruction does not have 0x0f prefix */
+    /* 无条件跳转指令没有 0x0f 前缀。 */
     if (code != JCC_JMP)
         emit1(state, 0x0f);
     emit1(state, code);
@@ -947,11 +935,10 @@ static inline void emit_load_imm(struct jit_state *state,
                                  int dst,
                                  uint32_t imm);
 
-/* Load [src + offset] into dst.
+/* 将 [src + offset] 加载到 dst。
  *
- * If the offset is non-zero, it restores the vm register to the host register
- * from the stack. Otherwise, it is a `read` pseudo instruction that loading
- * the [src] into destination register.
+ * 若 offset 非零，表示从栈中把 VM 寄存器恢复到宿主寄存器。
+ * 否则这是一个 `read` 伪指令，把 [src] 处内容加载到目标寄存器。
  */
 static inline void emit_load(struct jit_state *state,
                              enum operand_size size,
@@ -965,7 +952,7 @@ static inline void emit_load(struct jit_state *state,
         if (register_map[i].vm_reg_idx != 0)
             continue;
 
-        /* if dst is x0, load 0x0 into host register */
+        /* 若 dst 是 x0，则向宿主寄存器加载 0x0。 */
         emit_load_imm(state, dst, 0x0);
         set_dirty(dst, true);
         return;
@@ -1022,7 +1009,7 @@ static inline void emit_load_sext(struct jit_state *state,
         if (register_map[i].vm_reg_idx != 0)
             continue;
 
-        /* if dst is x0, load 0x0 into host register */
+        /* 若 dst 是 x0，则向宿主寄存器加载 0x0。 */
         emit_load_imm(state, dst, 0x0);
         set_dirty(dst, true);
         return;
@@ -1061,17 +1048,17 @@ static inline void emit_load_sext(struct jit_state *state,
     set_dirty(dst, !offset);
 }
 
-/* Sign-extend 32-bit value in register to 64-bit (in-place) */
+/* 将寄存器中的 32 位值原地符号扩展为 64 位。 */
 static inline void UNUSED emit_sxtw(struct jit_state *state, int reg)
 {
 #if defined(__x86_64__)
-    /* MOVSXD reg, reg (sign-extend 32-bit to 64-bit) */
+    /* MOVSXD reg, reg：将 32 位符号扩展为 64 位。 */
     emit_basic_rex(state, 1, reg, reg);
     emit1(state, 0x63);
     emit_modrm_reg2reg(state, reg, reg);
 #elif defined(__aarch64__)
-    /* SXTW Xd, Wn is SBFM Xd, Xn, #0, #31
-     * Encoding: sf=1, opc=00, N=1, immr=0, imms=31
+    /* SXTW Xd, Wn 等价于 SBFM Xd, Xn, #0, #31。
+     * 编码：sf=1, opc=00, N=1, immr=0, imms=31
      * = 0x93407C00 | (Rn << 5) | Rd
      */
     uint32_t insn = 0x93407C00 | ((uint32_t) reg << 5) | (uint32_t) reg;
@@ -1079,7 +1066,7 @@ static inline void UNUSED emit_sxtw(struct jit_state *state, int reg)
 #endif
 }
 
-/* Load 32-bit immediate into register (zero-extend) */
+/* 将 32 位立即数加载到寄存器，并进行零扩展。 */
 static inline void emit_load_imm(struct jit_state *state, int dst, uint32_t imm)
 {
 #if defined(__x86_64__)
@@ -1094,7 +1081,7 @@ static inline void emit_load_imm(struct jit_state *state, int dst, uint32_t imm)
 #endif
 }
 
-/* Load sign-extended immediate into register */
+/* 将符号扩展后的立即数加载到寄存器。 */
 static inline void emit_load_imm_sext(struct jit_state *state,
                                       int dst,
                                       int64_t imm)
@@ -1131,9 +1118,9 @@ static inline bool jit_store_x0(struct jit_state *state,
             continue;
 
 #if defined(__x86_64__)
-        /* if src is x0, write 0x0 into destination */
+        /* 若 src 是 x0，则向目标位置写入 0x0。 */
         if (size == S16)
-            emit1(state, 0x66); /* 16-bit override */
+            emit1(state, 0x66); /* 16 位操作数覆盖前缀。 */
         if (dst & 8)
             emit_rex(state, 0, 0, 0, !!(dst & 8));
         emit1(state, size == S8 ? 0xc6 : 0xc7);
@@ -1176,11 +1163,10 @@ static inline bool jit_store_x0(struct jit_state *state,
     return false;
 }
 
-/* Store register src to [dst + offset].
+/* 将寄存器 src 写入 [dst + offset]。
  *
- * If the offset is non-zero, it stores the host register back to the stack
- * which mapped to the vm register file. Otherwise, it is a `write` pseudo
- * instruction that writing the content of `src` into [dst].
+ * 若 offset 非零，表示把宿主寄存器写回映射 VM 寄存器文件的栈槽。
+ * 否则这是一个 `write` 伪指令，把 src 内容写入 [dst]。
  */
 static inline void emit_store(struct jit_state *state,
                               enum operand_size size,
@@ -1193,7 +1179,7 @@ static inline void emit_store(struct jit_state *state,
 
 #if defined(__x86_64__)
     if (size == S16)
-        emit1(state, 0x66); /* 16-bit override */
+        emit1(state, 0x66); /* 16 位操作数覆盖前缀。 */
     if (src & 8 || dst & 8 || size == S8)
         emit_rex(state, 0, !!(src & 8), 0, !!(dst & 8));
     emit1(state, size == S8 ? 0x88 : 0x89);
@@ -1251,7 +1237,7 @@ static inline void emit_call(struct jit_state *state, intptr_t target)
     emit_load_imm_sext(state, RAX, target);
     /* callq *%rax */
     emit1(state, 0xff);
-    /* ModR/M byte: b11010000b = xd0, rax is register 0 */
+    /* ModR/M 字节：b11010000b = xd0，其中 rax 是寄存器 0。 */
     emit1(state, 0xd0);
 #elif defined(__aarch64__)
     uint32_t stack_movement = align_up(8, 16);
@@ -1314,16 +1300,16 @@ static void divmod(struct jit_state *state,
     int div_dest = mod ? temp_div_reg : rd;
 
     if (sign)
-        emit_cmp_imm32(state, rd, 0x80000000); /* overflow checking */
+        emit_cmp_imm32(state, rd, 0x80000000); /* 溢出检查。 */
 
-    /* Use SDIV for signed operations, UDIV for unsigned */
+    /* 有符号操作使用 SDIV，无符号操作使用 UDIV。 */
     emit_dataproc_2source(state, is64, sign ? DP2_SDIV : DP2_UDIV, div_dest, rn,
                           rm);
     if (mod)
         emit_dataproc_3source(state, is64, DP3_MSUB, rd, rm, div_dest, rn);
 
     if (sign) {
-        /* handle overflow */
+        /* 处理溢出。 */
         uint32_t jump_loc_0 = state->offset;
         emit_jcc_offset(state, JCC_JNE);
         emit_cmp_imm32(state, rm, -1);
@@ -1335,7 +1321,7 @@ static void divmod(struct jit_state *state,
         emit_jump_target_offset(state, JUMP_LOC_0, state->offset);
     }
     if (!mod) {
-        /* handle dividing zero */
+        /* 处理除零。 */
         emit_cmp_imm32(state, rm, 0);
         emit_load_imm(state, temp_reg, -1);
         emit_conditional_move(state, rd, temp_reg, rd, COND_EQ);
@@ -1355,8 +1341,7 @@ static void muldivmod(struct jit_state *state,
     bool mod = (opcode & JIT_ALU_OP_MASK) == (JIT_OP_MOD_IMM & JIT_ALU_OP_MASK);
     bool is64 = (opcode & JIT_CLS_MASK) == JIT_CLS_ALU64;
 
-    /* Record the mapping status before the registers are used for other
-     * purposes, and restore the status after popping the registers.
+    /* 寄存器被挪作他用前先记录映射状态，弹栈后再恢复该状态。
      */
     int d1 = register_map[0].dirty, d2 = register_map[2].dirty;
     int r1 = register_map[0].vm_reg_idx, r2 = register_map[2].vm_reg_idx;
@@ -1371,37 +1356,33 @@ static void muldivmod(struct jit_state *state,
         emit_push(state, RDX);
     }
 
-    /*  Load the divisor into RCX */
+    /* 将除数加载到 RCX。 */
     emit_mov(state, src, RCX);
 
-    /* Load the dividend into RAX */
+    /* 将被除数加载到 RAX。 */
     emit_mov(state, dst, RAX);
 
-    /* The JIT employs two different semantics for division and modulus
-     * operations. In the case of division, if the divisor is zero, the result
-     * is set to -1. For modulus operations, if the divisor is zero, the
-     * result becomes the dividend. To manage this, we first set the divisor to
-     * 1 if it is initially zero. Then, we adjust the result accordingly: for
-     * division, we set it to -1 if the original divisor was zero; for
-     * modulus, we set it to the dividend under the same condition.
+    /* JIT 对除法和取模采用不同语义：除法中除数为 0 时结果为 -1；
+     * 取模中除数为 0 时结果为被除数。为统一处理，先在原除数为 0 时把除数改为
+     * 1，再按原除数是否为 0 修正结果：除法修正为 -1，取模修正为被除数。
      */
 
     if (div || mod) {
         if (sign) {
             emit_load_imm_sext(state, RDX, -1);
-            /* compare divisor with -1 for overflow checking */
+            /* 与 -1 比较，用于溢出检查。 */
             emit_cmp32(state, RDX, RCX);
-            /* Save the result of the comparision */
+            /* 保存比较结果。 */
             emit1(state, 0x9c); /* pushfq */
         }
         if (mod || (div && sign))
-            emit_push(state, RAX); /* Save dividend */
+            emit_push(state, RAX); /* 保存被除数。 */
 
         emit_alu32(state, 0x85, RCX, RCX);
-        /* Save the result of the test */
+        /* 保存 test 结果。 */
         emit1(state, 0x9c); /* pushfq */
 
-        /* Set the divisor to 1 if it is zero */
+        /* 若除数为 0，则先把除数设为 1。 */
         emit_load_imm(state, RDX, 1);
         emit_conditional_move(state, RDX, RCX);
         /* xor %edx,%edx */
@@ -1410,28 +1391,26 @@ static void muldivmod(struct jit_state *state,
 
     if (is64)
         emit_rex(state, 1, 0, 0, 0);
-    /* Multiply or divide */
+    /* 执行乘法或除法。 */
     emit_alu32(state, 0xf7, mul ? 4 : 6, RCX);
 
-    /* The division operation stores the remainder in RDX and the quotient
-     * in RAX.
+    /* 除法操作会把余数放入 RDX，把商放入 RAX。
      */
     if (div || mod) {
-        /* Restore the result of the test */
+        /* 恢复 test 结果。 */
         emit1(state, 0x9d); /* popfq */
 
-        /* If zero flag is set, then the divisor was zero. */
+        /* 若 zero flag 被设置，则原除数为 0。 */
 
         if (div) {
-            /* Set the dividend to zero if the divisor was zero. */
+            /* 若原除数为 0，则把结果修正为 -1。 */
             emit_load_imm_sext(state, RCX, -1);
 
-            /* Store 0 in RAX if the divisor was zero. */
-            /* Use conditional move to avoid a branch. */
+            /* 使用 conditional move 避免分支。 */
             emit_conditional_move(state, RCX, RAX);
             if (sign) {
                 emit_pop(state, RCX);
-                /* handle DIV overflow */
+                /* 处理 DIV 溢出。 */
                 emit1(state, 0x9d); /* popfq */
                 uint32_t jump_loc_0 = state->offset;
                 emit_jcc_offset(state, JCC_JNE);
@@ -1440,13 +1419,12 @@ static void muldivmod(struct jit_state *state,
                 emit_jump_target_offset(state, JUMP_LOC_0, state->offset);
             }
         } else {
-            /* Restore dividend to RCX */
+            /* 将被除数恢复到 RCX。 */
             emit_pop(state, RCX);
-            /* Store the dividend in RAX if the divisor was zero. */
-            /* Use conditional move to avoid a branch. */
+            /* 若原除数为 0，则把被除数写入 RDX；使用 conditional move 避免分支。 */
             emit_conditional_move(state, RCX, RDX);
             if (sign) {
-                /* handle REM overflow */
+                /* 处理 REM 溢出。 */
                 emit1(state, 0x9d); /* popfq */
                 uint32_t jump_loc_0 = state->offset;
                 emit_jcc_offset(state, JCC_JNE);
@@ -1494,19 +1472,17 @@ static void muldivmod(struct jit_state *state,
 }
 #endif /* RV32_HAS(EXT_M) */
 
-/* JIT misaligned memory access handler.
- * This function performs misaligned load/store operations using byte-level
- * memory accesses. It mirrors the behavior of the interpreter's default
- * trap handler for misaligned operations.
- * @rv: RISC-V emulator state
- * @addr: The misaligned memory address
- * @vreg_idx: Register index (rd for loads, rs2 for stores)
- * @type: Instruction type (rv_insn_lw, rv_insn_lh, etc.)
- * @is_store: true for store operations, false for loads
+/* JIT 非对齐内存访问处理器。
+ * 该函数用字节级访问完成非对齐 load/store，行为与解释器默认非对齐 trap 处理保持
+ * 一致。
+ * @rv: RISC-V 模拟器状态。
+ * @addr: 非对齐内存地址。
+ * @vreg_idx: 寄存器索引；load 时为 rd，store 时为 rs2。
+ * @type: 指令类型（rv_insn_lw、rv_insn_lh 等）。
+ * @is_store: true 表示 store，false 表示 load。
  *
- * Note: This handler is called when JIT-generated code detects a misaligned
- * memory access and the emulator is configured to handle misalignment
- * (allow_misalign is false).
+ * 注意：JIT 生成代码检测到非对齐内存访问，且模拟器配置为由软件处理非对齐访问
+ *（allow_misalign 为 false）时，会调用该处理器。
  */
 void jit_misaligned_handler(riscv_t *rv,
                             uint32_t addr,
@@ -1517,7 +1493,7 @@ void jit_misaligned_handler(riscv_t *rv,
     assert(vreg_idx < 32);
 
     if (is_store) {
-        /* Misaligned store */
+        /* 非对齐 store。 */
         uint32_t value = rv->X[vreg_idx];
         switch (type) {
         case rv_insn_sw:
@@ -1525,7 +1501,7 @@ void jit_misaligned_handler(riscv_t *rv,
         case rv_insn_csw:
         case rv_insn_cswsp:
 #endif
-            /* Fast-path for 2-byte aligned, slow-path for odd addresses */
+            /* 2 字节对齐走快路径，奇数地址走慢路径。 */
             if ((addr & 1) == 0) {
                 rv->io.mem_write_s(rv, addr, value & 0xFFFF);
                 rv->io.mem_write_s(rv, addr + 2, (value >> 16) & 0xFFFF);
@@ -1542,7 +1518,7 @@ void jit_misaligned_handler(riscv_t *rv,
             break;
         }
     } else {
-        /* Misaligned load */
+        /* 非对齐 load。 */
         uint32_t value = 0;
         switch (type) {
         case rv_insn_lw:
@@ -1550,7 +1526,7 @@ void jit_misaligned_handler(riscv_t *rv,
         case rv_insn_clw:
         case rv_insn_clwsp:
 #endif
-            /* Fast-path for 2-byte aligned, slow-path for odd addresses */
+            /* 2 字节对齐走快路径，奇数地址走慢路径。 */
             if ((addr & 1) == 0) {
                 value = (uint32_t) rv->io.mem_read_s(rv, addr);
                 value |= ((uint32_t) rv->io.mem_read_s(rv, addr + 2)) << 16;
@@ -1565,7 +1541,7 @@ void jit_misaligned_handler(riscv_t *rv,
             for (int i = 0; i < 2; i++)
                 value |= ((uint32_t) rv->io.mem_read_b(rv, addr + i))
                          << (i * 8);
-            rv->X[vreg_idx] = (int32_t) ((int16_t) value); /* sign extend */
+            rv->X[vreg_idx] = (int32_t) ((int16_t) value); /* 符号扩展。 */
             break;
         case rv_insn_lhu:
             for (int i = 0; i < 2; i++)
@@ -1593,7 +1569,7 @@ void jit_mmu_handler(riscv_t *rv, uint32_t vreg_idx)
     uint32_t addr;
     uint32_t access_size;
 
-    /* Determine access size based on instruction type */
+    /* 按指令类型确定访问大小。 */
     switch (rv->jit_mmu.type) {
     case rv_insn_lb:
     case rv_insn_lbu:
@@ -1610,16 +1586,15 @@ void jit_mmu_handler(riscv_t *rv, uint32_t vreg_idx)
         access_size = 4;
         break;
     default:
-        /* Catch unhandled instruction types early */
-        assert(!"Unhandled JIT MMU instruction type");
+        /* 尽早捕获未处理的指令类型。 */
+        assert(!"未处理的 JIT MMU 指令类型");
         __UNREACHABLE;
     }
 
-    /* Set rv->PC to the faulting instruction's PC BEFORE calling mem_translate.
-     * This is necessary because if a page fault occurs, on_trap is called from
-     * inside mem_translate (via SET_CAUSE_AND_TVAL_THEN_TRAP) and the trap
-     * handler uses rv->PC to set sepc/mepc (the return address). Without this,
-     * the kernel would resume at the wrong instruction after sret.
+    /* 调用 mem_translate 前，先把 rv->PC 设置为出错指令的 PC。
+     * 这是必要的：如果发生缺页，mem_translate 内部会通过
+     * SET_CAUSE_AND_TVAL_THEN_TRAP 调用 on_trap，而 trap 处理器使用 rv->PC 设置
+     * sepc/mepc（返回地址）。如果不这样做，内核在 sret 后会从错误指令恢复。
      */
     rv->PC = rv->jit_mmu.pc;
 
@@ -1630,19 +1605,17 @@ void jit_mmu_handler(riscv_t *rv, uint32_t vreg_idx)
     else
         addr = rv->io.mem_translate(rv, rv->jit_mmu.vaddr, W);
 
-    /* Check for trap during address translation.
-     * mem_translate may trigger a page fault which sets is_trapped=true.
-     * In this case, mark as MMIO to skip direct memory access in JIT code,
-     * but don't actually perform any MMIO operation.
+    /* 检查地址转换期间是否触发 trap。
+     * mem_translate 可能触发缺页并设置 is_trapped=true。此时把访问标记为 MMIO，
+     * 让 JIT 代码跳过直接内存访问，但实际不执行任何 MMIO 操作。
      */
     if (rv->is_trapped) {
         rv->jit_mmu.is_mmio = 1;
         return;
     }
 
-    /* Only treat as RAM if entire access range [addr, addr+size) is within
-     * valid guest memory bounds. This prevents buffer overflow on multi-byte
-     * accesses near the memory boundary.
+    /* 只有整个访问区间 [addr, addr+size) 都位于有效客体内存范围内时，才视为 RAM。
+     * 这能防止靠近内存边界的多字节访问造成缓冲区溢出。
      */
     if (GUEST_RAM_CONTAINS(PRIV(rv)->mem, addr, access_size)) {
         rv->jit_mmu.is_mmio = 0;
@@ -1692,39 +1665,39 @@ void emit_jit_mmu_handler(struct jit_state *state, uint8_t vreg_idx)
     assert(vreg_idx < 32);
 
 #if defined(__x86_64__)
-    /* push $rdi */
+    /* 压栈保存 $rdi。 */
     emit1(state, 0xff);
     emit_modrm(state, 0x3 << 6, 0x6, parameter_reg[0]);
 
-    /* mov $vreg_idx, %rsi */
+    /* 将 vreg_idx 移入 %rsi。 */
     emit1(state, 0xbe);
     emit4(state, vreg_idx);
 
-    /* call jit_mmu_handler */
+    /* 调用 jit_mmu_handler。 */
     emit_load_imm_sext(state, temp_reg, (uintptr_t) &jit_mmu_handler);
     emit1(state, 0xff);
     emit_modrm(state, 0x3 << 6, 0x2, temp_reg);
 
-    /* pop rv to $rdi */
+    /* 从栈中恢复 rv 到 $rdi。 */
     emit1(state, 0x8f);
     emit_modrm(state, 0x3 << 6, 0x0, parameter_reg[0]);
 #elif defined(__aarch64__)
     uint32_t insn;
 
-    /* push rv into stack */
+    /* 将 rv 压入栈。 */
     insn = (0xf81f0fe << 4) | R0;
     emit_a64(state, insn);
 
-    /* move vreg_idx into R1 */
+    /* 将 vreg_idx 移入 R1。 */
     emit_movewide_imm(state, false, R1, vreg_idx);
 
-    /* load &jit_mmu_handler */
+    /* 加载 &jit_mmu_handler。 */
     emit_movewide_imm(state, true, temp_reg, (uintptr_t) &jit_mmu_handler);
-    /* blr jit_mmu_handler */
+    /* 通过 blr 调用 jit_mmu_handler。 */
     insn = (0xd63f << 16) | (temp_reg << 5);
     emit_a64(state, insn);
 
-    /* pop from stack */
+    /* 从栈中恢复 rv。 */
     insn = (0xf84107e << 4) | R0;
     emit_a64(state, insn);
 #endif
@@ -1734,72 +1707,70 @@ void emit_jit_mmu_handler(struct jit_state *state, uint8_t vreg_idx)
 static void prepare_translate(struct jit_state *state)
 {
 #if defined(__x86_64__)
-    /* Save platform non-volatile registers */
+    /* 保存平台非易失寄存器。 */
     for (uint32_t i = 0; i < ARRAY_SIZE(nonvolatile_reg); i++)
         emit_push(state, nonvolatile_reg[i]);
 
-    /* Assuming that the stack is 16-byte aligned just before the call
-     * instruction that brought us to this code, we need to restore 16-byte
-     * alignment upon starting execution of the JIT'd code. STACK_SIZE is
-     * guaranteed to be divisible by 16. However, if an even number of
-     * registers were pushed onto the stack during state saving (see above),
-     * an additional 8 bytes must be added to regain 16-byte alignment.
+    /* 假设进入本段代码的 call 指令执行前，栈已经按 16 字节对齐。
+     * 开始执行 JIT 代码时需要恢复 16 字节对齐。STACK_SIZE 保证可被 16 整除。
+     * 但若状态保存阶段（见上方）压入了偶数个寄存器，则需额外增加 8 字节以重新
+     * 获得 16 字节对齐。
      */
     if (!(ARRAY_SIZE(nonvolatile_reg) % 2))
         emit_alu64_imm32(state, 0x81, 5, RSP, 0x8);
 
-    /* Set JIT R10 (the way to access the frame in JIT) to match RSP. */
+    /* 将 JIT R10（JIT 中访问 frame 的方式）设置为当前 RSP。 */
     emit_mov(state, RSP, RBP);
 
-    /* Allocate stack space */
+    /* 分配栈空间。 */
     emit_alu64_imm32(state, 0x81, 5, RSP, STACK_SIZE);
 
 #if defined(_WIN32)
-    /* Windows x64 ABI requires home register space. */
-    /* Allocate home register space - 4 registers */
+    /* Windows x64 ABI 要求 home register space。 */
+    /* 分配 4 个寄存器大小的 home register space。 */
     emit_alu64_imm32(state, 0x81, 5, RSP, 4 * sizeof(uint64_t));
 #endif
 
-    /* Jump to the entry point, which is stored in the second parameter. */
+    /* 跳转到第二个参数中保存的入口点。 */
     emit1(state, 0xff);
     emit1(state, 0xe6);
 
-    /* Epilogue */
+    /* 函数尾声。 */
     state->exit_loc = state->offset;
 
-    /* Deallocate stack space by restoring RSP from JIT R10. */
+    /* 从 JIT R10 恢复 RSP，以释放栈空间。 */
     emit_mov(state, RBP, RSP);
 
     if (!(ARRAY_SIZE(nonvolatile_reg) % 2))
         emit_alu64_imm32(state, 0x81, 0, RSP, 0x8);
 
-    /* Restore platform non-volatile registers */
+    /* 恢复平台非易失寄存器。 */
     for (uint32_t i = 0; i < ARRAY_SIZE(nonvolatile_reg); i++)
         emit_pop(state, nonvolatile_reg[ARRAY_SIZE(nonvolatile_reg) - i - 1]);
 
-    /* Return */
+    /* 返回调用方。 */
     emit1(state, 0xc3);
 #elif defined(__aarch64__)
     uint32_t register_space = ARRAY_SIZE(callee_reg) * 8 + 2 * 8;
     state->stack_size = align_up(STACK_SIZE + register_space, 16);
     emit_addsub_imm(state, true, AS_SUB, SP, SP, state->stack_size);
 
-    /* Set up frame */
+    /* 建立栈帧。 */
     emit_loadstorepair_imm(state, LSP_STPX, R29, R30, SP, 0);
-    /* In ARM64 calling convention, R29 is the frame pointer. */
+    /* ARM64 调用约定中，R29 是 frame pointer。 */
     emit_addsub_imm(state, true, AS_ADD, R29, SP, 0);
 
-    /* Save callee saved registers */
+    /* 保存被调用者保存寄存器。 */
     for (size_t i = 0; i < ARRAY_SIZE(callee_reg); i += 2) {
         emit_loadstorepair_imm(state, LSP_STPX, callee_reg[i],
                                callee_reg[i + 1], SP, (i + 2) * 8);
     }
 
     emit_uncond_branch_reg(state, BR_BR, R1);
-    /* Epilogue */
+    /* 函数尾声。 */
     state->exit_loc = state->offset;
 
-    /* Restore callee-saved registers).  */
+    /* 恢复被调用者保存寄存器。 */
     for (size_t i = 0; i < ARRAY_SIZE(callee_reg); i += 2) {
         emit_loadstorepair_imm(state, LSP_LDPX, callee_reg[i],
                                callee_reg[i + 1], SP, (i + 2) * 8);
@@ -1812,9 +1783,7 @@ static void prepare_translate(struct jit_state *state)
 }
 
 static int liveness[N_RV_REGS];
-/* The priority queue of vm registers. The one which has farthest liveness is
- * first.
- */
+/* VM 寄存器优先队列，后续最晚再使用的寄存器排在最前。 */
 static uint8_t candidate_queue[N_RV_REGS];
 static int vm_reg[3]; /* enum x64_reg/a64_reg */
 
@@ -1827,7 +1796,7 @@ static void reset_reg()
     }
 }
 
-/* Save host register if it is dirty. */
+/* 如果宿主寄存器为 dirty，则写回 VM 寄存器。 */
 static inline void save_reg(struct jit_state *state, int idx)
 {
     assert(idx > -1 && idx < n_host_regs);
@@ -1835,9 +1804,8 @@ static inline void save_reg(struct jit_state *state, int idx)
     if (!register_map[idx].dirty)
         return;
 
-    /* Never save x0 - it's hardwired to zero. This allows using rv_reg_zero
-     * as a scratch register for temporary calculations without corrupting
-     * the zero register.
+    /* 永远不保存 x0，它硬连线为零。这样可把 rv_reg_zero 用作临时计算 scratch，
+     * 而不会破坏零寄存器。
      */
     if (register_map[idx].vm_reg_idx == 0) {
         register_map[idx].dirty = 0;
@@ -1875,13 +1843,13 @@ static int liveness_cmp(const void *l, const void *r)
     int liveness_l = liveness[*(uint8_t *) l];
     int liveness_r = liveness[*(uint8_t *) r];
 
-    /* Use explicit comparisons to avoid potential overflow from subtraction */
+    /* 使用显式比较，避免减法比较可能溢出。 */
     if (liveness_l < liveness_r)
         return -1;
     if (liveness_l > liveness_r)
         return 1;
 
-    /* Use register index as tie-breaker for stable sorting */
+    /* 使用寄存器索引作为稳定排序的平局规则。 */
     uint8_t reg_l = *(uint8_t *) l;
     uint8_t reg_r = *(uint8_t *) r;
     if (reg_l < reg_r)
@@ -1896,7 +1864,7 @@ static inline void liveness_calc(block_t *block)
     uint32_t idx;
     rv_insn_t *ir;
 
-    /* follow the order of operator in "src/rc32_template.c" */
+    /* 按 src/rv32_template.c 中操作实现的顺序统计活跃度。 */
     for (idx = 0, ir = block->ir_head; idx < block->n_insn;
          idx++, ir = ir->next) {
         switch (ir->opcode) {
@@ -2058,30 +2026,30 @@ static inline void liveness_calc(block_t *block)
             }
             break;
         case rv_insn_fuse6:
-            /* LI a7 + ECALL: no registers to track (a7 is set internally) */
+            /* LI a7 + ECALL：无须跟踪寄存器，a7 在内部设置。 */
             break;
         case rv_insn_fuse7:
-            /* Multiple ADDI: track rs1 for each operation */
+            /* 多条 ADDI：跟踪每个操作的 rs1。 */
             for (int i = 0; i < ir->imm2; i++) {
                 liveness[ir->fuse[i].rs1] = idx;
             }
             break;
         case rv_insn_fuse8:
-            /* LUI + ADDI: no source registers (rd = imm + imm2) */
+            /* LUI + ADDI：无源寄存器，rd = imm + imm2。 */
             break;
         case rv_insn_fuse9:
-            /* LUI + LW: no source registers (absolute address load) */
+            /* LUI + LW：无源寄存器，绝对地址加载。 */
             break;
         case rv_insn_fuse10:
-            /* LUI + SW: rs1 is source (value to store) */
+            /* LUI + SW：rs1 是待存储值来源。 */
             liveness[ir->rs1] = idx;
             break;
         case rv_insn_fuse11:
-            /* LW + ADDI: rs1 is source (base address and increment source) */
+            /* LW + ADDI：rs1 是基址和递增来源。 */
             liveness[ir->rs1] = idx;
             break;
         case rv_insn_fuse12:
-            /* ADDI + BNE: rs1 is source */
+            /* ADDI + BNE：rs1 是源寄存器。 */
             liveness[ir->rs1] = idx;
             break;
         default:
@@ -2103,10 +2071,10 @@ static inline void regs_refresh(int idx)
     }
 }
 
-/* return the index in the register_map */
+/* 返回 register_map 中的索引。 */
 static inline int reg_pick(int reserved)
 {
-    /* pick an available register */
+    /* 优先选择可用寄存器。 */
     for (int i = 0; i < n_host_regs; i++) {
         if (register_map[i].reg_idx == reserved)
             continue;
@@ -2114,7 +2082,7 @@ static inline int reg_pick(int reserved)
             return i;
     }
 
-    /* If registers are exhausted, pick the one which has farthest liveness. */
+    /* 寄存器耗尽时，选择后续最晚再使用的那个。 */
     int idx = -1;
     for (int i = 0; i < N_RV_REGS; i++) {
         uint8_t candidate = candidate_queue[i];
@@ -2134,10 +2102,10 @@ end_pick_reg:
     return idx;
 }
 
-/* return the index in the register_map, avoiding two reserved registers */
+/* 返回 register_map 中的索引，同时避开两个保留寄存器。 */
 static inline int reg_pick2(int reserved1, int reserved2)
 {
-    /* pick an available register */
+    /* 优先选择可用寄存器。 */
     for (int i = 0; i < n_host_regs; i++) {
         if (register_map[i].reg_idx == reserved1 ||
             register_map[i].reg_idx == reserved2)
@@ -2146,7 +2114,7 @@ static inline int reg_pick2(int reserved1, int reserved2)
             return i;
     }
 
-    /* If registers are exhausted, pick the one which has farthest liveness. */
+    /* 寄存器耗尽时，选择后续最晚再使用的那个。 */
     int idx = -1;
     for (int i = 0; i < N_RV_REGS; i++) {
         uint8_t candidate = candidate_queue[i];
@@ -2167,10 +2135,10 @@ end_pick_reg2:
     return idx;
 }
 
-/* Unmap the vm register to the host register. */
+/* 解除 VM 寄存器到宿主寄存器的映射。 */
 static inline void unmap_vm_reg(int idx)
 {
-    /* check dirty before unmap */
+    /* 解除映射前应已处理 dirty 状态。 */
     assert(idx > -1 && idx < n_host_regs);
     register_map[idx].vm_reg_idx = -1;
 }
@@ -2182,8 +2150,7 @@ static inline void set_vm_reg(int idx, int vm_reg_idx)
     register_map[idx].alive = true;
 }
 
-/* Map the vm register to a host register. If the host register file is
- * exhausted, pick a register and swap it out.
+/* 将 VM 寄存器映射到宿主寄存器。若宿主寄存器耗尽，则选择一个寄存器换出。
  */
 static inline int map_vm_reg(struct jit_state *state, int vm_reg_idx)
 {
@@ -2218,9 +2185,8 @@ static int ra_load(struct jit_state *state, int vm_reg_idx)
     return target_reg;
 }
 
-/* Prevent the host register collision while the first vm register has already
- * been mapped and the second one is going to be mapped to the same host
- * register and invoke swapping.
+/* 避免宿主寄存器冲突：第一个 VM 寄存器已经完成映射时，第二个 VM 寄存器若将映射
+ * 到同一个宿主寄存器并触发交换，就需要保护已保留的宿主寄存器。
  */
 static inline int map_vm_reg_reserved(struct jit_state *state,
                                       int vm_reg_idx,
@@ -2244,10 +2210,9 @@ static inline int map_vm_reg_reserved(struct jit_state *state,
     return target_reg;
 }
 
-/* Map a vm register while protecting two already-allocated host registers.
- * This prevents the register allocator from evicting either of the reserved
- * registers when allocating a third register (e.g., for rd after loading rs1
- * and rs2).
+/* 映射一个 VM 寄存器，同时保护两个已分配的宿主寄存器。
+ * 这样在分配第三个寄存器时，寄存器分配器不会逐出两个保留寄存器之一
+ * （例如加载 rs1、rs2 后再为 rd 分配寄存器）。
  */
 static inline int map_vm_reg_reserved2(struct jit_state *state,
                                        int vm_reg_idx,
@@ -2334,9 +2299,9 @@ static void ra_load2_sext(struct jit_state *state,
             emit_load(state, S32, parameter_reg[0], vm_reg[0],
                       offsetof(riscv_t, X) + 4 * vm_reg_idx1);
     } else if (sext1) {
-        /* Register already mapped but may not be sign-extended.
-         * On ARM64, emit_mov uses 32-bit ops which zero-extend,
-         * so we must explicitly sign-extend for signed operations.
+        /* 寄存器已映射，但可能尚未符号扩展。
+         * ARM64 上 emit_mov 使用 32 位操作，会把结果零扩展，因此有符号操作必须
+         * 显式执行符号扩展。
          */
         emit_sxtw(state, vm_reg[0]);
     }
@@ -2348,7 +2313,7 @@ static void ra_load2_sext(struct jit_state *state,
             emit_load(state, S32, parameter_reg[0], vm_reg[1],
                       offsetof(riscv_t, X) + 4 * vm_reg_idx2);
     } else if (sext2) {
-        /* Register already mapped but may not be sign-extended. */
+        /* 寄存器已映射，但可能尚未符号扩展。 */
         emit_sxtw(state, vm_reg[1]);
     }
 }
@@ -2381,9 +2346,8 @@ void parse_branch_history_table(struct jit_state *state,
     emit_jump_target_offset(state, JUMP_LOC_0, state->offset);
 }
 
-/* Timer increment removed: timer is now derived from cycle counter at
- * interrupt check points (rv_check_interrupt) rather than per-instruction.
- * This eliminates per-instruction memory operations in the JIT hot path.
+/* 已移除 timer 递增：现在 timer 在中断检查点（rv_check_interrupt）由
+ * cycle counter 推导，而不是逐指令维护。这可消除 JIT 热路径上的逐指令内存操作。
  */
 
 #define GEN(inst, code)                                                       \
@@ -2476,18 +2440,17 @@ static void do_fuse5(struct jit_state *state, riscv_t *rv UNUSED, rv_insn_t *ir)
     }
 }
 
-/* fused LI a7, imm + ECALL
- * This fusion is only available in standard RV32I/M/A/F/C since RV32E
- * uses a different syscall convention (t0 instead of a7).
+/* 融合 LI a7, imm + ECALL。
+ * 该融合只适用于标准 RV32I/M/A/F/C；RV32E 使用不同系统调用约定（t0 而非 a7）。
  */
 #if !RV32_HAS(RV32E)
 static void do_fuse6(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 {
-    /* Set a7 = syscall number (imm) */
+    /* 设置 a7 = 系统调用号 imm。 */
     vm_reg[0] = map_vm_reg(state, rv_reg_a7);
     emit_load_imm(state, vm_reg[0], ir->imm);
-    /* Store back all registers and call ecall handler.
-     * ECALL is at ir->pc + 4 (second instruction in fused pair).
+    /* 写回所有寄存器并调用 ecall 处理器。
+     * ECALL 位于 ir->pc + 4，即融合对的第二条指令。
      */
     store_back(state);
     emit_load_imm(state, temp_reg, ir->pc + 4);
@@ -2496,19 +2459,19 @@ static void do_fuse6(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     emit_exit(state);
 }
 #else
-/* RV32E stub: fuse6 pattern is never generated for RV32E.
- * Defensive fallback - emit exit if unexpectedly reached.
+/* RV32E stub：RV32E 下不会生成 fuse6 模式。
+ * 防御性回退：如果意外到达，则直接发射 exit。
  */
 static void do_fuse6(struct jit_state *state,
                      riscv_t *rv UNUSED,
                      rv_insn_t *ir UNUSED)
 {
-    assert(!"fuse6 should not be called in RV32E mode");
+    assert(!"RV32E 模式不应调用 fuse6");
     emit_exit(state);
 }
 #endif
 
-/* fused multiple ADDI */
+/* 融合多条 ADDI。 */
 static void do_fuse7(struct jit_state *state, riscv_t *rv UNUSED, rv_insn_t *ir)
 {
     opcode_fuse_t *fuse = ir->fuse;
@@ -2521,42 +2484,41 @@ static void do_fuse7(struct jit_state *state, riscv_t *rv UNUSED, rv_insn_t *ir)
     }
 }
 
-/* fused LUI + ADDI: 32-bit constant load (li pseudo-op)
- * rd = (lui_imm << 12) + addi_imm = ir->imm + ir->imm2
+/* 融合 LUI + ADDI：加载 32 位常量（li 伪指令）。
+ * rd = (lui_imm << 12) + addi_imm = ir->imm + ir->imm2。
  */
 static void do_fuse8(struct jit_state *state, riscv_t *rv UNUSED, rv_insn_t *ir)
 {
     vm_reg[0] = map_vm_reg(state, ir->rd);
-    /* Compute combined immediate at JIT compile time.
-     * Cast to uint32_t to avoid signed overflow UB.
+    /* 在 JIT 编译期计算合并立即数。转为 uint32_t 可避免有符号溢出 UB。
      */
     uint32_t combined_imm = (uint32_t) ir->imm + (uint32_t) ir->imm2;
     emit_load_imm(state, vm_reg[0], combined_imm);
 }
 
-/* fused LUI + LW: absolute address load
- * addr = ir->imm (lui << 12) + ir->imm2 (lw offset)
- * ir->rs2 = destination register for load
+/* 融合 LUI + LW：绝对地址加载。
+ * addr = ir->imm（lui << 12）+ ir->imm2（lw 偏移）。
+ * ir->rs2 是加载目的寄存器。
  */
 static void do_fuse9(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 {
     memory_t *m = PRIV(rv)->mem;
     uint32_t addr = (uint32_t) ir->imm + (uint32_t) ir->imm2;
 #if RV32_HAS(SYSTEM_MMIO)
-    /* Write LUI result to rd - required when rd != LW destination.
-     * LUI completes before LW, so this write happens even if LW faults.
+    /* 写入 LUI 结果到 rd；当 rd != LW 目的寄存器时这是必须的。
+     * LUI 在 LW 前完成，因此即使 LW fault，该写入也应发生。
      */
     vm_reg[0] = map_vm_reg(state, ir->rd);
     emit_load_imm(state, vm_reg[0], ir->imm);
 
-    /* Store virtual address and type for MMU translation */
+    /* 保存虚拟地址和访问类型，供 MMU 转换使用。 */
     emit_load_imm(state, temp_reg, addr);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.vaddr));
     emit_load_imm(state, temp_reg, rv_insn_lw);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.type));
-    /* Store instruction PC for trap return address */
+    /* 保存指令 PC，作为 trap 返回地址。 */
     emit_load_imm(state, temp_reg, ir->pc);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.pc));
@@ -2565,16 +2527,15 @@ static void do_fuse9(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     emit_jit_mmu_handler(state, ir->rs2);
     reset_reg();
 
-    /* Check if trap occurred during MMU translation.
-     * If trapped, skip the load entirely to avoid loading garbage.
+    /* 检查 MMU 转换期间是否发生 trap。若已 trap，则完全跳过加载，避免读入无效数据。
      */
     emit_load(state, S8, parameter_reg[0], temp_reg,
               offsetof(riscv_t, is_trapped));
     emit_cmp_imm32(state, temp_reg, 0);
     uint32_t jump_trap = state->offset;
-    emit_jcc_offset(state, JCC_JNE); /* Jump to end if trapped */
+    emit_jcc_offset(state, JCC_JNE); /* 已 trap 时跳到末尾。 */
 
-    /* If MMIO, value already in X[rd]; otherwise load from translated paddr */
+    /* 若为 MMIO，值已在 X[rd]；否则从转换后的 paddr 加载。 */
     emit_load(state, S8, parameter_reg[0], temp_reg,
               offsetof(riscv_t, jit_mmu.is_mmio));
     emit_cmp_imm32(state, temp_reg, 0);
@@ -2582,15 +2543,15 @@ static void do_fuse9(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     uint32_t jump_loc_0 = state->offset;
     emit_jcc_offset(state, JCC_JE);
 
-    /* MMIO path: load from X[rd] */
+    /* MMIO 路径：从 X[rd] 加载。 */
     emit_load(state, S32, parameter_reg[0], vm_reg[0],
               offsetof(riscv_t, X) + 4 * ir->rs2);
     uint32_t jump_loc_1 = state->offset;
     emit_jcc_offset(state, JCC_JMP);
 
-    /* RAM path: load from mem_base + paddr.
-     * Reuse vm_reg[0] (already mapped to ir->rs2) for address calculation,
-     * then load into the same register - matches GEN_LOAD pattern.
+    /* RAM 路径：从 mem_base + paddr 加载。
+     * 复用已映射到 ir->rs2 的 vm_reg[0] 做地址计算，然后加载到同一寄存器，与
+     * GEN_LOAD 模式保持一致。
      */
     emit_jump_target_offset(state, JUMP_LOC_0, state->offset);
     emit_load(state, S32, parameter_reg[0], temp_reg,
@@ -2599,16 +2560,16 @@ static void do_fuse9(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     emit_alu64(state, ALU_OP_ADD, temp_reg, vm_reg[0]);
     emit_load(state, S32, vm_reg[0], vm_reg[0], 0);
     emit_jump_target_offset(state, JUMP_LOC_1, state->offset);
-    /* Jump over trap exit to continue normally */
+    /* 跳过 trap exit，继续正常执行。 */
     uint32_t jump_normal = state->offset;
     emit_jcc_offset(state, JCC_JMP);
-    /* Trap exit point - exit JIT block for trap handling */
+    /* trap 退出点：离开 JIT 基本块，交给 trap 处理。 */
     emit_jump_target_offset(state, JUMP_TRAP, state->offset);
     emit_exit(state);
-    /* Normal continuation point */
+    /* 正常继续执行点。 */
     emit_jump_target_offset(state, JUMP_NORMAL, state->offset);
 #else
-    /* Write LUI result to rd - required when rd != LW destination */
+    /* 写入 LUI 结果到 rd；当 rd != LW 目的寄存器时这是必须的。 */
     vm_reg[0] = map_vm_reg(state, ir->rd);
     emit_load_imm(state, vm_reg[0], ir->imm);
     emit_load_imm_sext(state, temp_reg, (intptr_t) (m->mem_base + addr));
@@ -2617,30 +2578,29 @@ static void do_fuse9(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 #endif
 }
 
-/* fused LUI + SW: absolute address store
- * addr = ir->imm (lui << 12) + ir->imm2 (sw offset)
- * ir->rs1 = source register for store
+/* 融合 LUI + SW：绝对地址存储。
+ * addr = ir->imm（lui << 12）+ ir->imm2（sw 偏移）。
+ * ir->rs1 是存储源寄存器。
  */
 static void do_fuse10(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 {
     memory_t *m = PRIV(rv)->mem;
     uint32_t addr = (uint32_t) ir->imm + (uint32_t) ir->imm2;
 #if RV32_HAS(SYSTEM_MMIO)
-    /* Write LUI result to rd - SW doesn't write registers, so rd may be
-     * used later. LUI completes before SW, so this write happens even if
-     * SW faults.
+    /* 写入 LUI 结果到 rd。SW 不写寄存器，因此 rd 之后可能仍会被使用；LUI 在 SW
+     * 前完成，所以即使 SW fault，该写入也应发生。
      */
     vm_reg[0] = map_vm_reg(state, ir->rd);
     emit_load_imm(state, vm_reg[0], ir->imm);
 
-    /* Store virtual address and type for MMU translation */
+    /* 保存虚拟地址和访问类型，供 MMU 转换使用。 */
     emit_load_imm(state, temp_reg, addr);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.vaddr));
     emit_load_imm(state, temp_reg, rv_insn_sw);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.type));
-    /* Store instruction PC for trap return address */
+    /* 保存指令 PC，作为 trap 返回地址。 */
     emit_load_imm(state, temp_reg, ir->pc);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.pc));
@@ -2648,24 +2608,23 @@ static void do_fuse10(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     emit_jit_mmu_handler(state, ir->rs1);
     reset_reg();
 
-    /* Check if trap occurred - skip store if trapped */
+    /* 检查是否发生 trap；已 trap 时跳过存储。 */
     emit_load(state, S8, parameter_reg[0], temp_reg,
               offsetof(riscv_t, is_trapped));
     emit_cmp_imm32(state, temp_reg, 0);
     uint32_t jump_trap = state->offset;
-    emit_jcc_offset(state, JCC_JNE); /* Jump to end if trapped */
+    emit_jcc_offset(state, JCC_JNE); /* 已 trap 时跳到末尾。 */
 
-    /* If MMIO, skip store (handled by MMU handler) */
+    /* 若为 MMIO，跳过这里的 store，已由 MMU handler 处理。 */
     emit_load(state, S8, parameter_reg[0], temp_reg,
               offsetof(riscv_t, jit_mmu.is_mmio));
     emit_cmp_imm32(state, temp_reg, 1);
     uint32_t jump_loc_0 = state->offset;
     emit_jcc_offset(state, JCC_JE);
 
-    /* RAM path: store to mem_base + paddr.
-     * SW doesn't write registers, so rd can be used as scratch.
-     * Note: Cannot use rv_reg_zero as scratch because emit_load has special
-     * handling that returns 0 for any load targeting a register mapped to x0.
+    /* RAM 路径：存储到 mem_base + paddr。
+     * SW 不写寄存器，因此 rd 可用作 scratch。注意不能使用 rv_reg_zero 作为 scratch，
+     * 因为 emit_load 对映射到 x0 的目标寄存器有特殊处理，会直接返回 0。
      */
     emit_load(state, S32, parameter_reg[0], temp_reg,
               offsetof(riscv_t, jit_mmu.paddr));
@@ -2675,17 +2634,17 @@ static void do_fuse10(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     vm_reg[1] = ra_load(state, ir->rs1);
     emit_store(state, S32, vm_reg[1], vm_reg[0], 0);
     emit_jump_target_offset(state, JUMP_LOC_0, state->offset);
-    /* Jump over trap exit to continue normally */
+    /* 跳过 trap exit，继续正常执行。 */
     uint32_t jump_normal = state->offset;
     emit_jcc_offset(state, JCC_JMP);
-    /* Trap exit point - exit JIT block for trap handling */
+    /* trap 退出点：离开 JIT 基本块，交给 trap 处理。 */
     emit_jump_target_offset(state, JUMP_TRAP, state->offset);
     emit_exit(state);
-    /* Normal continuation point */
+    /* 正常继续执行点。 */
     emit_jump_target_offset(state, JUMP_NORMAL, state->offset);
     reset_reg();
 #else
-    /* Write LUI result to rd - SW doesn't write registers, so rd may be used */
+    /* 写入 LUI 结果到 rd；SW 不写寄存器，因此 rd 之后可能仍会使用。 */
     vm_reg[0] = map_vm_reg(state, ir->rd);
     emit_load_imm(state, vm_reg[0], ir->imm);
     vm_reg[1] = ra_load(state, ir->rs1);
@@ -2694,16 +2653,16 @@ static void do_fuse10(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 #endif
 }
 
-/* fused LW + ADDI (post-increment load)
- * addr = rv->X[ir->rs1] + ir->imm
- * ir->rd = load destination
- * ir->rs1 += ir->imm2 (increment)
+/* 融合 LW + ADDI（后递增加载）。
+ * addr = rv->X[ir->rs1] + ir->imm。
+ * ir->rd 是加载目的寄存器。
+ * ir->rs1 += ir->imm2（递增）。
  */
 static void do_fuse11(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 {
     memory_t *m = PRIV(rv)->mem;
 #if RV32_HAS(SYSTEM_MMIO)
-    /* Compute virtual address: rs1 + imm */
+    /* 计算虚拟地址：rs1 + imm。 */
     vm_reg[0] = ra_load(state, ir->rs1);
     emit_load_imm_sext(state, temp_reg, ir->imm);
     emit_alu32(state, ALU_OP_ADD, vm_reg[0], temp_reg);
@@ -2712,7 +2671,7 @@ static void do_fuse11(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     emit_load_imm(state, temp_reg, rv_insn_lw);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.type));
-    /* Store instruction PC for trap return address */
+    /* 保存指令 PC，作为 trap 返回地址。 */
     emit_load_imm(state, temp_reg, ir->pc);
     emit_store(state, S32, temp_reg, parameter_reg[0],
                offsetof(riscv_t, jit_mmu.pc));
@@ -2721,17 +2680,16 @@ static void do_fuse11(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     emit_jit_mmu_handler(state, ir->rd);
     reset_reg();
 
-    /* Check if trap occurred during MMU translation.
-     * If trapped, skip the load and post-increment entirely.
-     * is_trapped is set by jit_mmu_handler when mem_translate faults.
+    /* 检查 MMU 转换期间是否发生 trap。若已 trap，则完全跳过加载和后递增。
+     * mem_translate fault 时，jit_mmu_handler 会设置 is_trapped。
      */
     emit_load(state, S8, parameter_reg[0], temp_reg,
               offsetof(riscv_t, is_trapped));
     emit_cmp_imm32(state, temp_reg, 0);
     uint32_t jump_trap = state->offset;
-    emit_jcc_offset(state, JCC_JNE); /* Jump to end if trapped */
+    emit_jcc_offset(state, JCC_JNE); /* 已 trap 时跳到末尾。 */
 
-    /* If MMIO, value already in X[rd]; otherwise load from translated paddr */
+    /* 若为 MMIO，值已在 X[rd]；否则从转换后的 paddr 加载。 */
     emit_load(state, S8, parameter_reg[0], temp_reg,
               offsetof(riscv_t, jit_mmu.is_mmio));
     emit_cmp_imm32(state, temp_reg, 0);
@@ -2739,15 +2697,15 @@ static void do_fuse11(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     uint32_t jump_loc_0 = state->offset;
     emit_jcc_offset(state, JCC_JE);
 
-    /* MMIO path: load from X[rd] */
+    /* MMIO 路径：从 X[rd] 加载。 */
     emit_load(state, S32, parameter_reg[0], vm_reg[0],
               offsetof(riscv_t, X) + 4 * ir->rd);
     uint32_t jump_loc_1 = state->offset;
     emit_jcc_offset(state, JCC_JMP);
 
-    /* RAM path: load from mem_base + paddr.
-     * Reuse vm_reg[0] (already mapped to ir->rd) for address calculation,
-     * then load into the same register - matches GEN_LOAD pattern.
+    /* RAM 路径：从 mem_base + paddr 加载。
+     * 复用已映射到 ir->rd 的 vm_reg[0] 做地址计算，然后加载到同一寄存器，与
+     * GEN_LOAD 模式保持一致。
      */
     emit_jump_target_offset(state, JUMP_LOC_0, state->offset);
     emit_load(state, S32, parameter_reg[0], temp_reg,
@@ -2757,62 +2715,62 @@ static void do_fuse11(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
     emit_load(state, S32, vm_reg[0], vm_reg[0], 0);
     emit_jump_target_offset(state, JUMP_LOC_1, state->offset);
 
-    /* Post-increment rs1 by imm2 (only executed if no trap).
-     * Must use ra_load to load rs1's value from memory since reset_reg() was
-     * called after store_back(). Without loading, we'd increment garbage.
+    /* rs1 按 imm2 后递增，仅在没有 trap 时执行。
+     * store_back() 后调用了 reset_reg()，因此必须用 ra_load 从内存重新加载 rs1；
+     * 否则会递增无效寄存器内容。
      */
     vm_reg[0] = ra_load(state, ir->rs1);
     emit_alu32_imm32(state, 0x81, 0, vm_reg[0], ir->imm2);
-    /* Jump over trap exit to continue normally */
+    /* 跳过 trap exit，继续正常执行。 */
     uint32_t jump_normal = state->offset;
     emit_jcc_offset(state, JCC_JMP);
-    /* Trap exit point - exit JIT block for trap handling */
+    /* trap 退出点：离开 JIT 基本块，交给 trap 处理。 */
     emit_jump_target_offset(state, JUMP_TRAP, state->offset);
     emit_exit(state);
-    /* Normal continuation point */
+    /* 正常继续执行点。 */
     emit_jump_target_offset(state, JUMP_NORMAL, state->offset);
 #else
     vm_reg[0] = ra_load(state, ir->rs1);
-    /* Compute address: mem_base + rs1 + imm */
+    /* 计算地址：mem_base + rs1 + imm。 */
     emit_load_imm_sext(state, temp_reg, (intptr_t) (m->mem_base + ir->imm));
     emit_alu64(state, 0x01, vm_reg[0], temp_reg);
-    /* Load value into rd */
+    /* 加载值到 rd。 */
     vm_reg[1] = map_vm_reg(state, ir->rd);
     emit_load(state, S32, temp_reg, vm_reg[1], 0);
-    /* Increment rs1 by imm2 */
+    /* rs1 按 imm2 递增。 */
     vm_reg[0] = map_vm_reg(state, ir->rs1);
     emit_alu32_imm32(state, 0x81, 0, vm_reg[0], ir->imm2);
-    set_dirty(vm_reg[0], true); /* Mark rs1 dirty so it's saved to memory */
+    set_dirty(vm_reg[0], true); /* 标记 rs1 为 dirty，确保写回内存。 */
 #endif
 }
 
-/* fused ADDI + BNE (loop counter decrement-branch)
- * rd = rs1 + imm
- * if rd != 0, branch to PC + 4 + imm2
- * This is a branching instruction, so we must store back and exit
+/* 融合 ADDI + BNE（循环计数递减并分支）。
+ * rd = rs1 + imm。
+ * 如果 rd != 0，则跳转到 PC + 4 + imm2。
+ * 这是分支指令，必须写回寄存器并退出当前 JIT 块。
  */
 static void do_fuse12(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 {
-    /* Compute rd = rs1 + imm */
+    /* 计算 rd = rs1 + imm。 */
     vm_reg[0] = ra_load(state, ir->rs1);
     vm_reg[1] = map_vm_reg_reserved(state, ir->rd, vm_reg[0]);
     if (vm_reg[0] != vm_reg[1])
         emit_mov(state, vm_reg[0], vm_reg[1]);
     emit_alu32_imm32(state, 0x81, 0, vm_reg[1], ir->imm);
-    /* Compare rd with 0 for branch decision */
+    /* 比较 rd 与 0，决定是否分支。 */
     emit_cmp_imm32(state, vm_reg[1], 0);
     store_back(state);
-    /* jne (jump if not equal) to taken path: 0x85 = JNE */
+    /* JNE 跳转到 taken 路径：0x85 = JNE。 */
     uint32_t jump_loc_0 = state->offset;
     emit_jcc_offset(state, 0x85);
-    /* Untaken path: rd == 0, fall through to PC + 8 */
+    /* untaken 路径：rd == 0，落到 PC + 8。 */
     if (ir->branch_untaken) {
         emit_jmp(state, ir->pc + 8, rv->csr_satp);
     }
     emit_load_imm(state, temp_reg, ir->pc + 8);
     emit_store(state, S32, temp_reg, parameter_reg[0], offsetof(riscv_t, PC));
     emit_exit(state);
-    /* Taken path: rd != 0, branch to PC + 4 + imm2 */
+    /* taken 路径：rd != 0，跳转到 PC + 4 + imm2。 */
     emit_jump_target_offset(state, JUMP_LOC_0, state->offset);
     if (ir->branch_taken) {
         emit_jmp(state, ir->pc + 4 + ir->imm2, rv->csr_satp);
@@ -2824,11 +2782,11 @@ static void do_fuse12(struct jit_state *state, riscv_t *rv, rv_insn_t *ir)
 
 /* clang-format off */
 static const void *dispatch_table[] = {
-    /* RV32 instructions */
+    /* RV32 指令。 */
 #define _(inst, can_branch, insn_len, translatable, reg_mask) [rv_insn_##inst] = do_##inst,
     RV_INSN_LIST
 #undef _
-    /* Macro operation fusion instructions */
+    /* 宏操作融合指令。 */
 #define _(inst) [rv_insn_##inst] = do_##inst,
     FUSE_INSN_LIST
 #undef _
@@ -2873,18 +2831,17 @@ static void translate(struct jit_state *state, riscv_t *rv, block_t *block)
     }
 
 #if RV32_HAS(BLOCK_CHAINING)
-    /* Page-terminated block fallthrough: emit jump to next block or exit.
-     * Unlike branch-terminated blocks, page-terminated blocks always fall
-     * through to the next sequential address (pc_end).
+    /* 页边界终止基本块的 fallthrough：发射跳转到下一块或退出。不同于分支终止块，
+     * 页边界终止块总是落到下一个顺序地址 pc_end。
      */
     if (block->page_terminated && !should_flush) {
         ir = block->ir_tail;
         store_back(state);
         if (ir->branch_taken) {
-            /* Fallthrough chain established - jump to next block */
+            /* fallthrough 链接已建立，跳转到下一基本块。 */
             emit_jmp(state, block->pc_end, rv->csr_satp);
         }
-        /* Store PC and exit for un-chained path */
+        /* 未链接路径保存 PC 并退出。 */
         emit_load_imm(state, temp_reg, block->pc_end);
         emit_store(state, S32, temp_reg, parameter_reg[0],
                    offsetof(riscv_t, PC));
@@ -2899,7 +2856,7 @@ static void resolve_jumps(struct jit_state *state)
         return;
 
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* Write mode is maintained by jit_translate during translation. */
+    /* 翻译期间写模式由 jit_translate 维护。 */
 #endif
 
     for (int i = 0; i < state->n_jumps; i++) {
@@ -2930,7 +2887,7 @@ static void resolve_jumps(struct jit_state *state)
             }
         }
 #if defined(__x86_64__)
-        /* Assumes jump offset is at end of instruction */
+        /* 假设跳转偏移位于指令末尾。 */
         uint32_t rel = target_loc - (jump.offset_loc + sizeof(uint32_t));
 
         uint8_t *offset_ptr = &state->buf[jump.offset_loc];
@@ -3002,7 +2959,7 @@ void jit_translate(riscv_t *rv, block_t *block)
 {
     struct jit_state *state = rv->jit_state;
     if (set_has(&state->set, RV_HASH_KEY(block))) {
-        /* Block already translated - skip */
+        /* 基本块已翻译，直接复用。 */
         for (int i = 0; i < state->n_blocks; i++) {
             if (block->pc_start == state->offset_map[i].pc
 #if RV32_HAS(SYSTEM)
@@ -3022,9 +2979,8 @@ restart:
     state->n_jumps = 0;
     block->offset = state->offset;
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* Enter write mode for the entire translation phase.
-     * This batches all write protection toggling into a single operation,
-     * avoiding potential cache coherency issues from rapid toggling.
+    /* 整个翻译阶段进入写模式。
+     * 将所有写保护切换合并为一次操作，避免快速切换造成潜在缓存一致性问题。
      */
     jit_enter_write_mode();
 #endif
@@ -3038,10 +2994,9 @@ restart:
     }
     resolve_jumps(state);
 #if defined(__aarch64__)
-    /* Cache maintenance after patching branch immediates.
-     * On Apple: sys_icache_invalidate performs DC CVAU + DSB + IC IVAU + DSB +
-     * ISB. On Linux: __builtin___clear_cache performs similar cache
-     * maintenance.
+    /* 修补分支立即数后的缓存维护。
+     * Apple 上 sys_icache_invalidate 执行 DC CVAU + DSB + IC IVAU + DSB + ISB；
+     * Linux 上 __builtin___clear_cache 执行类似维护。
      */
 #if defined(__APPLE__)
     __asm__ volatile("dmb ish" ::: "memory");
@@ -3049,10 +3004,10 @@ restart:
     sys_icache_invalidate(state->buf + block->offset,
                           state->offset - block->offset);
 #if defined(__APPLE__)
-    /* Exit write mode - page becomes executable. */
+    /* 退出写模式，页面恢复可执行。 */
     jit_exit_write_mode();
 #endif
-    /* Full barrier sequence to ensure instruction coherency. */
+    /* 完整屏障序列，确保指令一致性。 */
     __asm__ volatile("dsb ish" ::: "memory");
     __asm__ volatile("isb" ::: "memory");
 #endif
@@ -3086,9 +3041,8 @@ struct jit_state *jit_state_init(size_t size)
     reset_reg();
     prepare_translate(state);
 #if defined(__APPLE__) && defined(__aarch64__)
-    /* Final cache flush for prologue/epilogue code.
-     * emit_bytes handles per-instruction cache maintenance, but a final
-     * flush ensures the entire region is coherent.
+    /* 对 prologue/epilogue 代码做最后一次 cache flush。
+     * emit_bytes 已处理逐指令 cache 维护，但最终 flush 可确保整个区域一致。
      */
     __builtin___clear_cache((char *) state->buf,
                             (char *) (state->buf + state->offset));

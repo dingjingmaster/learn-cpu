@@ -3,6 +3,13 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * 8250/16550 UART 设备模型。
+ *
+ * 系统模式下，客体通过 UART MMIO 寄存器完成控制台输入输出。本文件模拟常用寄存器、
+ * FIFO 可用状态和中断更新；WASM 构建还会通过输入缓冲区函数与浏览器终端桥接。
+ */
+
 #include <assert.h>
 #include <errno.h>
 #include <poll.h>
@@ -16,23 +23,23 @@
 #endif
 
 #include "uart.h"
-/* Emulate 8250 (plain, without loopback mode support) */
+/* 模拟基础 8250 UART，不支持 loopback 模式。 */
 
 #define U8250_INTR_THRE 1
 
 void u8250_update_interrupts(u8250_state_t *uart)
 {
-    /* Some interrupts are level-generated. */
-    /* TODO: does it also generate an LSR change interrupt? */
+    /* 部分中断按电平触发。 */
+    /* TODO：确认是否还会产生 LSR 变化中断。 */
     if (uart->in_ready)
         uart->pending_intrs |= 1;
     else
         uart->pending_intrs &= ~1;
 
-    /* Prevent generating any disabled interrupts in the first place */
+    /* 已禁用的中断不应进入 pending 集合。 */
     uart->pending_intrs &= uart->ier;
 
-    /* Update current interrupt (higher bits -> more priority) */
+    /* 更新当前中断；位号越高，优先级越高。 */
     if (uart->pending_intrs)
         uart->current_intr = ilog2(uart->pending_intrs);
 }
@@ -78,7 +85,7 @@ void u8250_check_ready(u8250_state_t *uart)
 static void u8250_handle_out(u8250_state_t *uart, uint8_t value)
 {
     if (write(uart->out_fd, &value, 1) < 1)
-        rv_log_error("Failed to write UART output: %s", strerror(errno));
+        rv_log_error("写入 UART 输出失败：%s", strerror(errno));
 }
 
 static uint8_t u8250_handle_in(u8250_state_t *uart)
@@ -95,24 +102,22 @@ static uint8_t u8250_handle_in(u8250_state_t *uart)
         input_buf_start = 0;
 #else
     if (read(uart->in_fd, &value, 1) < 0)
-        rv_log_error("Failed to read UART input: %s", strerror(errno));
+        rv_log_error("读取 UART 输入失败：%s", strerror(errno));
 #endif
     uart->in_ready = false;
 
-    if (value == 1) { /* start of heading (Ctrl-a) */
+    if (value == 1) { /* SOH 控制字符（Ctrl-a） */
         u8250_check_ready(uart);
-        if (getchar() == 120) { /* keyboard x */
-            rv_log_info("RISC-V emulator is destroyed");
+        if (getchar() == 120) { /* 键盘输入 x */
+            rv_log_info("RISC-V 模拟器已销毁");
             exit(EXIT_SUCCESS);
         }
     }
 
 #if RV32_HAS(SDL) && RV32_HAS(SYSTEM_MMIO)
     /*
-     * The guestOS may repeatedly open and close the SDL window,
-     * and the user could close the application by pressing the ctrl-c key.
-     * Need to trap the ctrl-c key and ensure the SDL window and
-     * SDL mixer are destroyed properly.
+     * 客体 OS 可能反复打开和关闭 SDL 窗口，用户也可能按 Ctrl-C 关闭应用。
+     * 这里拦截 Ctrl-C，确保 SDL 窗口和 SDL mixer 能被正确销毁。
      */
     extern void sdl_video_audio_cleanup();
     if (value == 3) /* ctrl-c */
@@ -145,12 +150,12 @@ uint32_t u8250_read(u8250_state_t *uart, uint32_t addr)
     case U8250_MCR:
         return uart->mcr;
     case U8250_LSR:
-        /* LSR = no error, TX done & ready */
+        /* LSR：无错误，TX 已完成且可继续发送。 */
         return (0x60 | (uint8_t) uart->in_ready);
     case U8250_MSR:
-        /* MSR = carrier detect, no ring, data ready, clear to send. */
+        /* MSR：载波检测、无振铃、数据就绪、允许发送。 */
         return 0xb0;
-        /* no scratch register, so we should be detected as a plain 8250. */
+        /* 无 scratch register，因此应被识别为基础 8250。 */
     default:
         break;
     }

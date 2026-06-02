@@ -1,22 +1,26 @@
-/* RV32I Base Instruction Set */
+/*
+ * RV32 常量传播和折叠规则。
+ *
+ * 本文件由 emulate.c 以模板方式包含，使用 CONSTOPT 宏为每条 IR 定义常量状态
+ * 如何传播。它不会执行指令，而是标记寄存器是否为常量、常量值是多少，以及遇到
+ * 分支、访存、CSR、浮点等不易静态证明的操作时如何保守失效。
+ */
 
-/* Internal */
+/* RV32I 基础指令集。 */
+
+/* 内部伪操作。 */
 CONSTOPT(nop, {})
 
-/* LUI is used to build 32-bit constants and uses the U-type format. LUI
- * places the U-immediate value in the top 20 bits of the destination
- * register rd, filling in the lowest 12 bits with zeros. The 32-bit
- * result is sign-extended to 64 bits.
+/* LUI 用 U-type 格式构造 32 位常量：U-immediate 放入目标寄存器高 20 位，
+ * 低 12 位填 0，结果按指令语义写回 rd。
  */
 CONSTOPT(lui, {
     info->is_constant[ir->rd] = true;
     info->const_val[ir->rd] = ir->imm;
 })
 
-/* AUIPC is used to build pc-relative addresses and uses the U-type format.
- * AUIPC forms a 32-bit offset from the 20-bit U-immediate, filling in the
- * lowest 12 bits with zeros, adds this offset to the address of the AUIPC
- * instruction, then places the result in register rd.
+/* AUIPC 用于构造 PC 相对地址，也采用 U-type 格式。它把 20 位 U-immediate 放到
+ * 32 位偏移的高位，低 12 位填 0，再加上当前 AUIPC 指令地址，结果写入 rd。
  */
 CONSTOPT(auipc, {
     ir->imm += ir->pc;
@@ -26,9 +30,8 @@ CONSTOPT(auipc, {
     ir->impl = dispatch_table[ir->opcode];
 })
 
-/* JAL: Jump and Link
- * store successor instruction address into rd.
- * add next J imm (offset) to pc.
+/* JAL：跳转并链接。
+ * 将后继指令地址写入 rd，并把 J 型立即数偏移加到 PC 上。
  */
 CONSTOPT(jal, {
     if (ir->rd) {
@@ -37,12 +40,8 @@ CONSTOPT(jal, {
     }
 })
 
-/* The indirect jump instruction JALR uses the I-type encoding. The target
- * address is obtained by adding the sign-extended 12-bit I-immediate to the
- * register rs1, then setting the least-significant bit of the result to zero.
- * The address of the instruction following the jump (pc+4) is written to
- * register rd. Register x0 can be used as the destination if the result is
- * not required.
+/* JALR 是 I-type 间接跳转指令。目标地址为 rs1 加符号扩展后的 12 位立即数，
+ * 再清零最低位。跳转后继地址 pc+4 写入 rd；若不需要返回地址，可用 x0 作为 rd。
  */
 CONSTOPT(jalr, {
     if (ir->rd) {
@@ -62,52 +61,50 @@ CONSTOPT(jalr, {
     }
 /* clang-format on */
 
-/* BEQ: Branch if Equal */
+/* BEQ：相等则分支。 */
 CONSTOPT(beq, { OPT_BRANCH_FUNC(uint32_t, !=); })
 
-/* BNE: Branch if Not Equal */
+/* BNE：不相等则分支。 */
 CONSTOPT(bne, { OPT_BRANCH_FUNC(uint32_t, ==); })
 
-/* BLT: Branch if Less Than */
+/* BLT：有符号小于则分支。 */
 CONSTOPT(blt, { OPT_BRANCH_FUNC(int32_t, >=); })
 
-/* BGE: Branch if Greater Than */
+/* BGE：有符号大于等于则分支。 */
 CONSTOPT(bge, { OPT_BRANCH_FUNC(int32_t, <); })
 
-/* BLTU: Branch if Less Than Unsigned */
+/* BLTU：无符号小于则分支。 */
 CONSTOPT(bltu, { OPT_BRANCH_FUNC(uint32_t, >=); })
 
-/* BGEU: Branch if Greater Than Unsigned */
+/* BGEU：无符号大于等于则分支。 */
 CONSTOPT(bgeu, { OPT_BRANCH_FUNC(uint32_t, <); })
 
-/* LB: Load Byte */
+/* LB：加载有符号字节，内存值不可静态确定，目标寄存器失效。 */
 CONSTOPT(lb, { info->is_constant[ir->rd] = false; })
 
-/* LH: Load Halfword */
+/* LH：加载有符号半字，目标寄存器失效。 */
 CONSTOPT(lh, { info->is_constant[ir->rd] = false; })
 
-/* LW: Load Word */
+/* LW：加载字，目标寄存器失效。 */
 CONSTOPT(lw, { info->is_constant[ir->rd] = false; })
 
-/* LBU: Load Byte Unsigned */
+/* LBU：加载无符号字节，目标寄存器失效。 */
 CONSTOPT(lbu, { info->is_constant[ir->rd] = false; })
 
-/* LHU: Load Halfword Unsigned */
+/* LHU：加载无符号半字，目标寄存器失效。 */
 CONSTOPT(lhu, { info->is_constant[ir->rd] = false; })
 
-/* SB: Store Byte */
+/* SB：存储字节，不改变寄存器常量状态。 */
 CONSTOPT(sb, {})
 
-/* SH: Store Halfword */
+/* SH：存储半字，不改变寄存器常量状态。 */
 CONSTOPT(sh, {})
 
-/* SW: Store Word */
+/* SW：存储字，不改变寄存器常量状态。 */
 CONSTOPT(sw, {})
 
-/* ADDI adds the sign-extended 12-bit immediate to register rs1. Arithmetic
- * overflow is ignored and the result is simply the low XLEN bits of the
- * result. ADDI rd, rs1, 0 is used to implement the MV rd, rs1 assembler
- * pseudo-instruction.
+/* ADDI 将符号扩展后的 12 位立即数加到 rs1。算术溢出按 XLEN 低位截断处理。
+ * ADDI rd, rs1, 0 也用于实现 MV rd, rs1 汇编伪指令。
  */
 CONSTOPT(addi, {
     if (info->is_constant[ir->rs1]) {
@@ -120,10 +117,7 @@ CONSTOPT(addi, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SLTI place the value 1 in register rd if register rs1 is less than the
- * signextended immediate when both are treated as signed numbers, else 0 is
- * written to rd.
- */
+/* SLTI 按有符号数比较 rs1 与符号扩展立即数；rs1 更小时 rd=1，否则 rd=0。 */
 CONSTOPT(slti, {
     if (info->is_constant[ir->rs1]) {
         ir->imm = (int32_t) info->const_val[ir->rs1] < ir->imm ? 1 : 0;
@@ -135,9 +129,7 @@ CONSTOPT(slti, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SLTIU places the value 1 in register rd if register rs1 is less than the
- * immediate when both are treated as unsigned numbers, else 0 is written to rd.
- */
+/* SLTIU 按无符号数比较 rs1 与立即数；rs1 更小时 rd=1，否则 rd=0。 */
 CONSTOPT(sltiu, {
     if (info->is_constant[ir->rs1]) {
         ir->imm = info->const_val[ir->rs1] < (uint32_t) ir->imm ? 1 : 0;
@@ -149,7 +141,7 @@ CONSTOPT(sltiu, {
         info->is_constant[ir->rd] = false;
 })
 
-/* XORI: Exclusive OR Immediate */
+/* XORI：立即数异或。 */
 CONSTOPT(xori, {
     if (info->is_constant[ir->rs1]) {
         ir->imm ^= info->const_val[ir->rs1];
@@ -161,7 +153,7 @@ CONSTOPT(xori, {
         info->is_constant[ir->rd] = false;
 })
 
-/* ORI: OR Immediate */
+/* ORI：立即数或。 */
 CONSTOPT(ori, {
     if (info->is_constant[ir->rs1]) {
         ir->imm |= info->const_val[ir->rs1];
@@ -173,9 +165,7 @@ CONSTOPT(ori, {
         info->is_constant[ir->rd] = false;
 })
 
-/* ANDI performs bitwise AND on register rs1 and the sign-extended 12-bit
- * immediate and place the result in rd.
- */
+/* ANDI 对 rs1 和符号扩展后的 12 位立即数做按位与，结果写入 rd。 */
 CONSTOPT(andi, {
     if (info->is_constant[ir->rs1]) {
         ir->imm &= info->const_val[ir->rs1];
@@ -187,9 +177,7 @@ CONSTOPT(andi, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SLLI performs logical left shift on the value in register rs1 by the shift
- * amount held in the lower 5 bits of the immediate.
- */
+/* SLLI 使用立即数低 5 位作为移位量，对 rs1 做逻辑左移。 */
 CONSTOPT(slli, {
     if (info->is_constant[ir->rs1]) {
         ir->imm = info->const_val[ir->rs1] << (ir->imm & 0x1f);
@@ -201,9 +189,7 @@ CONSTOPT(slli, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SRLI performs logical right shift on the value in register rs1 by the shift
- * amount held in the lower 5 bits of the immediate.
- */
+/* SRLI 使用立即数低 5 位作为移位量，对 rs1 做逻辑右移。 */
 CONSTOPT(srli, {
     if (info->is_constant[ir->rs1]) {
         ir->imm = info->const_val[ir->rs1] >> (ir->imm & 0x1f);
@@ -215,9 +201,7 @@ CONSTOPT(srli, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SRAI performs arithmetic right shift on the value in register rs1 by the
- * shift amount held in the lower 5 bits of the immediate.
- */
+/* SRAI 使用立即数低 5 位作为移位量，对 rs1 做算术右移。 */
 CONSTOPT(srai, {
     if (info->is_constant[ir->rs1]) {
         ir->imm = (int32_t) info->const_val[ir->rs1] >> (ir->imm & 0x1f);
@@ -241,7 +225,7 @@ CONSTOPT(add, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SUB: Substract */
+/* SUB：减法。 */
 CONSTOPT(sub, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -253,7 +237,7 @@ CONSTOPT(sub, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SLL: Shift Left Logical */
+/* SLL：逻辑左移。 */
 CONSTOPT(sll, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -265,7 +249,7 @@ CONSTOPT(sll, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SLT: Set on Less Than */
+/* SLT：有符号小于则置 1。 */
 CONSTOPT(slt, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -280,7 +264,7 @@ CONSTOPT(slt, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SLTU: Set on Less Than Unsigned */
+/* SLTU：无符号小于则置 1。 */
 CONSTOPT(sltu, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -292,7 +276,7 @@ CONSTOPT(sltu, {
         info->is_constant[ir->rd] = false;
 })
 
-/* XOR: Exclusive OR */
+/* XOR：按位异或。 */
 CONSTOPT(xor, {
   if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
       info->is_constant[ir->rd] = true;
@@ -305,7 +289,7 @@ CONSTOPT(xor, {
       info->is_constant[ir->rd] = false;
 })
 
-/* SRL: Shift Right Logical */
+/* SRL：逻辑右移。 */
 CONSTOPT(srl, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -317,7 +301,7 @@ CONSTOPT(srl, {
         info->is_constant[ir->rd] = false;
 })
 
-/* SRA: Shift Right Arithmetic */
+/* SRA：算术右移。 */
 CONSTOPT(sra, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -357,51 +341,48 @@ CONSTOPT(and, {
 })
 
 /*
- * FENCE: order device I/O and memory accesses as viewed by other
- * RISC-V harts and external devices or coprocessors
+ * FENCE：对其他 RISC-V hart、外部设备或协处理器可见的设备 I/O 和内存访问排序。
  */
 CONSTOPT(fence, {})
 
-/* ECALL: Environment Call */
+/* ECALL：环境调用。 */
 CONSTOPT(ecall, {})
 
-/* EBREAK: Environment Break */
+/* EBREAK：环境断点。 */
 CONSTOPT(ebreak, {})
 
-/* WFI: Wait for Interrupt */
+/* WFI：等待中断。 */
 CONSTOPT(wfi, {})
 
-/* URET: return from traps in U-mode */
+/* URET：从 U 模式 trap 返回。 */
 CONSTOPT(uret, {})
 
 #if RV32_HAS(SYSTEM)
-/* SRET: return from traps in S-mode */
+/* SRET：从 S 模式 trap 返回。 */
 CONSTOPT(sret, {})
 #endif
 
-/* HRET: return from traps in H-mode */
+/* HRET：从 H 模式 trap 返回。 */
 CONSTOPT(hret, {})
 
-/* MRET: return from traps in M-mode */
+/* MRET：从 M 模式 trap 返回。 */
 CONSTOPT(mret, {})
 
-/* SFENCE.VMA: synchronize updates to in-memory memory-management data
- * structures with current execution
- */
+/* SFENCE.VMA：同步内存中内存管理数据结构的更新与当前执行流。 */
 CONSTOPT(sfencevma, {})
 
-#if RV32_HAS(Zifencei) /* RV32 Zifencei Standard Extension */
+#if RV32_HAS(Zifencei) /* RV32 Zifencei 标准扩展。 */
 CONSTOPT(fencei, {})
 #endif
 
-#if RV32_HAS(Zicsr) /* RV32 Zicsr Standard Extension */
-/* CSRRW: Atomic Read/Write CSR */
+#if RV32_HAS(Zicsr) /* RV32 Zicsr 标准扩展。 */
+/* CSRRW：原子读/写 CSR。 */
 CONSTOPT(csrrw, { info->is_constant[ir->rd] = false; })
 
-/* CSRRS: Atomic Read and Set Bits in CSR */
+/* CSRRS：原子读取并置位 CSR 位。 */
 CONSTOPT(csrrs, { info->is_constant[ir->rd] = false; })
 
-/* CSRRC: Atomic Read and Clear Bits in CSR */
+/* CSRRC：原子读取并清除 CSR 位。 */
 CONSTOPT(csrrc, { info->is_constant[ir->rd] = false; })
 
 /* CSRRWI */
@@ -414,10 +395,10 @@ CONSTOPT(csrrsi, { info->is_constant[ir->rd] = false; })
 CONSTOPT(csrrci, { info->is_constant[ir->rd] = false; })
 #endif
 
-/* RV32M Standard Extension */
+/* RV32M 标准扩展。 */
 
 #if RV32_HAS(EXT_M)
-/* MUL: Multiply */
+/* MUL：乘法低 32 位。 */
 CONSTOPT(mul, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -431,7 +412,7 @@ CONSTOPT(mul, {
         info->is_constant[ir->rd] = false;
 })
 
-/* MULH: Multiply High Signed Signed */
+/* MULH：有符号乘有符号，取高 32 位。 */
 CONSTOPT(mulh, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -445,7 +426,7 @@ CONSTOPT(mulh, {
         info->is_constant[ir->rd] = false;
 })
 
-/* MULHSU: Multiply High Signed Unsigned */
+/* MULHSU：有符号乘无符号，取高 32 位。 */
 CONSTOPT(mulhsu, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -459,7 +440,7 @@ CONSTOPT(mulhsu, {
         info->is_constant[ir->rd] = false;
 })
 
-/* MULHU: Multiply High Unsigned Unsigned */
+/* MULHU：无符号乘无符号，取高 32 位。 */
 CONSTOPT(mulhu, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
         info->is_constant[ir->rd] = true;
@@ -473,12 +454,12 @@ CONSTOPT(mulhu, {
         info->is_constant[ir->rd] = false;
 })
 
-/* DIV: Divide Signed */
+/* DIV：有符号除法。 */
 /* +------------------------+-----------+----------+-----------+
- * |       Condition        |  Dividend |  Divisor |   DIV[W]  |
+ * |       条件             |  被除数   |  除数    |   DIV[W]  |
  * +------------------------+-----------+----------+-----------+
- * | Division by zero       |  x        |  0       |  −1       |
- * | Overflow (signed only) |  −2^{L−1} |  −1      |  −2^{L−1} |
+ * | 除零                  |  x        |  0       |  -1       |
+ * | 溢出（仅有符号）      |  -2^{L-1} |  -1      |  -2^{L-1} |
  * +------------------------+-----------+----------+-----------+
  */
 CONSTOPT(div, {
@@ -488,7 +469,7 @@ CONSTOPT(div, {
         const int32_t divisor = (int32_t) info->const_val[ir->rs2];
         ir->imm = !divisor ? ~0U
                   : (divisor == -1 && info->const_val[ir->rs1] == 0x80000000U)
-                      ? info->const_val[ir->rs1] /* overflow */
+                      ? info->const_val[ir->rs1] /* 溢出。 */
                       : (unsigned int) (dividend / divisor);
         info->const_val[ir->rd] = ir->imm;
         ir->opcode = rv_insn_lui;
@@ -497,11 +478,11 @@ CONSTOPT(div, {
         info->is_constant[ir->rd] = false;
 })
 
-/* DIVU: Divide Unsigned */
+/* DIVU：无符号除法。 */
 /* +------------------------+-----------+----------+----------+
- * |       Condition        |  Dividend |  Divisor |  DIVU[W] |
+ * |       条件             |  被除数   |  除数    |  DIVU[W] |
  * +------------------------+-----------+----------+----------+
- * | Division by zero       |  x        |  0       |  2^L − 1 |
+ * | 除零                  |  x        |  0       |  2^L - 1 |
  * +------------------------+-----------+----------+----------+
  */
 CONSTOPT(divu, {
@@ -517,12 +498,12 @@ CONSTOPT(divu, {
         info->is_constant[ir->rd] = false;
 })
 
-/* REM: Remainder Signed */
+/* REM：有符号余数。 */
 /* +------------------------+-----------+----------+---------+
- * |       Condition        |  Dividend |  Divisor |  REM[W] |
+ * |       条件             |  被除数   |  除数    |  REM[W] |
  * +------------------------+-----------+----------+---------+
- * | Division by zero       |  x        |  0       |  x      |
- * | Overflow (signed only) |  −2^{L−1} |  −1      |  0      |
+ * | 除零                  |  x        |  0       |  x      |
+ * | 溢出（仅有符号）      |  -2^{L-1} |  -1      |  0      |
  * +------------------------+-----------+----------+---------+
  */
 CONSTOPT(rem, {
@@ -532,7 +513,7 @@ CONSTOPT(rem, {
         const int32_t divisor = info->const_val[ir->rs2];
         ir->imm = !divisor ? dividend
                   : (divisor == -1 && info->const_val[ir->rs1] == 0x80000000U)
-                      ? 0 /* overflow */
+                      ? 0 /* 溢出。 */
                       : (dividend % divisor);
         info->const_val[ir->rd] = ir->imm;
         ir->opcode = rv_insn_lui;
@@ -541,11 +522,11 @@ CONSTOPT(rem, {
         info->is_constant[ir->rd] = false;
 })
 
-/* REMU: Remainder Unsigned */
+/* REMU：无符号余数。 */
 /* +------------------------+-----------+----------+----------+
- * |       Condition        |  Dividend |  Divisor |  REMU[W] |
+ * |       条件             |  被除数   |  除数    |  REMU[W] |
  * +------------------------+-----------+----------+----------+
- * | Division by zero       |  x        |  0       |  x       |
+ * | 除零                  |  x        |  0       |  x       |
  * +------------------------+-----------+----------+----------+
  */
 CONSTOPT(remu, {
@@ -562,56 +543,56 @@ CONSTOPT(remu, {
 })
 #endif
 
-/* RV32A Standard Extension */
-/* TODO: support constant optimization for A and F extension */
+/* RV32A 标准扩展。 */
+/* TODO：支持 A 和 F 扩展的常量优化。 */
 #if RV32_HAS(EXT_A)
 
-/* LR.W: Load Reserved */
+/* LR.W：保留加载。 */
 CONSTOPT(lrw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* SC.W: Store Conditional */
+/* SC.W：条件存储。 */
 CONSTOPT(scw, {})
 
-/* AMOSWAP.W: Atomic Swap */
+/* AMOSWAP.W：原子交换。 */
 CONSTOPT(amoswapw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* AMOADD.W: Atomic ADD */
+/* AMOADD.W：原子加法。 */
 CONSTOPT(amoaddw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* AMOXOR.W: Atomic XOR */
+/* AMOXOR.W：原子异或。 */
 CONSTOPT(amoxorw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* AMOAND.W: Atomic AND */
+/* AMOAND.W：原子与。 */
 CONSTOPT(amoandw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* AMOOR.W: Atomic OR */
+/* AMOOR.W：原子或。 */
 CONSTOPT(amoorw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* AMOMIN.W: Atomic MIN */
+/* AMOMIN.W：原子有符号最小值。 */
 CONSTOPT(amominw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* AMOMAX.W: Atomic MAX */
+/* AMOMAX.W：原子有符号最大值。 */
 CONSTOPT(amomaxw, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
@@ -630,7 +611,7 @@ CONSTOPT(amomaxuw, {
 })
 #endif /* RV32_HAS(EXT_A) */
 
-/* RV32F Standard Extension */
+/* RV32F 标准扩展。 */
 
 #if RV32_HAS(EXT_F)
 /* FLW */
@@ -675,20 +656,19 @@ CONSTOPT(fsgnjns, {})
 /* FSGNJX.S */
 CONSTOPT(fsgnjxs, {})
 
-/* FMIN.S
- * In IEEE754-201x, fmin(x, y) return
- * - min(x,y) if both numbers are not NaN
- * - if one is NaN and another is a number, return the number
- * - if both are NaN, return NaN
- * When input is signaling NaN, raise invalid operation
+/* FMIN.S。
+ * IEEE754-201x 中，fmin(x, y) 的返回规则为：
+ * - 两个输入都不是 NaN 时返回 min(x, y)。
+ * - 一个是 NaN、另一个是数值时返回该数值。
+ * - 两个都是 NaN 时返回 NaN。
+ * 输入为 signaling NaN 时设置 invalid operation。
  */
 CONSTOPT(fmins, {})
 
 /* FMAX.S */
 CONSTOPT(fmaxs, {})
 
-/* FCVT.W.S and FCVT.WU.S convert a floating point number to an integer,
- * the rounding mode is specified in rm field.
+/* FCVT.W.S 和 FCVT.WU.S 把浮点数转换为整数，舍入模式由 rm 字段指定。
  */
 
 /* FCVT.W.S */
@@ -709,17 +689,15 @@ CONSTOPT(fmvxw, {
         info->is_constant[ir->rd] = false;
 })
 
-/* FEQ.S performs a quiet comparison: it only sets the invalid operation
- * exception flag if either input is a signaling NaN.
+/* FEQ.S 执行静默比较：只有任一输入为信号 NaN 时才设置 invalid operation 异常标志。
  */
 CONSTOPT(feqs, {
     if (ir->rd)
         info->is_constant[ir->rd] = false;
 })
 
-/* FLT.S and FLE.S perform what the IEEE 754-2008 standard refers to as
- * signaling comparisons: that is, they set the invalid operation exception
- * flag if either input is NaN.
+/* FLT.S 和 FLE.S 执行 IEEE 754-2008 所说的信号比较：任一输入为 NaN 时设置
+ * invalid operation 异常标志。
  */
 CONSTOPT(flts, {
     if (ir->rd)
@@ -747,14 +725,12 @@ CONSTOPT(fcvtswu, {})
 CONSTOPT(fmvwx, {})
 #endif
 
-/* RV32C Standard Extension */
+/* RV32C 标准扩展。 */
 
 #if RV32_HAS(EXT_C)
-/* C.ADDI4SPN is a CIW-format instruction that adds a zero-extended non-zero
- * immediate, scaledby 4, to the stack pointer, x2, and writes the result to
- * rd'.
- * This instruction is used to generate pointers to stack-allocated variables,
- * and expands to addi rd', x2, nzuimm[9:2].
+/* C.ADDI4SPN 是 CIW 格式指令，把零扩展且非零、按 4 缩放的立即数加到栈指针
+ * x2，并把结果写入 rd'。它常用于生成栈上变量指针，展开为
+ * addi rd', x2, nzuimm[9:2]。
  */
 CONSTOPT(caddi4spn, {
     if (info->is_constant[rv_reg_sp]) {
@@ -767,27 +743,22 @@ CONSTOPT(caddi4spn, {
         info->is_constant[ir->rd] = false;
 })
 
-/* C.LW loads a 32-bit value from memory into register rd'. It computes an
- * effective address by adding the zero-extended offset, scaled by 4, to the
- * base address in register rs1'. It expands to lw rd', offset[6:2](rs1').
+/* C.LW 从内存加载 32 位值到 rd'。有效地址为 rs1' 加上零扩展且按 4 缩放的偏移，
+ * 展开为 lw rd', offset[6:2](rs1')。
  */
 CONSTOPT(clw, { info->is_constant[ir->rd] = false; })
 
-/* C.SW stores a 32-bit value in register rs2' to memory. It computes an
- * effective address by adding the zero-extended offset, scaled by 4, to the
- * base address in register rs1'.
- * It expands to sw rs2', offset[6:2](rs1').
+/* C.SW 把 rs2' 中的 32 位值存入内存。有效地址为 rs1' 加上零扩展且按 4 缩放的
+ * 偏移，展开为 sw rs2', offset[6:2](rs1')。
  */
 CONSTOPT(csw, {})
 
 /* C.NOP */
 CONSTOPT(cnop, {})
 
-/* C.ADDI adds the non-zero sign-extended 6-bit immediate to the value in
- * register rd then writes the result to rd. C.ADDI expands into
- * addi rd, rd, nzimm[5:0]. C.ADDI is only valid when rd'=x0. The code point
- * with both rd=x0 and nzimm=0 encodes the C.NOP instruction; the remaining
- * code points with either rd=x0 or nzimm=0 encode HINTs.
+/* C.ADDI 将非零、符号扩展的 6 位立即数加到 rd，并写回 rd；展开为
+ * addi rd, rd, nzimm[5:0]。rd=x0 且 nzimm=0 编码为 C.NOP，其余 rd=x0 或
+ * nzimm=0 的编码为 HINT。
  */
 CONSTOPT(caddi, {
     if (info->is_constant[ir->rd]) {
@@ -804,19 +775,15 @@ CONSTOPT(cjal, {
     info->const_val[rv_reg_ra] = ir->pc + 2;
 })
 
-/* C.LI loads the sign-extended 6-bit immediate, imm, into register rd.
- * C.LI expands into addi rd, x0, imm[5:0].
- * C.LI is only valid when rd=x0; the code points with rd=x0 encode HINTs.
+/* C.LI 将符号扩展的 6 位立即数加载到 rd，展开为 addi rd, x0, imm[5:0]。 */
  */
 CONSTOPT(cli, {
     info->is_constant[ir->rd] = true;
     info->const_val[ir->rd] = ir->imm;
 })
 
-/* C.ADDI16SP is used to adjust the stack pointer in procedure prologues
- * and epilogues. It expands into addi x2, x2, nzimm[9:4].
- * C.ADDI16SP is only valid when nzimm'=0; the code point with nzimm=0 is
- * reserved.
+/* C.ADDI16SP 用于在过程序言/尾声中调整栈指针，展开为
+ * addi x2, x2, nzimm[9:4]。nzimm=0 的编码保留。
  */
 CONSTOPT(caddi16sp, {
     if (info->is_constant[ir->rd]) {
@@ -827,22 +794,16 @@ CONSTOPT(caddi16sp, {
     }
 })
 
-/* C.LUI loads the non-zero 6-bit immediate field into bits 17–12 of the
- * destination register, clears the bottom 12 bits, and sign-extends bit
- * 17 into all higher bits of the destination.
- * C.LUI expands into lui rd, nzimm[17:12].
- * C.LUI is only valid when rd'={x0, x2}, and when the immediate is not equal
- * to zero.
+/* C.LUI 把非零 6 位立即数字段加载到目标寄存器 17-12 位，清零低 12 位，并将
+ * 第 17 位符号扩展到高位；展开为 lui rd, nzimm[17:12]。
  */
 CONSTOPT(clui, {
     info->is_constant[ir->rd] = true;
     info->const_val[ir->rd] = ir->imm;
 })
 
-/* C.SRLI is a CB-format instruction that performs a logical right shift
- * of the value in register rd' then writes the result to rd'. The shift
- * amount is encoded in the shamt field. C.SRLI expands into srli rd',
- * rd', shamt[5:0].
+/* C.SRLI 是 CB 格式指令，对 rd' 做逻辑右移并写回 rd'；移位量编码在 shamt 中，
+ * 展开为 srli rd', rd', shamt[5:0]。
  */
 CONSTOPT(csrli, {
     if (info->is_constant[ir->rs1]) {
@@ -854,8 +815,7 @@ CONSTOPT(csrli, {
     }
 })
 
-/* C.SRAI is defined analogously to C.SRLI, but instead performs an
- * arithmetic right shift. C.SRAI expands to srai rd', rd', shamt[5:0].
+/* C.SRAI 与 C.SRLI 类似，但执行算术右移；展开为 srai rd', rd', shamt[5:0]。
  */
 CONSTOPT(csrai, {
     if (info->is_constant[ir->rs1]) {
@@ -870,9 +830,8 @@ CONSTOPT(csrai, {
     }
 })
 
-/* C.ANDI is a CB-format instruction that computes the bitwise AND of the
- * value in register rd' and the sign-extended 6-bit immediate, then writes
- * the result to rd'. C.ANDI expands to andi rd', rd', imm[5:0].
+/* C.ANDI 是 CB 格式指令，对 rd' 与符号扩展 6 位立即数做按位与并写回 rd'；
+ * 展开为 andi rd', rd', imm[5:0]。
  */
 CONSTOPT(candi, {
     if (info->is_constant[ir->rs1]) {
@@ -930,17 +889,13 @@ CONSTOPT(cand, {
         info->is_constant[ir->rd] = false;
 })
 
-/* C.J performs an unconditional control transfer. The offset is sign-extended
- * and added to the pc to form the jump target address.
- * C.J can therefore target a ±2 KiB range.
- * C.J expands to jal x0, offset[11:1].
+/* C.J 执行无条件控制转移。偏移经符号扩展后加到 PC，形成跳转目标；范围为
+ * +/-2 KiB，展开为 jal x0, offset[11:1]。
  */
 CONSTOPT(cj, {})
 
-/* C.BEQZ performs conditional control transfers. The offset is sign-extended
- * and added to the pc to form the branch target address.
- * It can therefore target a ±256 B range. C.BEQZ takes the branch if the
- * value in register rs1' is zero. It expands to beq rs1', x0, offset[8:1].
+/* C.BEQZ 执行条件转移。偏移经符号扩展后加到 PC，范围为 +/-256 B；当 rs1' 为 0
+ * 时分支，展开为 beq rs1', x0, offset[8:1]。
  */
 CONSTOPT(cbeqz, {
     if (info->is_constant[ir->rs1]) {
@@ -961,9 +916,8 @@ CONSTOPT(cbnez, {
     }
 })
 
-/* C.SLLI is a CI-format instruction that performs a logical left shift of
- * the value in register rd then writes the result to rd. The shift amount
- * is encoded in the shamt field. C.SLLI expands into slli rd, rd, shamt[5:0].
+/* C.SLLI 是 CI 格式指令，对 rd 做逻辑左移并写回 rd；移位量编码在 shamt 字段，
+ * 展开为 slli rd, rd, shamt[5:0]。
  */
 CONSTOPT(cslli, {
     if (info->is_constant[ir->rd]) {
@@ -1002,12 +956,7 @@ CONSTOPT(cjalr, {
     info->const_val[ir->rd] = ir->pc + 2;
 })
 
-/* C.ADD adds the values in registers rd and rs2 and writes the result to
- * register rd.
- * C.ADD expands into add rd, rd, rs2.
- * C.ADD is only valid when rs2=x0; the code points with rs2=x0 correspond to
- * the C.JALR and C.EBREAK instructions. The code points with rs2=x0 and rd=x0
- * are HINTs.
+/* C.ADD 将 rd 和 rs2 相加并写回 rd，展开为 add rd, rd, rs2。 */
  */
 CONSTOPT(cadd, {
     if (info->is_constant[ir->rs1] && info->is_constant[ir->rs2]) {
@@ -1024,7 +973,7 @@ CONSTOPT(cadd, {
 CONSTOPT(cswsp, {})
 #endif
 
-/* RV32FC Standard Extension */
+/* RV32FC 标准扩展。 */
 
 #if RV32_HAS(EXT_F) && RV32_HAS(EXT_C)
 /* C.FLWSP */

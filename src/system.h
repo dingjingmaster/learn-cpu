@@ -1,12 +1,18 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 系统模式接口。
+ *
+ * 该头文件声明 MMU、TLB、MMIO、PLIC/UART/RTC/virtio 中断更新和地址转换函数。
+ * 只有 CONFIG_SYSTEM 启用时才应被构建。
  */
 
 #pragma once
 
 #if !RV32_HAS(SYSTEM)
-#error "Do not manage to build this file unless you enable system support."
+#error "只有启用 system 支持时才能构建此文件。"
 #endif
 
 #include "devices/plic.h"
@@ -16,9 +22,8 @@
 #define R 1
 #define W 0
 
-/* MMIO definitions for Linux kernel emulation.
- * Only defined when ELF_LOADER is disabled, as kernel mode needs MMIO but ELF
- * test mode does not.
+/* Linux 内核模拟使用的 MMIO 定义。
+ * 仅在关闭 ELF_LOADER 时启用；内核启动路径需要 MMIO，ELF 测试模式不需要。
  */
 #if !RV32_HAS(ELF_LOADER)
 
@@ -38,33 +43,33 @@ enum SUPPORTED_MMIO {
 #define MMIO_OP(io, rw)                                                               \
     switch(io){                                                                       \
         case MMIO_PLIC:                                                               \
-            IIF(rw)( /* read */                                                       \
+            IIF(rw)( /* 读 */                                                         \
                 mmio_read_val = plic_read(PRIV(rv)->plic, addr & 0x3FFFFFF);          \
                 plic_update_interrupts(PRIV(rv)->plic);                               \
                 return mmio_read_val;                                                 \
-                ,    /* write */                                                      \
+                ,    /* 写 */                                                         \
                 plic_write(PRIV(rv)->plic, addr & 0x3FFFFFF, val);                    \
                 plic_update_interrupts(PRIV(rv)->plic);                               \
                 return;                                                               \
             )                                                                         \
             break;                                                                    \
         case MMIO_UART:                                                               \
-            IIF(rw)( /* read */                                                       \
+            IIF(rw)( /* 读 */                                                         \
                 mmio_read_val = u8250_read(PRIV(rv)->uart, addr & 0xFFFFF);           \
                 emu_update_uart_interrupts(rv);                                       \
                 return mmio_read_val;                                                 \
-                ,    /* write */                                                      \
+                ,    /* 写 */                                                         \
                 u8250_write(PRIV(rv)->uart, addr & 0xFFFFF, val);                     \
                 emu_update_uart_interrupts(rv);                                       \
                 return;                                                               \
             )                                                                         \
             break;                                                                    \
         case MMIO_VIRTIOBLK:                                                          \
-            IIF(rw)( /* read */                                                       \
+            IIF(rw)( /* 读 */                                                         \
                 mmio_read_val = virtio_blk_read(PRIV(rv)->vblk_curr, addr & 0xFFFFF); \
                 emu_update_vblk_interrupts(rv);                                       \
                 return mmio_read_val;                                                 \
-                ,    /* write */                                                      \
+                ,    /* 写 */                                                         \
                 virtio_blk_write(PRIV(rv)->vblk_curr, addr & 0xFFFFF, val);           \
                 emu_update_vblk_interrupts(rv);                                       \
                 return;                                                               \
@@ -72,11 +77,11 @@ enum SUPPORTED_MMIO {
             break;                                                                    \
         IIF(RV32_FEATURE_GOLDFISH_RTC)(                                               \
         case MMIO_RTC:                                                                \
-            IIF(rw)( /* read */                                                       \
+            IIF(rw)( /* 读 */                                                         \
                 mmio_read_val = rtc_read(PRIV(rv)->rtc, addr & 0xFFFFF);              \
                 emu_update_rtc_interrupts(rv);                                        \
                 return mmio_read_val;                                                 \
-                ,    /* write */                                                      \
+                ,    /* 写 */                                                         \
                 rtc_write(PRIV(rv)->rtc, addr & 0xFFFFF, val);                        \
                 emu_update_rtc_interrupts(rv);                                        \
                 return;                                                               \
@@ -84,15 +89,15 @@ enum SUPPORTED_MMIO {
             break;                                                                    \
         ,)                                                                            \
         default:                                                                      \
-            rv_log_error("unknown MMIO type %d\n", io);                               \
+            rv_log_error("未知 MMIO 类型 %d\n", io);                                  \
             break;                                                                    \
     }
 
 #define MMIO_READ()                                                           \
     do {                                                                      \
         uint32_t mmio_read_val;                                               \
-        if ((addr >> 28) == 0xF) { /* MMIO at 0xF_______ */                   \
-            /* 256 regions of 1MiB */                                         \
+        if ((addr >> 28) == 0xF) { /* 位于 0xF_______ 的 MMIO。 */            \
+            /* 256 个 1MiB 区域。 */                                          \
             uint32_t hi = (addr >> 20) & MASK(8);                             \
             if (PRIV(rv)->vblk_cnt && hi >= PRIV(rv)->vblk_mmio_base_hi &&    \
                 hi <= PRIV(rv)->vblk_mmio_max_hi) {                           \
@@ -123,8 +128,8 @@ enum SUPPORTED_MMIO {
 
 #define MMIO_WRITE()                                                          \
     do {                                                                      \
-        if ((addr >> 28) == 0xF) { /* MMIO at 0xF_______ */                   \
-            /* 256 regions of 1MiB */                                         \
+        if ((addr >> 28) == 0xF) { /* 位于 0xF_______ 的 MMIO。 */            \
+            /* 256 个 1MiB 区域。 */                                          \
             uint32_t hi = (addr >> 20) & MASK(8);                             \
             if (PRIV(rv)->vblk_cnt && hi >= PRIV(rv)->vblk_mmio_base_hi &&    \
                 hi <= PRIV(rv)->vblk_mmio_max_hi) {                           \
@@ -168,31 +173,28 @@ void emu_update_rtc_interrupts(riscv_t *rv);
 #endif /* !RV32_HAS(ELF_LOADER) */
 
 /*
- * Signal to RVOP macro that inline trap handling occurred.
- * When set, the instruction should return without advancing PC to allow retry.
- * Used both for Linux kernel signal handling (modifies SEPC) and ELF loader
- * mode inline trap handling (page fault resolved, instruction needs retry).
+ * 通知 RVOP 宏：当前发生了内联 trap 处理。该标志置位时，指令应在不推进 PC 的
+ * 情况下返回，以便重试。Linux 内核信号处理（修改 SEPC）和 ELF loader 模式的
+ * 内联缺页处理（缺页已解决，需要重试指令）都会使用它。
  */
 extern bool need_handle_signal;
 
-/* Walk through page tables and get the corresponding PTE by virtual address if
- * exists
- * @rv: RISC-V emulator
- * @addr: virtual address
- * @level: the level of which the PTE is located
- * @return: NULL if a not found or fault else the corresponding PTE
+/* 遍历页表，按虚拟地址查找对应 PTE。
+ * @rv: RISC-V 模拟器实例。
+ * @addr: 虚拟地址。
+ * @level: 输出 PTE 所在页表层级。
+ * @return: 未找到或遇到异常时返回 NULL，否则返回对应 PTE。
  */
 uint32_t *mmu_walk(riscv_t *rv, const uint32_t addr, uint32_t *level);
 
-/* Verify the PTE and generate corresponding faults if needed
- * @op: the operation
- * @rv: RISC-V emulator
- * @pte: to be verified pte
- * @addr: the corresponding virtual address to cause fault
- * @return: false if a any fault is generated which caused by violating the
- * access permission else true
+/* 校验 PTE，必要时产生对应页异常。
+ * @op: 访问操作。
+ * @rv: RISC-V 模拟器实例。
+ * @pte: 待校验 PTE。
+ * @addr: 触发异常的虚拟地址。
+ * @return: 因权限违规产生异常时返回 false，否则返回 true。
  */
-/* FIXME: handle access fault, addr out of range check */
+/* FIXME：补充 access fault 和地址越界检查。 */
 #define MMU_FAULT_CHECK_DECL(op)                                            \
     bool mmu_##op##_fault_check(riscv_t *rv, uint32_t *pte, uint32_t vaddr, \
                                 uint32_t access_bits);
@@ -202,12 +204,12 @@ MMU_FAULT_CHECK_DECL(read);
 MMU_FAULT_CHECK_DECL(write);
 
 /*
- * Translate virtual address to physical address with TLB caching.
+ * 通过 TLB 缓存把虚拟地址转换为物理地址。
  */
 uint32_t mmu_translate(riscv_t *rv, uint32_t vaddr, bool rw);
 
 /*
- * TLB management functions for SFENCE.VMA and SATP changes.
+ * SFENCE.VMA 和 SATP 变更使用的 TLB 管理函数。
  */
 void mmu_tlb_flush_all(riscv_t *rv);
 void mmu_tlb_flush(riscv_t *rv, uint32_t vaddr);

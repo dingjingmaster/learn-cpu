@@ -3,6 +3,14 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * WebAssembly 运行时桥接。
+ *
+ * 该文件只在 Emscripten 构建中生效，用 EM_JS 暴露浏览器侧 DOM 操作，例如
+ * 启用/禁用运行按钮、连接 xterm.js 输入缓冲区，以及在浏览器事件中停止 CPU
+ * 主循环。普通本地构建不会编译这些函数。
+ */
+
 #include "em_runtime.h"
 
 #if defined(__EMSCRIPTEN__)

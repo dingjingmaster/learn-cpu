@@ -3,6 +3,14 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * JIT 基本块缓存。
+ *
+ * 缓存使用哈希桶、热点频次和 ghost list 管理翻译后的基本块；系统模式下还维护
+ * 虚拟页到基本块的反向索引，用于 SFENCE.VMA/FENCE.I 后按 SATP 或 VA 精确失效。
+ * 这里是解释器热点提升、一级 JIT 复用和二级 JIT 失效传播的共同基础。
+ */
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -18,7 +26,7 @@
 
 static uint32_t cache_size, cache_size_bits;
 
-/* hash function for the cache */
+/* 缓存哈希函数。 */
 HASH_FUNC_IMPL(cache_hash, cache_size_bits, cache_size)
 
 struct hlist_head {
@@ -31,8 +39,7 @@ struct hlist_node {
 
 typedef struct {
     void *value;
-    bool alive; /* indicates whether this cache is alive or a history of evicted
-                   cache in hash map */
+    bool alive; /* true 表示活跃缓存；false 表示哈希表中保留的淘汰历史 */
     uint32_t key;
     uint32_t freq;
     struct list_head list;
@@ -44,46 +51,43 @@ typedef struct {
 } hashtable_t;
 
 /*
- * The cache utilizes the degenerated adaptive replacement cache (ARC), which
- * has only least-recently-used (LRU) and ignores least-frequently-used (LFU)
- * part. The frequently used cache will be compiled to the binary of target
- * platform by the just-in-time (JIT) compiler, so that it doesn't need to be
- * preserved in cache anymore. When the cache is full, the least used cache is
- * going to be evicted to the ghost list as the history. If the key of the
- * inserted entry matches the one in the ghost list, the history will be
- * detached and freed, and the stored information will be inherited by the new
- * entry.
+ * 缓存采用退化版 ARC（Adaptive Replacement Cache，自适应替换缓存）策略。
+ * 这里仅保留 LRU（最近最少使用）部分，忽略 LFU（最不常使用）部分。
+ * 高频条目会被 JIT 编译为宿主平台机器码，之后不再需要长期保存在本缓存中。
+ * 当缓存已满时，最近最少使用的活跃条目会被移动到 ghost list，作为淘汰历史。
+ * 若新插入条目的 key 命中了 ghost list 中的历史记录，则释放旧历史条目，并将
+ * 其中记录的频次等信息继承到新条目上。
  */
 
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-/* Page index entry: links blocks in the same page bucket */
+/* 页索引条目：把同一页桶中的基本块串起来。 */
 typedef struct page_block_entry {
-    void *block;                   /* pointer to block_t */
-    struct page_block_entry *next; /* next entry in bucket chain */
+    void *block;                   /* 指向 block_t 的指针 */
+    struct page_block_entry *next; /* 桶链表中的下一个条目 */
 } page_block_entry_t;
 #endif
 
 typedef struct cache {
-    struct list_head list;       /* list of live cache */
-    struct list_head ghost_list; /* list of evicted cache */
-    hashtable_t map; /* hash map which contains both live and evicted cache */
+    struct list_head list;       /* 活跃缓存链表 */
+    struct list_head ghost_list; /* 已淘汰缓存的历史链表 */
+    hashtable_t map; /* 同时保存活跃条目和淘汰历史的哈希表 */
     uint32_t size;
     uint32_t ghost_list_size;
     uint32_t capacity;
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-    /* Page index for O(1) invalidation by virtual address.
-     * Each bucket contains a linked list of blocks starting in that page.
+    /* 按虚拟地址做 O(1) 失效的页索引。
+     * 每个桶保存起始地址落在该页内的基本块链表。
      */
     page_block_entry_t *page_index[PAGE_INDEX_SIZE];
-    /* Flag indicating page index is incomplete due to malloc failure.
-     * When set, cache_invalidate_va must use O(n) fallback scan.
+    /* malloc 失败会导致页索引不完整。
+     * 该标志置位后，cache_invalidate_va 必须退回 O(n) 全量扫描。
      */
     bool page_index_incomplete;
 #endif
 } cache_t;
 
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-/* Forward declarations for page index functions */
+/* 页索引辅助函数的前置声明。 */
 static void page_index_insert(cache_t *cache, block_t *block);
 static void page_index_remove(cache_t *cache, block_t *block);
 #endif
@@ -174,7 +178,7 @@ static inline void hlist_del_init(struct hlist_node *n)
 
 cache_t *cache_create(uint32_t size_bits)
 {
-    /* Prevent integer overflow in 1 << size_bits */
+    /* 避免 1 << size_bits 发生整数溢出。 */
     if (size_bits >= 32)
         return NULL;
 
@@ -191,7 +195,7 @@ cache_t *cache_create(uint32_t size_bits)
     cache->ghost_list_size = 0;
     cache->capacity = cache_size;
 
-    /* Check for overflow in size calculation */
+    /* 检查哈希桶数组大小计算是否溢出。 */
     size_t alloc_size = cache_size * sizeof(struct hlist_head);
     if (alloc_size / sizeof(struct hlist_head) != cache_size)
         goto fail_cache;
@@ -204,7 +208,7 @@ cache_t *cache_create(uint32_t size_bits)
         INIT_HLIST_HEAD(&cache->map.ht_list_head[i]);
 
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-    /* Initialize page index for O(1) invalidation lookup */
+    /* 初始化用于 O(1) 失效查找的页索引。 */
     memset(cache->page_index, 0, sizeof(cache->page_index));
     cache->page_index_incomplete = false;
 #endif
@@ -237,19 +241,16 @@ void *cache_get(const cache_t *cache, uint32_t key, bool update)
             break;
     }
 
-    /* return NULL if cache miss */
+    /* 缓存未命中时返回 NULL。 */
     if (!entry || entry->key != key || !entry->alive)
         return NULL;
 
     /*
-     * FIXME: In system simulation, there might be several identical PC from
-     * different processes. We need to check the SATP CSR to update the correct
-     * entry.
+     * FIXME：系统模式下，不同进程可能出现相同 PC。这里后续需要结合 SATP CSR
+     * 判断并更新正确的缓存条目。
      */
-    /* When the frequency of use for a specific block exceeds the predetermined
-     * THRESHOLD, the block is dispatched to the code generator to generate C
-     * code. The generated C code is then compiled into machine code by the
-     * target compiler.
+    /* 某个基本块的使用频次超过预设 THRESHOLD 后，会被送入代码生成器生成 C 代码；
+     * 生成的 C 代码随后由目标编译器编译为机器码。
      */
     if (update)
         entry->freq++;
@@ -258,8 +259,7 @@ void *cache_get(const cache_t *cache, uint32_t key, bool update)
 }
 
 /*
- * When the size of ghost list reaches the limit, the oldest history is going to
- * be dropped. The stored information will be lost forever.
+ * ghost list 超过容量上限时，丢弃最旧的历史记录；对应的历史频次信息也会永久丢失。
  */
 FORCE_INLINE void cache_ghost_list_update(cache_t *cache)
 {
@@ -276,10 +276,10 @@ FORCE_INLINE void cache_ghost_list_update(cache_t *cache)
 }
 
 /*
- * For a cache insertion, it might be the one which:
- * - evicts the least recently used cache
- * - updates the existing cache
- * - retrieves the information from the history in the glost list
+ * 插入缓存时可能出现三种情况：
+ * - 淘汰最近最少使用的活跃缓存
+ * - 更新已有缓存
+ * - 从 ghost list 的历史记录中恢复频次信息
  */
 void *cache_put(cache_t *cache, uint32_t key, void *value)
 {
@@ -300,17 +300,17 @@ void *cache_put(cache_t *cache, uint32_t key, void *value)
             revived = entry;
             break;
         }
-        /* update the existing cache */
+        /* 更新已有缓存。 */
         if (entry->value != value) {
             replaced = entry;
             break;
         }
-        /* should not put an identical block to cache */
+        /* 不应向缓存重复放入完全相同的基本块。 */
         assert(NULL);
         __UNREACHABLE;
     }
 
-    /* get the entry to be replaced if cache is full */
+    /* 缓存已满时，选出需要被替换的条目。 */
     if (!replaced && cache->size == cache->capacity) {
         replaced = list_last_entry(&cache->list, cache_entry_t, list);
         assert(replaced);
@@ -322,7 +322,7 @@ void *cache_put(cache_t *cache, uint32_t key, void *value)
 
         replaced_value = replaced->value;
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-        /* Remove replaced block from page index before eviction */
+        /* 淘汰前先从页索引移除被替换的基本块。 */
         if (replaced_value)
             page_index_remove(cache, (block_t *) replaced_value);
 #endif
@@ -335,7 +335,7 @@ void *cache_put(cache_t *cache, uint32_t key, void *value)
 
     cache_entry_t *new_entry = calloc(1, sizeof(cache_entry_t));
     if (unlikely(!new_entry)) {
-        /* Allocation failed - restore replaced entry if exists */
+        /* 分配失败时，如果已经取出了替换条目，需要恢复原状。 */
         if (replaced) {
             replaced->alive = true;
             list_del_init(&replaced->list);
@@ -370,8 +370,8 @@ void *cache_put(cache_t *cache, uint32_t key, void *value)
     cache->size++;
 
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-    /* Page index for O(1) invalidation - blocks are page-terminated
-     * and use fallthrough chaining for non-branch block boundaries.
+    /* 用页索引支持 O(1) 失效。
+     * 基本块在页边界处终止；非分支块边界通过顺序落入链继续执行。
      */
     page_index_insert(cache, (block_t *) value);
 #endif
@@ -386,7 +386,7 @@ void *cache_put(cache_t *cache, uint32_t key, void *value)
 void cache_free(cache_t *cache)
 {
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-    /* Free all page index entries */
+    /* 释放所有页索引条目。 */
     for (uint32_t i = 0; i < PAGE_INDEX_SIZE; i++) {
         page_block_entry_t *entry = cache->page_index[i];
         while (entry) {
@@ -466,10 +466,9 @@ void cache_profile(const struct cache *cache,
     }
 }
 
-/* Disable UBSAN function pointer type check for indirect calls. When T2C is
- * enabled, t2c_dispose_block_engine is compiled with LLVM's cflags which can
- * cause function type metadata mismatch, triggering false positive UBSAN
- * errors when called via clear_func_t.
+/* 对间接调用禁用 UBSAN 函数指针类型检查。启用 T2C 时，
+ * t2c_dispose_block_engine 会使用 LLVM 的 cflags 编译，可能导致函数类型元数据
+ * 不匹配；通过 clear_func_t 间接调用时，UBSAN 会因此产生误报。
  */
 DISABLE_UBSAN_FUNC
 void clear_cache_hot(const struct cache *cache, clear_func_t func)
@@ -490,14 +489,14 @@ void clear_cache_hot(const struct cache *cache, clear_func_t func)
 #endif
 
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING)
-/* Page index functions for O(1) cache invalidation.
- * Requires BLOCK_CHAINING for page-terminated blocks.
+/* 支持 O(1) 缓存失效的页索引函数。
+ * 依赖 BLOCK_CHAINING 生成的页终止基本块。
  */
 
-/* Hash function for page index using golden ratio multiplicative hash */
+/* 页索引哈希函数，使用黄金比例乘法哈希。 */
 HASH_FUNC_IMPL(page_index_hash, PAGE_INDEX_BITS, PAGE_INDEX_SIZE)
 
-/* Insert a block into the page index */
+/* 将基本块插入页索引。 */
 static void page_index_insert(cache_t *cache, block_t *block)
 {
     uint32_t page = block->pc_start & ~(RV_PG_SIZE - 1);
@@ -505,8 +504,8 @@ static void page_index_insert(cache_t *cache, block_t *block)
 
     page_block_entry_t *entry = malloc(sizeof(page_block_entry_t));
     if (!entry) {
-        /* Mark page index as incomplete - cache_invalidate_va must use O(n)
-         * fallback to ensure all blocks are found during SFENCE.VMA.
+        /* 标记页索引不完整。cache_invalidate_va 必须退回 O(n) 扫描，
+         * 以确保 SFENCE.VMA 时不会漏掉任何基本块。
          */
         cache->page_index_incomplete = true;
         return;
@@ -517,7 +516,7 @@ static void page_index_insert(cache_t *cache, block_t *block)
     cache->page_index[bucket] = entry;
 }
 
-/* Remove a block from the page index */
+/* 从页索引移除基本块。 */
 static void page_index_remove(cache_t *cache, block_t *block)
 {
     uint32_t page = block->pc_start & ~(RV_PG_SIZE - 1);
@@ -537,10 +536,9 @@ static void page_index_remove(cache_t *cache, block_t *block)
 #endif /* RV32_HAS(JIT) && RV32_HAS(SYSTEM) && RV32_HAS(BLOCK_CHAINING) */
 
 #if RV32_HAS(JIT) && RV32_HAS(SYSTEM)
-/* Thread safety note: These invalidation functions assume single-threaded
- * execution. The rv32emu JIT operates in a single-threaded model where
- * compilation and execution do not occur concurrently. If this assumption
- * changes, appropriate locking must be added around cache->list traversal.
+/* 线程安全说明：这些失效函数假设运行环境是单线程。
+ * rv32emu 的 JIT 目前采用单线程模型，编译和执行不会并发发生。如果该假设未来改变，
+ * cache->list 遍历周围必须补充合适的锁保护。
  */
 
 uint32_t cache_invalidate_satp(cache_t *cache, uint32_t satp)
@@ -560,9 +558,8 @@ uint32_t cache_invalidate_satp(cache_t *cache, uint32_t satp)
         if (block && block->satp == satp && !block->invalidated) {
             block->invalidated = true;
 #if RV32_HAS(T2C)
-            /* Reset hot2 to prevent T2C execution of invalidated blocks.
-             * This ensures the T2C execution path in rv_step() will skip this
-             * block and fall through to re-translation.
+            /* 重置 hot2，防止 T2C 继续执行已失效基本块。
+             * 这样 rv_step() 中的 T2C 执行路径会跳过该块并回落到重新翻译流程。
              */
             ATOMIC_STORE(&block->hot2, false, ATOMIC_RELEASE);
 #endif
@@ -581,26 +578,23 @@ uint32_t cache_invalidate_va(cache_t *cache, uint32_t va, uint32_t satp)
     uint32_t count = 0;
 
 #if RV32_HAS(BLOCK_CHAINING)
-    /* If page index is complete, use O(1) lookup.
-     * Otherwise fall through to O(n) scan to ensure all blocks are found.
+    /* 页索引完整时使用 O(1) 查找；否则退回 O(n) 扫描，确保不会漏掉基本块。
      */
     if (!cache->page_index_incomplete) {
-        /* O(1) lookup via page index.
-         * With page-bounded blocks, each block fits entirely within one 4KB
-         * page. We only need to check the bucket for this specific page.
+        /* 通过页索引执行 O(1) 查找。
+         * 在页界限内的基本块会完整落在一个 4KB 页中，因此只需检查对应页桶。
          */
         uint32_t bucket = page_index_hash(va_page >> RV_PG_SHIFT);
         page_block_entry_t *pentry = cache->page_index[bucket];
         while (pentry) {
             block_t *block = (block_t *) pentry->block;
             if (block && block->satp == satp && !block->invalidated) {
-                /* Verify block belongs to this page (hash collision check) */
+                /* 确认基本块属于该页，用于处理哈希冲突。 */
                 uint32_t block_page = block->pc_start & ~(RV_PG_SIZE - 1);
                 if (block_page == va_page) {
                     block->invalidated = true;
 #if RV32_HAS(T2C)
-                    /* Reset hot2 to prevent T2C execution of invalidated blocks
-                     */
+                    /* 重置 hot2，防止 T2C 继续执行已失效基本块。 */
                     ATOMIC_STORE(&block->hot2, false, ATOMIC_RELEASE);
 #endif
                     count++;
@@ -612,9 +606,9 @@ uint32_t cache_invalidate_va(cache_t *cache, uint32_t va, uint32_t satp)
     }
 #endif /* RV32_HAS(BLOCK_CHAINING) */
 
-    /* O(n) fallback: scan all blocks when page index is unavailable or
-     * incomplete. This ensures correctness when BLOCK_CHAINING is disabled,
-     * blocks may span pages, or malloc failed during page_index_insert.
+    /* O(n) 回退路径：页索引不可用或不完整时扫描所有基本块。
+     * 这能保证在 BLOCK_CHAINING 被禁用、基本块可能跨页，或 page_index_insert 中
+     * malloc 失败时仍然保持正确性。
      */
     cache_entry_t *entry = NULL;
 #ifdef __HAVE_TYPEOF
@@ -627,14 +621,13 @@ uint32_t cache_invalidate_va(cache_t *cache, uint32_t va, uint32_t satp)
         if (!block || block->satp != satp || block->invalidated)
             continue;
 
-        /* Check if target VA page overlaps with block's address range.
-         * A block may span multiple pages, so we check if va_page falls
-         * within [block_start_page, block_end_page].
+        /* 检查目标 VA 页是否与基本块地址范围重叠。
+         * 基本块可能跨越多个页，因此需要判断 va_page 是否落在
+         * [block_start_page, block_end_page] 范围内。
          *
-         * Note: pc_end is exclusive (address after last instruction), so we
-         * use (pc_end - 1) to get the page containing the last byte. This
-         * avoids false invalidation when pc_end falls exactly on a page
-         * boundary.
+         * 注意：pc_end 是排他边界（最后一条指令之后的地址），因此用
+         * (pc_end - 1) 取得最后一个字节所在页。这样可以避免 pc_end 正好落在页边界
+         * 时产生误失效。
          */
         uint32_t block_start_page = block->pc_start & ~(RV_PG_SIZE - 1);
         uint32_t last_byte = block->pc_end > block->pc_start ? block->pc_end - 1
@@ -643,7 +636,7 @@ uint32_t cache_invalidate_va(cache_t *cache, uint32_t va, uint32_t satp)
         if (va_page >= block_start_page && va_page <= block_end_page) {
             block->invalidated = true;
 #if RV32_HAS(T2C)
-            /* Reset hot2 to prevent T2C execution of invalidated blocks */
+            /* 重置 hot2，防止 T2C 继续执行已失效基本块。 */
             ATOMIC_STORE(&block->hot2, false, ATOMIC_RELEASE);
 #endif
             count++;

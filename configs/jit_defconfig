@@ -1,3 +1,3 @@
-# JIT compilation with tiered optimization
+# 启用分层优化的 JIT 编译配置
 CONFIG_JIT=y
 CONFIG_T2C=y

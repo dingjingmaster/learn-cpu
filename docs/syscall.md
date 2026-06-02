@@ -1,49 +1,42 @@
-# System Calls
+# 系统调用
 
-## Background
+## 背景
 
-System calls serve as the principal method of interaction between an application and the underlying operating system kernel.
-They enable applications to access services and resources provided by the OS kernel,
-such as file operations, network communication, and memory management.
-System calls are essential for performing privileged operations that applications can not directly execute,
-ensuring a secure and controlled environment.
-To directly interact with system calls without relying on external libraries, programmers can invoke them from assembler programs.
-For a comprehensive list of available system calls and detailed information about their usage, see [`man 2 syscalls`](http://man7.org/linux/man-pages/man2/syscalls.2.html).
+系统调用是应用程序与操作系统内核交互的主要方式。程序通过系统调用请求文件 I/O、
+时间、内存管理、进程退出等服务；这些服务通常需要特权级能力，不能由普通用户态
+程序直接执行。
 
-## System Calls in C
+在 RISC-V 程序中，系统调用参数按调用约定放入寄存器，随后执行 `ecall`。在
+rv32emu 的用户态模拟模式下，`ecall` 会进入模拟器的 `syscall_handler`，再由
+模拟器把请求转发到宿主系统或内部运行时。
 
-In C, a list of parameters is passed to the kernel in a certain sequence.
-For example, for the `write` system call, the parameters are structured as follows (see [`man 2 write`](https://man7.org/linux/man-pages/man2/write.2.html)):
+## C 语言中的系统调用
+
+以 `write` 为例，C 函数原型如下：
+
 ```c
 ssize_t write(int fd, const void *buf, size_t count);
 ```
 
-The three parameters passed are a file descriptor, a pointer to a character buffer (essentially a string),
-and the number of characters in that string to be written.
-The file descriptor can represent the standard output.
-It is important to note that the string is not zero-terminated.
+三个参数分别是文件描述符、缓冲区地址和写入字节数。标准输出通常使用文件描述符
+`1`。注意这里的缓冲区不是以 `\0` 结尾的字符串，写入长度完全由 `count` 决定。
 
-## RISC-V calling conventions
+## RISC-V 调用约定
 
-The RISC-V convention, as defined by the [Calling Convention](https://riscv.org/wp-content/uploads/2015/01/riscv-calling.pdf),
-involves mapping these parameters one by one to the registers, starting at `a0`.
-The system call number is placed in `a7`, and then the `ecall` instruction is executed.
+RISC-V 调用约定规定，普通参数从 `a0` 开始依次放入寄存器，系统调用号放入 `a7`，
+然后执行 `ecall`。
 
-Here is how the parameters are mapped:
-- The file descriptor number is placed in `a0`.
-- The pointer to the string (its address) is placed in `a1`.
-- The number of characters to print is placed in `a2`.
+以 `write` 为例：
 
-For determining the specific system call number for the 'write' operation in the context of `rv32emu`,
-reference can be made to [riscv-pk/pk/syscall.h](https://github.com/riscv/riscv-pk/blob/master/pk/syscall.h).
-In the case of the `write` system call, the associated number is `64`, which is then assigned to the register `a7`.
+* `a0`：文件描述符
+* `a1`：字符串/缓冲区地址
+* `a2`：写入字节数
+* `a7`：系统调用号，`write` 为 `64`
 
-Following a successful write operation, the count of written characters should be present in the `a0` register.
-Conversely, if an error occurs, the return value is represented as `-1`.
+成功后返回值在 `a0` 中；出错时通常返回 `-1` 或负 errno。
 
-For instance, to print the string "RISC-V" and subsequently exit using the exit system call,
-the GNU GCC compiler suite in combination with `rv32emu` offers a feasible approach.
-The following is a potential program in assembly code (`hello.S`):
+下面的汇编程序打印 `RISC-V` 并退出：
+
 ```assembly
     .equ STDOUT, 1
     .equ WRITE, 64
@@ -59,136 +52,125 @@ msg:
 
     .globl  _start
 _start:
-    li a0, STDOUT  # file descriptor
-    la a1, msg     # address of string
-    li a2, 7       # length of string
-    li a7, WRITE   # syscall number for write
+    li a0, STDOUT  # 文件描述符
+    la a1, msg     # 字符串地址
+    li a2, 7       # 字符串长度
+    li a7, WRITE   # write 系统调用号
     ecall
 
-    # MISSING: Check for error condition
-    li a0, 0       # 0 signals success
+    # TODO：这里应检查 write 是否出错。
+    li a0, 0       # 0 表示成功退出
     li a7, EXIT
     ecall
 ```
 
-The program is assembled, linked, and executed on `rv32emu` using the following commands:
-```shell
-$ riscv-none-elf-gcc -march=rv32i -mabi=ilp32 -nostartfiles -nostdlib -o hello hello.S
-$ build/rv32emu hello
+构建和运行：
+
+```sh
+riscv-none-elf-gcc -march=rv32i -mabi=ilp32 -nostartfiles -nostdlib -o hello hello.S
+build/rv32emu hello
 ```
 
-An `ecall` instruction is used to trigger a trap into the kernel,
-and there exist three privilege modes: User mode, Supervisor mode, and Machine mode.
-Corresponding to these modes, there are three versions of the iret instruction:
-`uret` which can be used from any mode if the `N-extension` is enabled to allow user-mode trap handlers,
-`sret` which is used from S-mode (or M-mode), and `mret` which can only be used from M-mode.
+RISC-V 有 User、Supervisor、Machine 三种常见特权模式。`ecall` 会触发 trap，
+随后由对应特权级的 trap handler 处理。返回指令包括 `uret`、`sret`、`mret`；
+其中 `mret` 只能从 M-mode 返回。
 
-NOTE: On RV32 and RV64 architectures, the stack pointer must always be aligned to a 16-byte boundary.
+RV32/RV64 ABI 要求栈指针保持 16 字节对齐。
 
-## Newlib integration
+## newlib 集成
 
-The [newlib](https://sourceware.org/newlib/) library encompasses most of the C standard library functionality,
-excluding thread support.
-C functions like `malloc`, `printf`, `memcpy`, and many others are included in its implementation.
-To enable cross-compiled binary files to run on this emulator,
-`rv32emu` offers a fundamental subset of necessary system calls that [newlib](https://sourceware.org/newlib/) requires.
+[newlib](https://sourceware.org/newlib/) 提供大部分 C 标准库功能，例如 `malloc`、
+`printf`、`memcpy` 等。为了让交叉编译出的程序在模拟器中运行，rv32emu 实现了
+newlib 常用的一小组系统调用。
 
-A subsystem is also provided to support a limited set of POSIX-compliant system calls.
-Presently, only a few system calls are accessible through semihosting.
-This mechanism allows code executed on a RISC-V target to interact with and utilize the I/O capabilities of the host computer.
+当前用户态 semihosting 支持：
 
-|#     | System call     | Current support |
-|------|-----------------|-----------------|
-|   57 | `close`         | Deletes a descriptor from the per-process object reference table. |
-|   62 | `lseek`         | Repositions the file offset of the open file description to the argument offset according to the directive whence. |
-|   63 | `read`          | Reads specific bytes of data from the object referenced by the descriptor fildes into the buffer. |
-|   64 | `write`         | Prints the buffer as a string to the specified file descriptor. |
-|   80 | `fstat`         | No effect. |
-|   93 | `exit`          | Terminates with a status code. |
-|  169 | `gettimeofday`  | Gets date and time. Current time zone is NOT obtained. |
-|  214 | `brk`           | Supports updating the program break and returning the current program break. |
-|  403 | `clock_gettime` | Retrieves the value used by a clock which is specified by clock-id. |
-| 1024 | `open`          | Opens or creates a file for reading or writing. |
+| 编号 | 系统调用 | 当前支持 |
+| --- | --- | --- |
+| 57 | `close` | 从进程对象引用表中删除描述符 |
+| 62 | `lseek` | 按 `whence` 调整文件偏移 |
+| 63 | `read` | 从描述符读取数据到客体缓冲区 |
+| 64 | `write` | 把缓冲区写到指定文件描述符 |
+| 80 | `fstat` | 当前无实际效果 |
+| 93 | `exit` | 以状态码终止客体程序 |
+| 169 | `gettimeofday` | 获取当前日期和时间，不获取当前时区 |
+| 214 | `brk` | 更新或查询 program break |
+| 403 | `clock_gettime` | 获取指定 clock-id 的时间 |
+| 1024 | `open` | 打开或创建文件 |
 
-Any other system calls will fail with an "unknown syscall" error.
+其他未知系统调用会以“未知系统调用”错误失败。
 
-## Display, Event, and Sound System Calls
+## SDL 图形、事件和声音系统调用
 
-These system calls are solely for the convenience of accessing the [SDL library](https://www.libsdl.org/) and [SDL2_Mixer](https://wiki.libsdl.org/SDL2_mixer) and are only intended for the presentation of RISC-V graphics applications. They are not present in the ABI interface of POSIX or Linux.
+下面这些调用不是 POSIX 或 Linux ABI 的一部分，只是 rv32emu 为图形 demo 和游戏
+提供的 SDL 扩展接口。相关客体侧辅助头文件见 [fenster.h](../tests/fenster.h)。
 
-Check the [fenster.h](../tests/fenster.h) header, which offers an extremely minimalistic and specific approach to displaying a 2D canvas.
-This integrates with rv32emu's SDL-based system calls, significantly enhancing usability and simplifying any future porting efforts.
+### `draw_frame`
 
-### `draw_frame` - Draw a frame around the SDL window
+**系统调用号**：`0xBEEF`
 
-**system call number**: `0xBEEF`
+**原型**：`void draw_frame(void *base, int width, int height)`
 
-**synopsis**: `void draw_frame(void *base, int width, int height)`
+如果窗口尚未创建，则按 `width` 和 `height` 创建 SDL 窗口。`base` 指向的缓冲区
+会替换帧缓冲内容。该调用还会轮询 SDL 事件，并把事件写入内部输入队列。
 
-If a window does not already exist, one will be created with the specified `width` and `height`. The buffer pointed to by `base` will replace the content of the framebuffer, passing a different `width` or `height` compared to the size of the window is undefined behavior. This system call additionally polls events from the SDL library, and, if necessary, update the internal input specific event queue.
+### `setup_queue`
 
-The width and height are merely the virtual dimensions of the screen; they are unrelated to the window's real size. The system call would deal with resizing events internally when they occurred.
+**系统调用号**：`0xC0DE`
 
-### `setup_queue` - Setup input system's dedicated event and submission queue
+**原型**：`void setup_queue(void *base, size_t capacity, size_t *event_count)`
 
-**system call number**: `0xC0DE`
+客体需要提供一块连续内存，里面紧密放置事件队列和提交队列。提交队列紧跟在事件
+队列之后。如果 `capacity` 不是 2 的幂，模拟器会向上取整。`event_count` 用作
+事件通知变量，传入前必须初始化。
 
-**synopsis**: `void setup_queue(void *base, size_t capacity, size_t *event_count)`
+事件类型：
 
-The user must pass a continuous memory chunk that contains two tightly packed queues, the event queue and the submission queue. And the submission queue is immediately following the last element of the event queue, which is the event queue's base address plus the size of each event element multiplied by the given capacity. If the capacity is not a power of two, it will be treated as the rounded value of the next highest power of two. Additionally, because the event counter variable serves as a notifier to the user that an event has been added to the event queue, it is critical to initialize it before passing its address to this system call.
+* `KEY_EVENT`：按键按下或释放。
+* `MOUSE_MOTION_EVENT`：鼠标从上一帧到当前帧的移动。
+* `MOUSE_BUTTON_EVENT`：鼠标按键状态变化。
+* `QUIT_EVENT`：请求客体程序退出。
 
-#### Events
+### `submit_queue`
 
-An event entry is made up of a 32-bit value representing the event's type and a `union` buffer containing the event's parameters.
+**系统调用号**：`0xFEED`
 
-* `KEY_EVENT`: Either a key is pressed or released. Its value buffer is made up of a 32-bit universal key code and an 8-bit state flag; if the corresponding character of the pressed key is not printable, the bit right after the most significant bit is set; for example, the "a" key's corresponding character is printable, so its keycode is the ASCII code of the "a" character, which is `0x61`. However, because the left shift key doesn't have a corresponding printable key, its hexadecimal value is `0x400000E1`, with the 31th bit set.
-* `MOUSE_MOTION_EVENT`: The cursor is moved between the previous and the current frames. This event contains the current mouse position and how it differs from the last frame. If the relative mouse mode is enabled, the cursor is wrapped within the canvas and repeated whenever the cursor reaches the border.
-* `MOUSE_BUTTON_EVENT`: The state of a mouse button has been changed. Its value buffer contains a 8-bit button value(1 is left, 2 is middle, 3 is right and so on) and an 8-bit boolean flag that indicates whether the mouse button is pressed.
-* `QUIT_EVENT`: The program is requested to exit. Typically, the hosted program destroys the created objects and terminates when this event occurs.
+**原型**：`void submit_queue(size_t count)`
 
-### `submit_queue` - Notify the emulator a submission has been pushed into the submission queue
+客体先向提交队列写入一批请求，再通过该调用通知模拟器处理。模拟器会按顺序立即
+执行这些提交。
 
-**system call number**: `0xFEED`
+提交类型：
 
-**synopsis**: `void submit_queue(size_t count)`
+* `RELATIVE_MODE_SUBMISSION`：启用或关闭鼠标相对模式。
+* `WINDOW_TITLE_SUBMISSION`：修改 SDL 窗口标题，未指定时默认为 `rv32emu`。
 
-To inform the emulator that a batch of submissions should be processed, the application code should push several submissions into the queue first, and then pass the size of the submissions batch to this system call; the submissions will be processed and executed sequentially and immediately.
+### `control_audio`
 
-#### Submissions
+**系统调用号**：`0xD00D`
 
-The submission entry is structured similarly to an event entry, with a 32-bit type field and an associated dynamic-sized value buffer whose width depends on the type of submission.
+**原型**：`void control_audio(int request)`
 
-* `RELATIVE_MODE_SUBMISSION`: Enable or disable the mouse relative mode. If the mouse relative mode is enabled, the mouse cursor is wrapped within the window border, it's associated with an 8-bit wide boolean value that indicates whether the relative mouse mode should be enbled.
-* `WINDOW_TITLE_SUBMISSION`: Change the title of the SDL window. If the title is not specified, it will be `rv32emu` by default.
+用于播放、停止或调节音乐/音效。客体把声音数据地址放入 `a1`，音量放入 `a2`，
+循环标志放入 `a3`。
 
-### `control_audio` - control the behavior of music and sound effect(sfx)
+支持请求：
 
-**system call number**: `0xD00D`
+* `PLAY_MUSIC`：播放音乐，已有音乐会被替换。
+* `STOP_MUSIC`：停止音乐。
+* `SET_MUSIC_VOLUME`：调整音乐音量。
+* `PLAY_SFX`：播放音效，不支持循环。
 
-**synopsis**: `void control_audio(int request)`
+音乐数据使用 `musicinfo_t`，音效数据使用 `sfxinfo_t`。当前支持 Doom WAV 格式和
+普通 WAV（含 RIFF header）格式。
 
-The application must prepare the sound data and then give the address of the sound data to register `a1`, the volume of the music to register `a2` (if necessary), and looping to register `a3` (if necessary).  in order to ask the emulator to perform some sound operations. The request will be processed as soon as possible. Three different sorts of requests exist:
-* `PLAY_MUSIC`: Play the music. If any music is currently playing, it will be changed to something new. In order to avoid blocking on the main thread, the music is played by a new thread.
-* `STOP_MUSIC`: Halt the music.
-* `SET_MUSIC_VOLUME`: If necessary, adjust the music level at some point.
+### `setup_audio`
 
-The request is similar to how music is managed earlier in the description and supports one type of sound effect request, however it does not support looping:
-* `PLAY_SFX`: Play the sound effect, however keep in mind that playing too many at once may cause the channel to run out and the sound effects to stop working. A new thread is used to play the sound effect, and it does so for the same reason as `PLAY_MUSIC`.
+**系统调用号**：`0xBABE`
 
-#### Music
-Music data is defined in a structure called `musicinfo_t`. The SDL2_mixer library is used by the emulator to play music using the fields `data` and `size` in the structure.
+**原型**：`void setup_audio(int request)`
 
-#### Sound Effect(sfx)
-`sfxinfo_t` is a structure that defines sound effect data and size. The `data` and `size` fields of the structure are used to play sound effect with the SDL2_mixer library. Currently, support sound effect of [Doom's WAV](https://doomwiki.org/wiki/Sound) format and [normal WAV](https://en.wikipedia.org/wiki/WAV) format(includes [RIFF header](https://en.wikipedia.org/wiki/Resource_Interchange_File_Format)).
+用于初始化或关闭音频系统。
 
-### `setup_audio` - setup or shutdown sound system
-
-**system call number**: `0xBABE`
-
-**synopsis**: `void setup_audio(int request)`
-
-The majority of games, such as Doom and Quake, will maintain its own sound system or server, hence there should be a pair of initialization and destruct semantics. I believe that we should give users access to activities like startup and termination in order to maintain the semantic clarity. If not, the emulator will repeatedly check whether audio is enabled before playing music or sound effects.
-
-Requesting the sound system to be turned on or off in the emulator. When the audio device is not in the busy status, the request will be handled. Two categories of requests exist:
-* `INIT_AUDIO`: Setup the audio device and the sfx samples buffer. After initialization, open the audio device and get ready to play some music.
-* `SHUTDOWN_AUDIO`: Release all the resources that initialized by `INIT_SOUND` request.
+* `INIT_AUDIO`：初始化音频设备和音效缓冲区。
+* `SHUTDOWN_AUDIO`：释放由初始化请求创建的资源。

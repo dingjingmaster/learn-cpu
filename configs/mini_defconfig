@@ -1,4 +1,4 @@
-# Minimal build without SDL for embedded use
+# 面向嵌入式用途的最小构建，不启用 SDL
 # CONFIG_EXT_F is not set
 # CONFIG_Zba is not set
 # CONFIG_Zbb is not set

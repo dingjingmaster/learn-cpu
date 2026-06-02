@@ -3,6 +3,14 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * 客体内存管理和基础内存访问。
+ *
+ * 本文件提供 memory_new/delete、指令取指、读写字/半字/字节等接口。支持 mmap
+ * 的平台会使用 PROT_NONE + SIGSEGV/SIGBUS 处理器实现按需分页，首次访问时才
+ * 激活 64 KiB 内存块，并可通过 memory_gc 回收全零块以降低物理内存占用。
+ */
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -25,37 +33,36 @@ static uint8_t *data_memory_base;
 static uint64_t data_memory_size;
 
 #if HAVE_MMAP
-/* Demand Paging Memory Management
+/* 按需分页内存管理。
  *
- * Memory is allocated in chunks on-demand using signal handling:
- * 1. Initial mapping uses PROT_NONE (no access, no physical memory)
- * 2. Access triggers SIGSEGV/SIGBUS, handler activates the chunk
- * 3. Unused chunks can be reclaimed via madvise(MADV_DONTNEED)
+ * 通过信号处理按块延迟分配内存：
+ * 1. 初始映射使用 PROT_NONE（不可访问，也不占用物理内存）
+ * 2. 访问触发 SIGSEGV/SIGBUS，处理器激活对应内存块
+ * 3. 未使用的块可以通过 madvise(MADV_DONTNEED) 回收
  *
- * This provides automatic memory growth with minimal initial footprint.
+ * 这能以很小的初始占用实现客体内存的自动增长。
  */
 
-/* Chunk size: 64KB provides good balance between granularity and overhead */
+/* 块大小：64KB 在粒度和管理开销之间提供较好的折中。 */
 #define CHUNK_SHIFT 16
 #define CHUNK_SIZE (1UL << CHUNK_SHIFT)
 #define CHUNK_MASK (~(CHUNK_SIZE - 1))
 
-/* Maximum chunks for 4GB address space: 4GB / 64KB = 65536 */
+/* 4GB 地址空间的最大块数：4GB / 64KB = 65536。 */
 #define MAX_CHUNKS (0x100000000ULL >> CHUNK_SHIFT)
 #define BITMAP_SIZE (MAX_CHUNKS / 8)
 
-/* Bitmap tracking which chunks are activated */
+/* 记录哪些内存块已经激活的位图。 */
 static uint8_t chunk_bitmap[BITMAP_SIZE];
 
-/* GC state: circular scan index */
+/* GC 状态：循环扫描索引。 */
 static uint32_t gc_scan_idx;
 
-/* Statistics: current and peak number of activated chunks (atomic for signal
- * safety) */
+/* 统计信息：当前和峰值激活块数。为保证信号安全，这里使用原子变量。 */
 static atomic_uint_fast32_t active_chunks;
 static atomic_uint_fast32_t peak_chunks;
 
-/* Previous signal handlers to chain */
+/* 记录旧信号处理器，必要时继续转发。 */
 static struct sigaction prev_sigsegv_handler;
 static struct sigaction prev_sigbus_handler;
 
@@ -74,9 +81,8 @@ static inline void bitmap_clear(uint32_t idx)
     chunk_bitmap[idx >> 3] &= ~(1 << (idx & 7));
 }
 
-/* Check if a memory region is all zeros (for reclaim decision).
- * Uses byte-wise scan to avoid alignment issues with word-sized access.
- * Compiler may optimize this to SIMD operations where available.
+/* 检查一段内存是否全为零，用于判断是否可以回收。
+ * 这里按字节扫描，避免按字访问带来的对齐问题；编译器在条件允许时可能优化为 SIMD。
  */
 static bool is_region_zero(const uint8_t *ptr, size_t size)
 {
@@ -87,13 +93,13 @@ static bool is_region_zero(const uint8_t *ptr, size_t size)
     return true;
 }
 
-/* Signal handler for demand paging
+/* 按需分页的信号处理器。
  *
- * Signal safety notes:
- * - mprotect() is async-signal-safe per POSIX.1-2008 and later
- * - Atomic operations with memory_order_relaxed are signal-safe
- * - Bitmap operations are on static memory with no locks
- * - No heap allocation or stdio calls in the handler
+ * 信号安全说明：
+ * - POSIX.1-2008 及之后版本规定 mprotect() 是异步信号安全的
+ * - 使用 memory_order_relaxed 的原子操作满足信号安全要求
+ * - 位图操作作用于静态内存，不需要锁
+ * - 处理器内不能进行堆分配或 stdio 调用
  */
 static void memory_fault_handler(int sig, siginfo_t *si, void *context UNUSED)
 {
@@ -101,25 +107,25 @@ static void memory_fault_handler(int sig, siginfo_t *si, void *context UNUSED)
     uintptr_t base = (uintptr_t) data_memory_base;
     uintptr_t end = base + data_memory_size;
 
-    /* Check if fault is within our guest memory range */
+    /* 检查触发地址是否落在客体内存范围内。 */
     if (fault_addr >= base && fault_addr < end) {
-        /* Calculate chunk boundaries relative to base address */
+        /* 根据基地址计算块边界。 */
         uintptr_t offset = fault_addr - base;
         uintptr_t aligned_offset = offset & CHUNK_MASK;
         uintptr_t chunk_start = base + aligned_offset;
         uint32_t chunk_idx = aligned_offset >> CHUNK_SHIFT;
 
-        /* Calculate chunk size (may be partial for last chunk) */
+        /* 计算块长度，最后一块可能不足 CHUNK_SIZE。 */
         size_t chunk_len = CHUNK_SIZE;
         if (chunk_start + CHUNK_SIZE > end) {
-            /* Last partial chunk */
+            /* 最后一块是不完整块。 */
             chunk_len = end - chunk_start;
         }
 
-        /* Activate the chunk with read/write permissions */
+        /* 以可读写权限激活该块。 */
         if (mprotect((void *) chunk_start, chunk_len, PROT_READ | PROT_WRITE) ==
             0) {
-            /* Only count if not already active (handles re-fault edge cases) */
+            /* 只有尚未激活时才计数，用于处理重复触发的边界情况。 */
             if (!bitmap_test(chunk_idx)) {
                 bitmap_set(chunk_idx);
                 uint_fast32_t current =
@@ -135,18 +141,18 @@ static void memory_fault_handler(int sig, siginfo_t *si, void *context UNUSED)
                         break;
                 }
             }
-            return; /* Resume execution */
+            return; /* 恢复执行。 */
         }
     }
 
-    /* Not our fault or mprotect failed - chain to previous handler */
+    /* 非本内存区域故障，或 mprotect 失败时，转发给旧处理器。 */
     struct sigaction *prev =
         (sig == SIGSEGV) ? &prev_sigsegv_handler : &prev_sigbus_handler;
 
     if (prev->sa_flags & SA_SIGINFO) {
         prev->sa_sigaction(sig, si, context);
     } else if (prev->sa_handler == SIG_DFL) {
-        /* Restore default handler and re-raise */
+        /* 恢复默认处理器并重新抛出信号。 */
         struct sigaction dfl;
         dfl.sa_handler = SIG_DFL;
         sigemptyset(&dfl.sa_mask);
@@ -163,16 +169,16 @@ static bool install_signal_handlers(void)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = memory_fault_handler;
-    sa.sa_flags = SA_SIGINFO; /* No SA_NODEFER: prevent reentrancy */
+    sa.sa_flags = SA_SIGINFO; /* 不使用 SA_NODEFER：避免重入。 */
     sigemptyset(&sa.sa_mask);
 
     if (sigaction(SIGSEGV, &sa, &prev_sigsegv_handler) == -1) {
-        rv_log_error("Failed to install SIGSEGV handler for demand paging");
+        rv_log_error("安装按需分页 SIGSEGV 处理器失败");
         return false;
     }
 
     if (sigaction(SIGBUS, &sa, &prev_sigbus_handler) == -1) {
-        rv_log_error("Failed to install SIGBUS handler for demand paging");
+        rv_log_error("安装按需分页 SIGBUS 处理器失败");
         sigaction(SIGSEGV, &prev_sigsegv_handler, NULL);
         return false;
     }
@@ -192,8 +198,8 @@ memory_t *memory_new(uint64_t size)
     if (!size)
         return NULL;
 
-    /* Maximum supported size is 4GB (32-bit address space).
-     * The demand paging bitmap is sized for exactly 4GB.
+    /* 最大支持 4GB（32 位地址空间）。
+     * 按需分页位图也是按 4GB 空间大小设计的。
      */
     if (size > 0x100000000ULL)
         return NULL;
@@ -203,15 +209,14 @@ memory_t *memory_new(uint64_t size)
         return NULL;
 
 #if HAVE_MMAP
-    /* Install signal handlers for demand paging */
+    /* 安装按需分页信号处理器。 */
     if (!install_signal_handlers()) {
         free(mem);
         return NULL;
     }
 
-    /* Map memory with PROT_NONE initially - no physical memory allocated.
-     * Chunks are activated on-demand when accessed (via signal handler).
-     * MAP_NORESERVE ensures no swap space is reserved upfront.
+    /* 初始以 PROT_NONE 映射内存，不立即分配物理页。
+     * 访问时由信号处理器按需激活块；MAP_NORESERVE 避免提前预留交换空间。
      */
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -230,10 +235,9 @@ memory_t *memory_new(uint64_t size)
     atomic_store_explicit(&active_chunks, 0, memory_order_relaxed);
     atomic_store_explicit(&peak_chunks, 0, memory_order_relaxed);
 #else
-    /* Fallback for systems without mmap (e.g., Windows, Emscripten).
-     * Cannot use demand paging - physical memory is allocated upfront.
-     * Limit to 512MB to avoid excessive memory consumption.
-     * Build with HAVE_MMAP=1 for larger address spaces.
+    /* 不支持 mmap 的系统（如 Windows、Emscripten）使用回退路径。
+     * 此时无法按需分页，物理内存会一次性分配。这里限制为 512MB，避免过度占用；
+     * 需要更大的地址空间时应使用 HAVE_MMAP=1 构建。
      */
 #define MALLOC_MAX_SIZE (512UL * 1024 * 1024) /* 512 MB */
     if (size > MALLOC_MAX_SIZE) {
@@ -245,21 +249,21 @@ memory_t *memory_new(uint64_t size)
         free(mem);
         return NULL;
     }
-    /* Zero-initialize for consistent behavior */
+    /* 清零初始化，保证行为一致。 */
     memset(data_memory_base, 0, size);
     data_memory_size = size;
 #undef MALLOC_MAX_SIZE
 #endif
 
     mem->mem_base = data_memory_base;
-    mem->mem_size = data_memory_size; /* Use actual allocated size */
+    mem->mem_size = data_memory_size; /* 使用实际分配大小。 */
     return mem;
 }
 
 void memory_delete(memory_t *mem)
 {
 #if HAVE_MMAP
-    /* Restore handlers first to prevent use-after-free in signal handler */
+    /* 先恢复信号处理器，避免处理器访问已释放内存。 */
     restore_signal_handlers();
     munmap(mem->mem_base, mem->mem_size);
 #else
@@ -268,14 +272,14 @@ void memory_delete(memory_t *mem)
     free(mem);
 }
 
-/* Return peak physical memory usage in bytes.
- * With MMAP: Returns actual physical memory allocated via demand paging.
- * Without MMAP: Returns total allocated size (no demand paging available).
+/* 返回峰值物理内存使用量，单位为字节。
+ * 启用 MMAP 时返回按需分页实际分配的物理内存。
+ * 未启用 MMAP 时返回总分配大小，因为没有按需分页能力。
  */
 uint64_t memory_get_usage(void)
 {
 #if HAVE_MMAP
-    /* Clamp to actual memory size to prevent overflow */
+    /* 限制到实际内存大小，防止溢出。 */
     uint32_t max_chunks = (data_memory_size + CHUNK_SIZE - 1) >> CHUNK_SHIFT;
     uint_fast32_t peak =
         atomic_load_explicit(&peak_chunks, memory_order_relaxed);
@@ -286,16 +290,16 @@ uint64_t memory_get_usage(void)
 #endif
 }
 
-/* Incremental garbage collection - scans one chunk per call.
- * Reclaims zeroed chunks by releasing physical pages (madvise)
- * and re-arming the fault handler (mprotect PROT_NONE).
+/* 增量垃圾回收：每次调用扫描一个内存块。
+ * 对全零块，通过释放物理页（madvise）并重新设置故障处理（mprotect PROT_NONE）
+ * 完成回收。
  */
 void memory_gc(void)
 {
 #if HAVE_MMAP
     uint32_t idx = gc_scan_idx;
 
-    /* Only process chunks within our actual memory size */
+    /* 只处理实际内存大小范围内的块。 */
     uint32_t max_idx = (data_memory_size + CHUNK_SIZE - 1) >> CHUNK_SHIFT;
     if (max_idx > MAX_CHUNKS)
         max_idx = MAX_CHUNKS;
@@ -305,32 +309,32 @@ void memory_gc(void)
         return;
     }
 
-    /* Block signals during bitmap operations to prevent races with handler */
+    /* 位图操作期间阻塞信号，避免与信号处理器竞争。 */
     sigset_t block_set, old_set;
     sigemptyset(&block_set);
     sigaddset(&block_set, SIGSEGV);
     sigaddset(&block_set, SIGBUS);
     sigprocmask(SIG_BLOCK, &block_set, &old_set);
 
-    /* Check if this chunk is activated */
+    /* 检查当前块是否已经激活。 */
     if (bitmap_test(idx)) {
         uint8_t *chunk_ptr =
             data_memory_base + ((uintptr_t) idx << CHUNK_SHIFT);
 
-        /* Calculate chunk size (may be partial for last chunk) */
+        /* 计算块长度，最后一块可能不足 CHUNK_SIZE。 */
         size_t chunk_len = CHUNK_SIZE;
         uintptr_t chunk_end = (uintptr_t) chunk_ptr + CHUNK_SIZE;
         uintptr_t mem_end = (uintptr_t) data_memory_base + data_memory_size;
         if (chunk_end > mem_end)
             chunk_len = mem_end - (uintptr_t) chunk_ptr;
 
-        /* Reclaim if chunk is all zeros */
+        /* 块内容全零时回收。 */
         if (is_region_zero(chunk_ptr, chunk_len)) {
-            /* Protect first to prevent races where chunk gets dirtied
-             * between madvise and mprotect. Only proceed if successful.
+            /* 先改为不可访问，避免 madvise 与 mprotect 之间块又被写脏。
+             * 只有保护成功后才继续。
              */
             if (mprotect(chunk_ptr, chunk_len, PROT_NONE) == 0) {
-                /* Release physical pages back to OS (advisory) */
+                /* 建议操作系统回收物理页。 */
                 madvise(chunk_ptr, chunk_len, MADV_DONTNEED);
                 bitmap_clear(idx);
                 uint_fast32_t current =
@@ -342,18 +346,18 @@ void memory_gc(void)
         }
     }
 
-    /* Restore signal mask */
+    /* 恢复信号掩码。 */
     sigprocmask(SIG_SETMASK, &old_set, NULL);
 
-    /* Advance to next chunk (circular) */
+    /* 推进到下一个块，循环扫描。 */
     gc_scan_idx = (idx + 1) % max_idx;
 #endif
 }
 
 /*
- * Fast memory access functions - no bounds checking for performance.
- * Callers must validate addresses. With MMAP, out-of-bounds access
- * triggers SIGSEGV that chains to the default handler.
+ * 快速内存访问函数：出于性能考虑不做边界检查。
+ * 调用方必须先验证地址。启用 MMAP 时，越界访问会触发 SIGSEGV，并继续转发到默认
+ * 处理器。
  */
 
 void memory_read(const memory_t *mem,
@@ -371,7 +375,7 @@ uint32_t memory_ifetch(uint32_t addr)
     return val;
 }
 
-/* Safe unaligned memory access using memcpy (compiler optimizes to load/store)
+/* 使用 memcpy 执行安全的非对齐访问，编译器通常会优化为普通 load/store。
  */
 #define MEM_READ_IMPL(size, type)                            \
     type memory_read_##size(uint32_t addr)                   \

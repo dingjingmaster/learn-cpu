@@ -1,47 +1,48 @@
-# RISC-V instructions
+# RISC-V 指令
 
-## ISA extensions
+## ISA 扩展
 
-RISC-V is designed for extensibility. A RISC-V platform must implement a base
-integer instruction set (such as RV32I or RV64I, which are ratified, or RV32E
-or RV128I, which are proposed) that defines a core set of basic instructions.
-Additional functionality is then provided through optional extensions.
-For example, the "M" extension adds integer multiplication and division
-capabilities, while the "F" extension introduces support for single-precision
-floating-point arithmetic.
+RISC-V 的一个核心设计目标是可扩展。平台必须实现一个基础整数指令集，例如 RV32I
+或 RV64I；随后再按需要选择扩展。常见扩展包括：
 
-## Instruction Encoding
+| 扩展 | 说明 |
+| --- | --- |
+| `M` | 整数乘法和除法 |
+| `A` | 原子内存操作 |
+| `F` | 单精度浮点 |
+| `C` | 16 位压缩指令 |
+| `Zicsr` | CSR 读写指令 |
+| `Zifencei` | 指令取指栅栏 |
+| `Zba/Zbb/Zbc/Zbs` | 位操作扩展族 |
 
-In RISC-V, there are only a small number of instruction layouts (named with
-letters: Register/register, Immediate/register, Store, Upper immediate, Branch,
-and Jump), which is refreshing, and the choice to reserve two bits in the
-fixed-width 32-bit format.
+rv32emu 通过 Kconfig 控制这些扩展，并在源码中使用 `RV32_HAS(...)` 做条件编译。
 
-The S-type, B-type, and J-type instructions include immediate fields in a
-slightly unusual permutation. In response to the observation that sign-extension
-was often a critical-path logic-design problem in modern CPUs, the designers
-consistently place the immediate sign bit in the MSB of the instruction word,
-enabling sign-extension before instruction decoding is completed. However, this
-approach results in the J-type format
+## 指令编码
+
+RISC-V 32 位指令格式较少，常见类型包括 R、I、S、B、U、J。格式少的好处是解码
+逻辑清晰，但 B/J/S 等类型的立即数会被拆散放在不同 bit 位置。
+
+这种布局的原因之一是让立即数符号位尽量固定在指令最高位，使硬件可以尽早进行
+符号扩展。例如 J-type 的立即数布局是：
+
+```text
+imm[20] || imm[10:1] || imm[11] || imm[19:12] || rd || opcode
 ```
-imm[20] || imm[10:1] || imm11 || imm[19:12] || rd || opcode
-```
-with a ±1MiB PC-relative range, and an only slightly-less-surprising B-type
-format, with a ±4KiB range.
 
-U-type instructions, of which there are only two (`lui` and `auipc`), have
-a 20-bit immediate field. However, I-type and S-type instructions, used for
-operations like `addi`, `slti`, and notably memory loads and stores, have
-only a 12-bit immediate field.
+解码器需要把这些字段重新排列，并按指令语义补上最低位 0。
 
-## Instruction Format
-```
+U-type 指令只有 `lui` 和 `auipc`，包含 20 位立即数。I-type 和 S-type 常用于
+`addi`、`slti`、load/store 等操作，只有 12 位立即数。
+
+## RV32I 指令格式
+
+```text
 31           25 24         20 19         15 14 12 11          7 6       0
 +--------------+-------------+-------------+-----+-------------+---------+
 |                   imm[31:12]                   |     rd      | 0110111 | LUI
 |                   imm[31:12]                   |     rd      | 0010111 | AUIPC
 |             imm[20|10:1|11|19:12]              |     rd      | 1101111 | JAL
-|         imm[11:0]          |     rs1     | 000 |     rd      | 1100111 | JALR 
+|         imm[11:0]          |     rs1     | 000 |     rd      | 1100111 | JALR
 | imm[12|10:5] |     rs2     |     rs1     | 000 | imm[4:1|11] | 1100011 | BEQ
 | imm[12|10:5] |     rs2     |     rs1     | 001 | imm[4:1|11] | 1100011 | BNE
 | imm[12|10:5] |     rs2     |     rs1     | 100 | imm[4:1|11] | 1100011 | BLT
@@ -77,12 +78,11 @@ only a 12-bit immediate field.
 |   0000000    |     rs2     |     rs1     | 111 |     rd      | 0110011 | AND
 ```
 
-## Pseudo-instructions
+## 伪指令
 
-Pseudo-instructions provide RISC-V with a broader range of assembly language
-instructions. The following example demonstrates the `li` pseudo-instruction,
-which is used to load immediate values:
-```
+伪指令扩展了汇编语言表达能力，汇编器会把它们展开为真实指令。例如：
+
+```assembly
 .org 0
 .globl _start
 .text
@@ -91,204 +91,75 @@ _start:
     li a0, CONSTANT
 ```
 
-which generates the following assembler output as seen by `objdump`:
-```
+`li` 会根据常量大小展开为 `lui`、`addi` 等组合。对 `0xcafebabe`，常见输出是：
+
+```text
 00000000 <_start>:
-   0:	cafec537        lui     a0,0xcafec
-   4:	abe50513        addi    a0,a0,-1346 # cafebabe <CONSTANT+0x0>
+   0: cafec537        lui     a0,0xcafec
+   4: abe50513        addi    a0,a0,-1346
 ```
 
-The `lui` (load-upper-immediate) instruction has a 20-bit immediate, while the
-other immediate-load instructions only have 12-bit immediates.
+## 解码示例：`0x01e007ef`
 
-## Instruction Examples
+十六进制转二进制：
 
-### Encoding instruction `0x01e007ef`
-
-First, convert hex into binary:
-
-| hex |  `0`   |  `1`   |   `e`  |   `0`  |   `0`  |   `7`  |   `e`  |   `f`  |
-|:---:|:------:|:------:|:------:|:------:|:------:|:------:|:------:|:------:|
+| hex | `0` | `1` | `e` | `0` | `0` | `7` | `e` | `f` |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | bin | `0000` | `0001` | `1110` | `0000` | `0000` | `0111` | `1110` | `1111` |
 
-Instructions are better decoded by reading them from right to left, where the
-first encountered elements are their quadrant and opcode.
+从低位看，最低两位 `11` 表示 32 位指令；opcode 为 `1101111`，即 `JAL`。`rd`
+字段为 `01111`，也就是 `x15/a5`。剩余高位是 J-type 立即数字段，需要按
+`imm[20|10:1|11|19:12]` 重新排列。
 
-|  RV32I  | `00000001111000000000` | `01111`   |    `11011`    |    `11`      |
-|:-------:|:----------------------:|:---------:|:-------------:|:------------:|
-| Meaning |  `<imm> (encoded)`     |   `rd`    | `opcode`      | `quadrant`   |
-|  Value  |  `<imm>`               |   15      | Jump and Link |  4th         |
+重排后立即数为 `30`，因此完整反汇编为：
 
-Therefore, `jal x15 <imm>` is obtained, with `<imm>` representing the immediate
-yet to be decoded.
+```text
+jal x15, 30
+```
 
-All the instruction fields except `<imm>` can be decoded directly from the
-tables for this instruction. For `<imm>`, further scrambling of some bits is
-required to decode it.
+使用 ABI 别名时也可写作：
 
-Identify the subfields of the immediate:
+```text
+jal a5, 30
+```
 
-| `<imm> (encoded)` |  `0` | `0000001111` | `0`  | `00000000` |
-|:-----------------:|:----:|:------------:|:----:|:----------:|
-|  Encoding         | `m2` |   `imm2`     | `m1` |  `imm1`    |
+## 编码示例：`j -12`
 
-Re-order the subfields as written on the tables. Typically, the immediate
-encoding is located just below the corresponding instruction's encoding.
+`j` 是 `jal x0, <offset>` 的伪指令。编码时要把 `-12` 先按 J-type 偏移表示，再
+拆成 `imm[20]`、`imm[10:1]`、`imm[11]`、`imm[19:12]` 写回指令位域。
 
-| Decoding di `<imm>` |    `-m2-`      |  `imm1`    | `m1` |   `imm2`     | `0` |
-|:-------------------:|:--------------:|:----------:|:----:|:------------:|:---:|
-| `<imm> (bin)`       | `000000000000` | `00000000` | `0`  | `0000001111` | `0` |
+最终会得到类似如下 32 位指令：
 
-We obtain the 2's complement
-- `<imm> (bin)` = `00000000000000000000000000011110`
+```text
+11111111010111111111000001101111
+```
 
-that is the decimal
-- `<imm> (dec)` = `30`
+## RVC 压缩指令
 
-The fully disassembled instruction is `jal x15, 30`, or `jal a5, 30` when using
-the ABI register aliases.
+RVC 扩展提供 16 位指令编码，常用于下列情况：
 
-### Decoding instruction `j -12`
+* 立即数或地址偏移较小。
+* 使用 `x0`、`x1/ra`、`x2/sp` 等常见寄存器。
+* 目标寄存器和第一个源寄存器相同。
+* 使用压缩格式可访问的 8 个热门寄存器。
 
-The instruction `j`.
+压缩指令可以减少 25% 到 30% 的取指流量，降低指令缓存 miss。RVC 包含多种格式：
+`CR`、`CI`、`CSS`、`CIW`、`CL`、`CS`、`CB`、`CJ`。
 
-| Instruction Encoding `j` | `<imm> (encoded)` | 00000 | 11011 | 11 |
-|:------------------------:|:-----------------:|:-----:|:-----:|:--:|
+`CIW`、`CL`、`CS`、`CB` 中的 3 bit 寄存器字段访问的是 `x8` 到 `x15`，也就是
+`s0`、`s1` 和 `a0` 到 `a5`。`CR`、`CI`、`CSS` 使用完整 5 bit 寄存器字段。
 
-The least significant bits are `xxxxxxxxxxxxxxxxxxxx000001101111`.
-The rest represents an immediate, `<imm> = 30`, which needs to be encoded.
-Then sign-extend it to cover all 32 bits of its width, converting
-`<imm> (bin) = 11111111111111111110100` from `<imm> (bin) = -12` to
-`<imm> (bin) = 10100`.
+常见压缩指令：
 
-Divide this number into its subfields.
+| 指令 | 说明 |
+| --- | --- |
+| `c.addi4spn` | 基于 `sp` 生成栈上对象地址 |
+| `c.lw` / `c.sw` | 使用压缩寄存器和缩放偏移进行 32 位 load/store |
+| `c.lwsp` / `c.swsp` | 以 `sp` 为基址访问栈 |
+| `c.j` / `c.jal` | 16 位无条件跳转/调用 |
+| `c.beqz` / `c.bnez` | 判断寄存器是否为零并跳转 |
+| `c.jr` / `c.jalr` | 间接跳转/调用 |
+| `c.ebreak` | 进入调试/断点处理 |
 
-| `<imm> (bin)`    | `111111111111` | `11111111` | `1`  | `1111111010` | `0` |
-|:----------------:|:--------------:|:----------:|:----:|:------------:|:---:|
-| Decoding `<imm>` |    `-m2-`      |  `imm1`    | `m1` |   `imm2`     | `0` |
-
-Re-order the fields to encode the immediate:
-
-|       Encoding    | `m2` |   `imm2`     | `m1` |  `imm1`    |
-|:-----------------:|:----:|:------------:|:----:|:----------:|
-| `<imm> (encoded)` | `1`  | `1111111010` | `1`  | `11111111` |
-
-The obtained `<imm> (encoded) is 11111111010111111111xxxxxxxxxxxx`, representing
-the missing most significant bits.
-
-The complete assembled instruction is therefore
-`11111111010111111111000001101111`, after combining the two half-results above.
-
-## "RVC" compressed instructions
-
-[Chapter 12](https://riscv.org/wp-content/uploads/2017/05/riscv-spec-v2.2.pdf),
-page 67 (79 of 145) explains a Thumb-2-like scheme, providing a 16-bit version
-of the instruction when:
-* the immediate or address offset is small, or
-* one of the registers is the zero register (`x0`), the ABI link register (`x1`),
-  or the ABI stack pointer (`x2`), or
-* both the destination register and the first source register are identical, or
-* the registers used are the 8 most popular ones.
-
-However, it turns out that the last two conditions are actually "and" rather
-than "or," and the conditions are more restrictive than the above implies.
-
-There is an opcode map on page 81–83.
-
-The designers point out that the Cray-1 also had 16-bit and 32-bit instruction
-lengths, following Stretch, the 360, the CDC 6600, and followed by not only
-Arm but also MIPS ("MIPS16" and "microMIPS") and PowerPC "VLE." RVC fetches
-25%-30% fewer instruction bits, resulting in a reduction of instruction cache
-misses by 20%-25%, which is approximately equivalent to doubling the instruction
-cache size in terms of performance impact.
-
-There are 8 compressed instruction formats.
-The eight registers accessible by the three-bit register fields in the `CIW` (immediate wide),
-`CL` (load), `CS` (store), and `CB` (branch) formats are not the first eight registers,
-but the second eight registers, `x8` – `x15`.
-These are callee-saved `s0` – `s1` and the first argument registers `a0` – `a5`.
-The `CR` (register–register), `CI` (immediate), and `CSS` (stack store) formats have
-full-width five-bit register fields. (The `CJ` format does not refer to any registers.)
-
-Complementing the stack-store format are stack-load instructions (page 71)
-using the `CI` format with a 6-bit immediate offset, prescaled by the data
-size (4, 8, or 16 bits). These instructions only index upward from the stack
-pointer, institutionalizing the otherwise conventional downward stack growth.
-The immediate-offset field in the stack-store format is also 6 bits and treated
-in the same way. Additionally, there is a instruction called `c.addi16sp`, which
-adds a signed multiple of 16 to the stack pointer, effectively allocating or
-deallocating stack space.
-
-So in a 16-bit instruction you can load or store any of the 32 integer registers
-to any of 64 stack slots (if you have allocated that many), and you can do a
-two-operand operation with either two registers or a register and an immediate.
-It is the more general load, store, and branch formats (`CL`, `CS`, `CB`) that
-limit you to the 8 "popular" registers and only permit 5-bit unsigned offsets
-(thus 32 slots indexed by those "popular" registers).
-
-These general `CL` and `CS` formats effectively require the register to either be
-used as a base pointer to a struct or contain a memory address computed in a
-previous instruction, although you could reasonably argue that the 12-bit
-immediate field in the uncompressed I-type and S-type instructions imposes a
-similar restriction — 2 KiB is not very much space for all of your array base
-addresses.
-
-Additionally, on RV32C and RV64C, the CIW-format `c.addi4spn` loads a pointer
-to any of 256 4-byte stack slots (specified in an immediate argument) into
-one of the 8 popular registers, which you can then use with a `CL` or `CS`
-instruction to access it.
-
-Unconditional jumps and calls (to ±2KiB from PC) and branches on zeroness
-(to ±256 bytes from PC) are also encodable in 16 bits, using the `CJ` format.
-These are also restricted to the 8 popular registers. There are also `c.jr` and
-`c.jalr` indirect unconditional jumps and calls, which can use any of the 32
-registers except, of course, x0.
-
-There are a couple of compressed load-immediate instructions with a 6-bit
-immediate operand, of which the second (`c.lui`) seems entirely mysterious.
-
-16-bit-encoded ALU instructions (subtract, `c.addw`, `c.subw`, copy, and, or,
-xor, and shifts) are all limited to the 8 popular registers, except for addition,
-which can use all 32 registers.
-
-`ebreak` (into the debugger) is mapped into RVC, which is pretty important,
-but `ecall` / `scall` is not.
-
-There does not seem to be a reasonable way to load immediate memory addresses
-in 16-bit code except through the deprecated c.jal .+2 approach, which leaves
-the current PC in ra, at which point you can add a signed 6-bit immediate to
-it with `c.addi`, thus generating an address of some constant (or maybe a
-variable, if your page is mapped XWR or you do not have memory protection.)
-within 32 bytes of where you are, but then it is still in `x1` and not a popular
-register. There is no compressed version of the auipc instruction, for example.
-
-In pure 16-bit instructions, one can freely navigate pointer graphs, index into
-arrays, perform jumps, addition, subtraction, and bitwise operations. However,
-invoking system calls or loading addresses of global variables or constants is
-not possible.
-
-With this in mind, an almost complete 16-bit instruction RISC-V hardware core
-could be designed to emulate other instructions with traps, while running 16-bit
-instructions at full speed. A few additional 16-bit instructions would be
-required to handle accessing CSRs, loading addresses, and managing traps.
-
-## Decode RISC-V instructions
-
-Various RISC-V instruction set simulators decode instructions using a series of
-nested `switch` statements.
-
-First, they switch on non-C vs. C (compressed if implemented) bits 1:0.
-Next, they switch on the "opcode" field bits 6:2, such as `op-imm`, `load`, or
-`branch`. Then, they typically switch on the "funct3" field bits 14:12, which
-distinguish instructions like `add`, `slt`, `sltu`, `and`, `or`, `xor`, `sll`,
-`srl` for arithmetic operations, or `beq`, `bne`, `blt`, `bltu`, `bge`, `bgeu`
-for conditional branches, or the operand size for loads and stores.
-Finally, for certain instructions, they switch on the "funct7" field bits 31:25
-to differentiate between `add`/`sub` or `srl`/`sra`, for example.
-
-## Reference
-* [RISC-V: An Overview of the Instruction Set Architecture](http://web.cecs.pdx.edu/~harry/riscv/RISCV-Summary.pdf)
-* [RISC-V Opcodes](https://github.com/riscv/riscv-opcodes)
-* [RISC-V Instruction Set Metadata](https://github.com/michaeljclark/riscv-meta)
-* [RISC-V Instruction-Set Cheatsheet](https://itnext.io/risc-v-instruction-set-cheatsheet-70961b4bbe8)
-* [RISC-V Assembly Programmer's Manual](https://github.com/riscv-non-isa/riscv-asm-manual/blob/master/riscv-asm.md)
+在 rv32emu 中，`decode.c` 会把 RVC 指令解码成统一 `rv_insn_t`，后续解释器和 JIT
+不需要直接处理 16 位编码细节。

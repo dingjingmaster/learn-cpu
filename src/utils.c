@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 通用工具函数。
+ *
+ * 这里包含跨平台时间获取、路径规整和小型集合操作。时间函数为系统调用模拟提供
+ * gettimeofday/clock_gettime 支持；路径规整用于约束客体 open 路径，避免简单的
+ * `..` 逃逸；集合工具用于轻量级去重场景。
  */
 
 #include <assert.h>
@@ -27,9 +34,9 @@
 
 #define MAX_PATH_LEN 1024
 
-/* Calculate "x * n / d" without unnecessary overflow or loss of precision.
+/* 在尽量避免溢出和精度损失的前提下计算 "x * n / d"。
  *
- * Reference:
+ * 参考：
  * https://elixir.bootlin.com/linux/v6.10.7/source/include/linux/math.h#L121
  */
 #if !defined(HAVE_POSIX_TIMER)
@@ -51,15 +58,14 @@ static void get_time_info(int32_t *tv_sec, int32_t *tv_nsec)
     *tv_nsec = t.tv_nsec;
 #elif defined(HAVE_MACH_TIMER)
     static mach_timebase_info_data_t info;
-    /* If it is the first time running, obtain the timebase. Using denom == 0
-     * indicates that sTimebaseInfo is uninitialized.
+    /* 首次运行时获取 Mach timebase。denom == 0 表示 info 尚未初始化。
      */
     if (info.denom == 0)
         (void) mach_timebase_info(&info);
     uint64_t nsecs = mult_frac(mach_absolute_time(), info.numer, info.denom);
     *tv_sec = nsecs / 1e9;
     *tv_nsec = nsecs - (*tv_sec * 1e9);
-#else /* low resolution timer */
+#else /* 低分辨率计时器。 */
     clock_t t = clock();
     *tv_sec = t / CLOCKS_PER_SEC;
     *tv_nsec = mult_frac(t % CLOCKS_PER_SEC, 1e9, CLOCKS_PER_SEC);
@@ -90,8 +96,7 @@ char *sanitize_path(const char *input)
     if (!ret)
         return NULL;
 
-    /* After sanitization, the new path will only be shorter than the original
-     * one. Thus, we can reuse the space.
+    /* 规整后的路径只会比原路径短，因此可以复用同一块缓冲区。
      */
     if (n == 0) {
         ret[0] = '.';
@@ -100,12 +105,11 @@ char *sanitize_path(const char *input)
 
     bool is_root = (input[0] == '/');
 
-    /* Invariants:
-     * reading from path; r is index of next byte to process -> path[r]
-     * writing to buf; w is index of next byte to write -> ret[strlen(ret)]
-     * dotdot is index in buf where .. must stop, either because:
-     *   (a) it is the leading slash;
-     *   (b) it is a leading ../../.. prefix.
+    /* 循环不变量：
+     * - r 是下一个待读取字节的索引，对应 input[r]。
+     * - w 是下一个待写入字节的索引，对应 ret[w]。
+     * - dotdot 是 ".." 回退必须停止的位置，原因可能是根目录斜杠，或相对路径
+     *   开头连续的 ../../.. 前缀。
      */
     size_t w = 0, r = 0;
     size_t dotdot = 0;
@@ -118,24 +122,24 @@ char *sanitize_path(const char *input)
 
     while (r < n) {
         if (input[r] == '/') {
-            /*  empty path element */
+            /* 空路径元素。 */
             r++;
         } else if (input[r] == '.' && (r + 1 == n || input[r + 1] == '/')) {
-            /* . element */
+            /* "." 元素直接跳过。 */
             r++;
         } else if (input[r] == '.' && input[r + 1] == '.' &&
                    (r + 2 == n || input[r + 2] == '/')) {
-            /* .. element: remove to last '/' */
+            /* ".." 元素：回退到上一个斜杠。 */
             r += 2;
 
             if (w > dotdot) {
-                /* can backtrack */
+                /* 可以回退已有路径元素。 */
                 w--;
                 while (w > dotdot && ret[w] != '/') {
                     w--;
                 }
             } else if (!is_root) {
-                /* cannot backtrack, but not is_root, so append .. element. */
+                /* 相对路径无法继续回退时，保留 ".." 元素。 */
                 if (w > 0) {
                     ret[w] = '/';
                     w++;
@@ -147,13 +151,13 @@ char *sanitize_path(const char *input)
                 dotdot = w;
             }
         } else {
-            /* real path element, add slash if needed */
+            /* 普通路径元素，必要时先补斜杠。 */
             if ((is_root && w != 1) || (!is_root && w != 0)) {
                 ret[w] = '/';
                 w++;
             }
 
-            /* copy element */
+            /* 复制路径元素。 */
             for (; r < n && input[r] != '/'; r++) {
                 ret[w] = input[r];
                 w++;
@@ -161,14 +165,13 @@ char *sanitize_path(const char *input)
         }
     }
 
-    /* Turn empty string into "." */
+    /* 空字符串规整为 "."。 */
     if (w == 0) {
         ret[w] = '.';
         w++;
     }
 
-    /* starting from w till the end, we should mark it as '\0' since that part
-     * of the buffer is not used.
+    /* w 之后的缓冲区不再使用，统一填 0，避免残留旧内容。
      */
     memset(ret + w, '\0', n + 1 - w);
 
@@ -183,9 +186,9 @@ void set_reset(set_t *set)
 }
 
 /**
- * set_add - insert a new element into the set
- * @set: a pointer points to target set
- * @key: the key of the inserted entry
+ * set_add - 向集合插入新元素。
+ * @set: 目标集合。
+ * @key: 待插入键值。
  */
 bool set_add(set_t *set, rv_hash_key_t key)
 {
@@ -204,9 +207,9 @@ bool set_add(set_t *set, rv_hash_key_t key)
 }
 
 /**
- * set_has - check whether the element exist in the set or not
- * @set: a pointer points to target set
- * @key: the key of the inserted entry
+ * set_has - 检查元素是否已经存在。
+ * @set: 目标集合。
+ * @key: 待查询键值。
  */
 bool set_has(set_t *set, rv_hash_key_t key)
 {

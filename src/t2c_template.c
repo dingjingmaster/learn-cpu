@@ -1,9 +1,10 @@
-/* This file maps each custom IR to the corresponding LLVM IRs and builds LLVM
- * IR through LLVM-C API. The built LLVM IR is offloaded to the LLVM backend,
- * where it undergoes optimization through several selected LLVM passes.
- * Subsequently, the optimized LLVM IR is passed to the LLVM execution engine,
- * which compiles the optimized LLVM IR and returns a function pointer to the
- * generated machine code.
+/*
+ * 二级 JIT 指令模板。
+ *
+ * 本文件把 rv32emu 的自定义 IR 映射为 LLVM IR，并通过 LLVM-C API 构建 IR。
+ * 构建出的 LLVM IR 会交给 LLVM 后端执行优化，再交给执行引擎编译为宿主机器码，
+ * 最终返回可直接调用的函数指针。T2C_OP 处理器的语义必须与 rv32_template.c
+ * 中的解释器实现保持一致。
  */
 
 T2C_OP(nop, { return; })
@@ -18,7 +19,7 @@ T2C_OP(auipc, {
                              t2c_gen_rd_addr(start, builder, ir));
 })
 
-/* Query the block by pc and return if it is valid. */
+/* 按 PC 查询基本块，并判断该块是否仍可用于跳转。 */
 static bool t2c_check_valid_blk(riscv_t *rv, block_t *block UNUSED, uint32_t pc)
 {
     block_t *blk = cache_get(rv->block_cache, pc, false);
@@ -57,27 +58,27 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
                                        rv_insn_t *ir,
                                        LLVMValueRef insn_counter)
 {
-    /* Inline caching + seqlock pattern for indirect jump resolution.
+    /* 用 inline cache + seqlock 模式解析间接跳转。
      *
-     * Fast path (inline cache hit):
-     *   1. Load cached key from inline_cache[hash]
-     *   2. Compare with target address - if match, call cached entry directly
-     *   3. No ISB needed on ARM64 - target was already executed successfully
+     * 快路径（inline cache 命中）：
+     *   1. 从 inline_cache[hash] 加载缓存 key。
+     *   2. 与目标地址比较，匹配则直接调用缓存入口。
+     *   3. ARM64 上不需要 ISB，因为该目标此前已经成功执行过。
      *
-     * Slow path (inline cache miss -> jit_cache lookup):
-     *   1. Load seq1 (acquire), if odd (write in progress) -> fallback
-     *   2. Load key (acquire), compare with expected -> fallback on mismatch
-     *   3. Load entry (acquire), ensuring all data loads complete
-     *   4. Load seq2 (monotonic), if seq1 != seq2 or entry == NULL -> fallback
-     *   5. Update inline cache with (key, entry) for next time
-     *   6. ISB on ARM64 (new block), call entry
+     * 慢路径（inline cache 未命中，查 jit_cache）：
+     *   1. 加载 seq1（acquire），若为奇数表示写入中，回退解释器。
+     *   2. 加载 key（acquire）并与期望值比较，不匹配则回退。
+     *   3. 加载 entry（acquire），确保相关数据加载完成。
+     *   4. 加载 seq2（monotonic），若 seq1 != seq2 或 entry == NULL 则回退。
+     *   5. 用 (key, entry) 更新 inline cache，供下次使用。
+     *   6. ARM64 新块路径执行 ISB，然后调用 entry。
      *
-     * Inline cache provides ~90% hit rate for stable branch patterns (returns,
-     * virtual calls). Removes seqlock overhead and ISB for hot paths.
+     * 对返回、虚调用等稳定分支模式，inline cache 通常可提供约 90% 命中率，热点
+     * 路径因此能避开 seqlock 开销和 ISB。
      */
     LLVMValueRef rv_param = LLVMGetParam(start, 0);
 
-    /* Compute expected key once - used by both inline cache and jit_cache */
+    /* 只计算一次期望 key，inline cache 和 jit_cache 共用。 */
 #if RV32_HAS(SYSTEM)
     LLVMValueRef satp_offset_early =
         LLVMConstInt(LLVMInt64Type(), offsetof(riscv_t, csr_satp), false);
@@ -98,9 +99,9 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
         *builder, addr, LLVMInt64Type(), false, "expected_key");
 #endif
 
-    /* === INLINE CACHE FAST PATH === */
+    /* === INLINE CACHE 快路径 === */
 
-    /* Load inline_cache base address */
+    /* 加载 inline_cache 基址。 */
     LLVMValueRef ic_offset =
         LLVMConstInt(LLVMInt64Type(), offsetof(riscv_t, inline_cache), false);
     LLVMValueRef ic_ptr = LLVMBuildInBoundsGEP2(*builder, LLVMInt8Type(),
@@ -108,8 +109,9 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
     LLVMValueRef ic_base = LLVMBuildLoad2(
         *builder, LLVMPointerType(t2c_inline_cache_struct_type, 0), ic_ptr, "");
 
-    /* Compute inline cache index: different hash from jit_cache to spread load.
-     * Use upper bits XOR lower bits for better distribution. */
+    /* 计算 inline cache 索引：使用不同于 jit_cache 的哈希以分散负载。
+     * 高位 XOR 低位能改善分布。
+     */
     LLVMValueRef ic_addr_high = LLVMBuildLShr(
         *builder, addr, LLVMConstInt(LLVMInt32Type(), 12, false), "");
     LLVMValueRef ic_addr_mixed = LLVMBuildXor(*builder, addr, ic_addr_high, "");
@@ -125,13 +127,13 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
         LLVMConstInt(LLVMInt32Type(), N_INLINE_CACHE_ENTRIES - 1, false), "");
 #endif
 
-    /* Get inline cache element pointer */
+    /* 获取 inline cache 条目指针。 */
     LLVMValueRef ic_idx =
         LLVMBuildIntCast2(*builder, ic_hash, LLVMInt64Type(), false, "");
     LLVMValueRef ic_element_ptr = LLVMBuildInBoundsGEP2(
         *builder, t2c_inline_cache_struct_type, ic_base, &ic_idx, 1, "");
 
-    /* Load cached key and entry from inline cache */
+    /* 从 inline cache 加载缓存的 key 和 entry。 */
     LLVMValueRef ic_key_ptr = LLVMBuildStructGEP2(
         *builder, t2c_inline_cache_struct_type, ic_element_ptr, 0, "");
     LLVMValueRef ic_key =
@@ -142,14 +144,14 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
     LLVMValueRef ic_entry = LLVMBuildLoad2(
         *builder, LLVMPointerType(LLVMVoidType(), 0), ic_entry_ptr, "ic_entry");
 
-    /* Check if inline cache hit: key matches AND entry is not NULL */
+    /* 判断 inline cache 是否命中：key 匹配且 entry 非 NULL。 */
     LLVMValueRef ic_key_match =
         LLVMBuildICmp(*builder, LLVMIntEQ, ic_key, expected_key, "");
     LLVMValueRef ic_entry_valid = LLVMBuildIsNotNull(*builder, ic_entry, "");
     LLVMValueRef ic_hit =
         LLVMBuildAnd(*builder, ic_key_match, ic_entry_valid, "ic_hit");
 
-    /* Create basic blocks for inline cache hit and miss paths */
+    /* 为 inline cache 命中和未命中路径创建基本块。 */
     LLVMBasicBlockRef ic_hit_block = LLVMAppendBasicBlock(start, "ic_hit");
     LLVMBuilderRef ic_hit_builder = LLVMCreateBuilder();
     LLVMPositionBuilderAtEnd(ic_hit_builder, ic_hit_block);
@@ -160,9 +162,8 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
 
     LLVMBuildCondBr(*builder, ic_hit, ic_hit_block, ic_miss_block);
 
-    /* === INLINE CACHE HIT PATH (fast) ===
-     * No ISB needed - we already executed this target successfully before.
-     * The instruction cache was coherent at that time.
+    /* === INLINE CACHE 命中路径（快） ===
+     * 不需要 ISB：该目标此前已经成功执行，当时指令缓存已保持一致。
      */
     T2C_STORE_TIMER(ic_hit_builder, start, insn_counter);
     LLVMValueRef ic_call_args[1] = {rv_param};
@@ -170,7 +171,7 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
                    ic_call_args, 1, "");
     LLVMBuildRetVoid(ic_hit_builder);
 
-    /* === INLINE CACHE MISS PATH (slow - use seqlock jit_cache) === */
+    /* === INLINE CACHE 未命中路径（慢，使用 seqlock jit_cache） === */
 
     LLVMBasicBlockRef seq_even = LLVMAppendBasicBlock(start, "seq_even");
     LLVMBuilderRef seq_even_builder = LLVMCreateBuilder();
@@ -188,7 +189,7 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
     LLVMBuilderRef fallback_builder = LLVMCreateBuilder();
     LLVMPositionBuilderAtEnd(fallback_builder, fallback);
 
-    /* Load jit_cache base address */
+    /* 加载 jit_cache 基址。 */
     LLVMValueRef jit_cache_offset =
         LLVMConstInt(LLVMInt64Type(), offsetof(riscv_t, jit_cache), false);
     LLVMValueRef jit_cache_ptr = LLVMBuildInBoundsGEP2(
@@ -197,7 +198,7 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
         ic_miss_builder, LLVMPointerType(t2c_jit_cache_struct_type, 0),
         jit_cache_ptr, "");
 
-    /* Compute jit_cache index */
+    /* 计算 jit_cache 索引。 */
     LLVMValueRef addr_high = LLVMBuildLShr(
         ic_miss_builder, addr, LLVMConstInt(LLVMInt32Type(), 12, false), "");
     LLVMValueRef addr_mixed =
@@ -214,13 +215,13 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
         LLVMConstInt(LLVMInt32Type(), N_JIT_CACHE_ENTRIES - 1, false), "");
 #endif
 
-    /* Get jit_cache element pointer */
+    /* 获取 jit_cache 条目指针。 */
     LLVMValueRef cast =
         LLVMBuildIntCast2(ic_miss_builder, hash, LLVMInt64Type(), false, "");
     LLVMValueRef element_ptr = LLVMBuildInBoundsGEP2(
         ic_miss_builder, t2c_jit_cache_struct_type, base, &cast, 1, "");
 
-    /* Step 1: Load seq1 (acquire). Odd value means write in progress. */
+    /* 步骤 1：加载 seq1（acquire）。奇数表示写入正在进行。 */
     LLVMValueRef seq_ptr = LLVMBuildStructGEP2(
         ic_miss_builder, t2c_jit_cache_struct_type, element_ptr, 0, "");
     LLVMValueRef seq1 =
@@ -233,7 +234,7 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
                       LLVMConstInt(LLVMInt32Type(), 0, false), "");
     LLVMBuildCondBr(ic_miss_builder, is_even, seq_even, fallback);
 
-    /* Step 2: Load key (acquire) and compare with expected. */
+    /* 步骤 2：加载 key（acquire）并与期望值比较。 */
     LLVMValueRef jc_key_ptr = LLVMBuildStructGEP2(
         seq_even_builder, t2c_jit_cache_struct_type, element_ptr, 2, "");
     LLVMValueRef jc_key =
@@ -245,7 +246,7 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
         LLVMBuildICmp(seq_even_builder, LLVMIntEQ, jc_key, expected_key, "");
     LLVMBuildCondBr(seq_even_builder, jc_key_cmp, key_match, fallback);
 
-    /* Step 3: Load entry (acquire). */
+    /* 步骤 3：加载 entry（acquire）。 */
     LLVMValueRef jc_entry_ptr = LLVMBuildStructGEP2(
         key_match_builder, t2c_jit_cache_struct_type, element_ptr, 3, "");
     LLVMValueRef entry =
@@ -254,7 +255,7 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
     LLVMSetOrdering(entry, LLVMAtomicOrderingAcquire);
     LLVMSetAlignment(entry, 8);
 
-    /* Step 4: Load seq2 (monotonic), check seq1 == seq2 AND entry != NULL. */
+    /* 步骤 4：加载 seq2（monotonic），确认 seq1 == seq2 且 entry 非 NULL。 */
     LLVMValueRef seq2 =
         LLVMBuildLoad2(key_match_builder, LLVMInt32Type(), seq_ptr, "");
     LLVMSetOrdering(seq2, LLVMAtomicOrderingMonotonic);
@@ -267,17 +268,15 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
         LLVMBuildAnd(key_match_builder, seq_cmp, entry_not_null, "");
     LLVMBuildCondBr(key_match_builder, valid, call_jit, fallback);
 
-    /* Step 5: Update inline cache with the newly looked-up entry.
-     * This populates the fast path for subsequent calls to same target.
-     * No atomics needed - single-threaded update from main thread only.
+    /* 步骤 5：用新查到的 entry 更新 inline cache。
+     * 这会为后续相同目标填充快路径。更新只发生在主线程，因此不需要原子操作。
      */
     LLVMBuildStore(call_builder, expected_key, ic_key_ptr);
     LLVMBuildStore(call_builder, entry, ic_entry_ptr);
 
 #if defined(__aarch64__)
-    /* ARM64 ISB required on slow path only - this is a newly-discovered block.
-     * The inline cache hit path skips ISB because we already executed the
-     * target successfully, so icache was coherent at that time.
+    /* 只有慢路径上的新发现基本块需要 ARM64 ISB。inline cache 命中路径会跳过 ISB，
+     * 因为目标此前已成功执行，指令缓存当时已经一致。
      */
     LLVMTypeRef isb_func_type = LLVMFunctionType(LLVMVoidType(), NULL, 0, 0);
     LLVMValueRef isb_asm =
@@ -292,13 +291,13 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
                    "");
     LLVMBuildRetVoid(call_builder);
 
-    /* Fallback: seq odd, key mismatch, or seq changed - return to interp */
+    /* 回退：seq 为奇数、key 不匹配或 seq 变化时返回解释器。 */
     LLVMBuildStore(fallback_builder, addr,
                    t2c_gen_PC_addr(start, &fallback_builder, ir));
     T2C_STORE_TIMER(fallback_builder, start, insn_counter);
     LLVMBuildRetVoid(fallback_builder);
 
-    /* Dispose temporary builders */
+    /* 释放临时 builder。 */
     LLVMDisposeBuilder(ic_hit_builder);
     LLVMDisposeBuilder(ic_miss_builder);
     LLVMDisposeBuilder(seq_even_builder);
@@ -308,8 +307,7 @@ FORCE_INLINE void t2c_jit_cache_helper(LLVMBuilderRef *builder,
 }
 
 T2C_OP(jalr, {
-    /* The register which stores the indirect address needs to be loaded first
-     * to avoid being overriden by other operation.
+    /* 保存间接地址的寄存器必须先加载，避免后续操作覆盖其值。
      */
     T2C_LLVM_GEN_LOAD_VMREG(rs1, 32, t2c_gen_rs1_addr(start, builder, ir));
     val_rs1 = T2C_LLVM_GEN_ALU32_IMM(Add, val_rs1, ir->imm);
@@ -370,23 +368,22 @@ BRANCH_FUNC(bgeu, UGE)
 
 #define t2c_mmu_wrapper(opcode) t2c_mmu_wrapper_##opcode
 
-/* T2C_MMU_LOAD: Generate LLVM IR for MMU load operations.
- * Loads function pointer from rv->io at runtime to avoid ASLR issues.
- * Parameters:
- *   opcode: Instruction name (lb, lh, lw, lbu, lhu)
- *   io_field: Field name in riscv_io_t (mmu_read_b, mmu_read_s, mmu_read_w)
- *   bits: Return value bit width (8, 16, 32)
- *   is_signed: Whether to sign-extend the result
+/* T2C_MMU_LOAD：为 MMU 读操作生成 LLVM IR。
+ * 运行时从 rv->io 加载函数指针，避免 ASLR 导致的地址问题。
+ * 参数：
+ *   opcode: 指令名（lb、lh、lw、lbu、lhu）。
+ *   io_field: riscv_io_t 中的字段名（mmu_read_b、mmu_read_s、mmu_read_w）。
+ *   bits: 返回值位宽（8、16、32）。
+ *   is_signed: 是否对结果做符号扩展。
  *
- * OPTIMIZATION NOTE: Each call to t2c_mmu_wrapper_* generates a load of the
- * MMU function pointer from rv->io. For blocks with multiple memory ops of
- * the same type, this creates redundant loads. LLVM's O3 optimization with
- * early-cse (Common Subexpression Elimination) should eliminate these since:
- *   1. rv->io is at a constant offset from the rv parameter
- *   2. The pointer values are invariant during block execution
- *   3. Memory SSA analysis tracks the load dependencies
- * If profiling shows this is still a bottleneck, consider hoisting the function
- * pointer loads to block entry and passing them through a context structure.
+ * 优化说明：每次调用 t2c_mmu_wrapper_* 都会从 rv->io 加载 MMU 函数指针。若同一
+ * 基本块内有多条同类型内存操作，会产生冗余加载。LLVM O3 的 early-cse（公共子
+ * 表达式消除）通常能移除这些冗余，因为：
+ *   1. rv->io 相对 rv 参数的偏移是常量。
+ *   2. 指针值在基本块执行期间不变。
+ *   3. Memory SSA 能跟踪加载依赖。
+ * 如果 profiling 显示这里仍是瓶颈，可考虑把函数指针加载提升到基本块入口，并
+ * 通过上下文结构传递。
  */
 #define T2C_MMU_LOAD(opcode, io_field, bits, is_signed)                       \
     static void t2c_mmu_wrapper_##opcode(LLVMBuilderRef *builder,             \
@@ -396,15 +393,15 @@ BRANCH_FUNC(bgeu, UGE)
             LLVMBuildLoad2(*builder, LLVMInt32Type(),                         \
                            t2c_gen_rs1_addr(start, builder, ir), "");         \
         LLVMValueRef vaddr = T2C_LLVM_GEN_ALU32_IMM(Add, val_rs1, ir->imm);   \
-        /* MMU read functions: uint##bits##_t fn(riscv_t *rv, uint32_t vaddr) \
-         * Use proper 32-bit vaddr type to match C function signature. */     \
+        /* MMU 读函数：uint##bits##_t fn(riscv_t *rv, uint32_t vaddr)。       \
+         * 使用正确的 32 位 vaddr 类型以匹配 C 函数签名。 */                \
         LLVMTypeRef param_types[] = {LLVMPointerType(LLVMVoidType(), 0),      \
                                      LLVMInt32Type()};                        \
         LLVMTypeRef mmu_fn_type =                                             \
             LLVMFunctionType(LLVMInt##bits##Type(), param_types, 2, 0);       \
-        /* Load MMU function pointer from rv->io at runtime.                  \
-         * This avoids embedding compile-time addresses that break with ASLR. \
-         * Offset = offsetof(riscv_t, io) + offsetof(riscv_io_t, io_field) */ \
+        /* 运行时从 rv->io 加载 MMU 函数指针。                               \
+         * 避免嵌入会被 ASLR 破坏的编译期地址。                             \
+         * 偏移 = offsetof(riscv_t, io) + offsetof(riscv_io_t, io_field)。 */ \
         LLVMValueRef rv_param = LLVMGetParam(start, 0);                       \
         LLVMValueRef fn_offset = LLVMConstInt(                                \
             LLVMInt64Type(),                                                  \
@@ -421,12 +418,12 @@ BRANCH_FUNC(bgeu, UGE)
         LLVMBuildStore(*builder, ret, t2c_gen_rd_addr(start, builder, ir));   \
     }
 
-/* T2C_MMU_STORE: Generate LLVM IR for MMU store operations.
- * Loads function pointer from rv->io at runtime to avoid ASLR issues.
- * Parameters:
- *   opcode: Instruction name (sb, sh, sw)
- *   io_field: Field name in riscv_io_t (mmu_write_b, mmu_write_s, mmu_write_w)
- *   val_bits: Value parameter bit width (8, 16, 32)
+/* T2C_MMU_STORE：为 MMU 写操作生成 LLVM IR。
+ * 运行时从 rv->io 加载函数指针，避免 ASLR 导致的地址问题。
+ * 参数：
+ *   opcode: 指令名（sb、sh、sw）。
+ *   io_field: riscv_io_t 中的字段名（mmu_write_b、mmu_write_s、mmu_write_w）。
+ *   val_bits: 写入值参数位宽（8、16、32）。
  */
 #define T2C_MMU_STORE(opcode, io_field, val_bits)                             \
     static void t2c_mmu_wrapper_##opcode(LLVMBuilderRef *builder,             \
@@ -436,16 +433,16 @@ BRANCH_FUNC(bgeu, UGE)
             LLVMBuildLoad2(*builder, LLVMInt32Type(),                         \
                            t2c_gen_rs1_addr(start, builder, ir), "");         \
         LLVMValueRef vaddr = T2C_LLVM_GEN_ALU32_IMM(Add, val_rs1, ir->imm);   \
-        /* MMU write functions: void fn(riscv_t *rv, uint32_t vaddr, val)     \
-         * Use proper types to match C function signature. */                 \
+        /* MMU 写函数：void fn(riscv_t *rv, uint32_t vaddr, val)。           \
+         * 使用正确类型以匹配 C 函数签名。 */                                \
         LLVMTypeRef param_types[] = {LLVMPointerType(LLVMVoidType(), 0),      \
                                      LLVMInt32Type(),                         \
                                      LLVMInt##val_bits##Type()};              \
         LLVMTypeRef mmu_fn_type =                                             \
             LLVMFunctionType(LLVMVoidType(), param_types, 3, 0);              \
-        /* Load MMU function pointer from rv->io at runtime.                  \
-         * This avoids embedding compile-time addresses that break with ASLR. \
-         * Offset = offsetof(riscv_t, io) + offsetof(riscv_io_t, io_field) */ \
+        /* 运行时从 rv->io 加载 MMU 函数指针。                               \
+         * 避免嵌入会被 ASLR 破坏的编译期地址。                             \
+         * 偏移 = offsetof(riscv_t, io) + offsetof(riscv_io_t, io_field)。 */ \
         LLVMValueRef rv_param = LLVMGetParam(start, 0);                       \
         LLVMValueRef fn_offset = LLVMConstInt(                                \
             LLVMInt64Type(),                                                  \
@@ -470,16 +467,16 @@ T2C_MMU_STORE(sb, mmu_write_b, 8);
 T2C_MMU_STORE(sh, mmu_write_s, 16);
 T2C_MMU_STORE(sw, mmu_write_w, 32);
 
-/* MMU wrapper for clwsp: load word from sp + imm via MMU */
+/* clwsp 的 MMU 包装器：通过 MMU 从 sp + imm 加载 32 位字。 */
 static void t2c_mmu_wrapper_clwsp(LLVMBuilderRef *builder,
                                   LLVMValueRef start,
                                   rv_insn_t *ir)
 {
-    /* Load sp value (x2) and add immediate offset */
+    /* 加载 sp（x2）并加上立即数偏移。 */
     LLVMValueRef val_sp = LLVMBuildLoad2(
         *builder, LLVMInt32Type(), t2c_gen_sp_addr(start, builder, ir), "");
     LLVMValueRef vaddr = T2C_LLVM_GEN_ALU32_IMM(Add, val_sp, ir->imm);
-    /* MMU read: uint32_t fn(riscv_t *rv, uint32_t vaddr) */
+    /* MMU 读：uint32_t fn(riscv_t *rv, uint32_t vaddr)。 */
     LLVMTypeRef param_types[] = {LLVMPointerType(LLVMVoidType(), 0),
                                  LLVMInt32Type()};
     LLVMTypeRef mmu_fn_type =
@@ -498,16 +495,16 @@ static void t2c_mmu_wrapper_clwsp(LLVMBuilderRef *builder,
     LLVMBuildStore(*builder, ret, t2c_gen_rd_addr(start, builder, ir));
 }
 
-/* MMU wrapper for cswsp: store word to sp + imm via MMU */
+/* cswsp 的 MMU 包装器：通过 MMU 向 sp + imm 存储 32 位字。 */
 static void t2c_mmu_wrapper_cswsp(LLVMBuilderRef *builder,
                                   LLVMValueRef start,
                                   rv_insn_t *ir)
 {
-    /* Load sp value (x2) and add immediate offset */
+    /* 加载 sp（x2）并加上立即数偏移。 */
     LLVMValueRef val_sp = LLVMBuildLoad2(
         *builder, LLVMInt32Type(), t2c_gen_sp_addr(start, builder, ir), "");
     LLVMValueRef vaddr = T2C_LLVM_GEN_ALU32_IMM(Add, val_sp, ir->imm);
-    /* MMU write: void fn(riscv_t *rv, uint32_t vaddr, uint32_t val) */
+    /* MMU 写：void fn(riscv_t *rv, uint32_t vaddr, uint32_t val)。 */
     LLVMTypeRef param_types[] = {LLVMPointerType(LLVMVoidType(), 0),
                                  LLVMInt32Type(), LLVMInt32Type()};
     LLVMTypeRef mmu_fn_type =
@@ -525,8 +522,8 @@ static void t2c_mmu_wrapper_cswsp(LLVMBuilderRef *builder,
     LLVMBuildCall2(*builder, mmu_fn_type, mmu_fn_ptr, params, 3, "");
 }
 
-/* MMU wrapper for fuse9: LUI+LW absolute address load
- * addr = ir->imm + ir->imm2, dest = ir->rs2 (not rd!)
+/* fuse9 的 MMU 包装器：LUI+LW 绝对地址加载。
+ * addr = ir->imm + ir->imm2，目的寄存器为 ir->rs2（不是 rd）。
  */
 static void t2c_mmu_wrapper_fuse9(LLVMBuilderRef *builder,
                                   LLVMValueRef start,
@@ -549,12 +546,12 @@ static void t2c_mmu_wrapper_fuse9(LLVMBuilderRef *builder,
     LLVMValueRef params[] = {rv_param, vaddr};
     LLVMValueRef ret =
         LLVMBuildCall2(*builder, mmu_fn_type, mmu_fn_ptr, params, 2, "");
-    /* fuse9 uses rs2 as destination, not rd */
+    /* fuse9 使用 rs2 作为目的寄存器，而不是 rd。 */
     LLVMBuildStore(*builder, ret, t2c_gen_rs2_addr(start, builder, ir));
 }
 
-/* MMU wrapper for fuse10: LUI+SW absolute address store
- * addr = ir->imm + ir->imm2, source = ir->rs1
+/* fuse10 的 MMU 包装器：LUI+SW 绝对地址存储。
+ * addr = ir->imm + ir->imm2，源寄存器为 ir->rs1。
  */
 static void t2c_mmu_wrapper_fuse10(LLVMBuilderRef *builder,
                                    LLVMValueRef start,
@@ -579,8 +576,8 @@ static void t2c_mmu_wrapper_fuse10(LLVMBuilderRef *builder,
     LLVMBuildCall2(*builder, mmu_fn_type, mmu_fn_ptr, params, 3, "");
 }
 
-/* MMU wrapper for fuse11: LW+ADDI post-increment load
- * addr = X[rs1] + imm, dest = rd, then X[rs1] += imm2
+/* fuse11 的 MMU 包装器：LW+ADDI 后递增加载。
+ * addr = X[rs1] + imm，目的寄存器为 rd，然后 X[rs1] += imm2。
  */
 static void t2c_mmu_wrapper_fuse11(LLVMBuilderRef *builder,
                                    LLVMValueRef start,
@@ -589,7 +586,7 @@ static void t2c_mmu_wrapper_fuse11(LLVMBuilderRef *builder,
     LLVMValueRef addr_rs1 = t2c_gen_rs1_addr(start, builder, ir);
     T2C_LLVM_GEN_LOAD_VMREG(rs1, 32, addr_rs1);
     LLVMValueRef vaddr = T2C_LLVM_GEN_ALU32_IMM(Add, val_rs1, ir->imm);
-    /* MMU read */
+    /* MMU 读。 */
     LLVMTypeRef param_types[] = {LLVMPointerType(LLVMVoidType(), 0),
                                  LLVMInt32Type()};
     LLVMTypeRef mmu_fn_type =
@@ -606,7 +603,7 @@ static void t2c_mmu_wrapper_fuse11(LLVMBuilderRef *builder,
     LLVMValueRef ret =
         LLVMBuildCall2(*builder, mmu_fn_type, mmu_fn_ptr, params, 2, "");
     LLVMBuildStore(*builder, ret, t2c_gen_rd_addr(start, builder, ir));
-    /* Post-increment rs1 by imm2 */
+    /* rs1 按 imm2 后递增。 */
     LLVMValueRef inc = T2C_LLVM_GEN_ALU32_IMM(Add, val_rs1, ir->imm2);
     LLVMBuildStore(*builder, inc, addr_rs1);
 }
@@ -866,8 +863,8 @@ T2C_OP(fence, { __UNREACHABLE; })
 T2C_OP(ecall, {
     T2C_LLVM_GEN_STORE_IMM32(*builder, ir->pc,
                              t2c_gen_PC_addr(start, builder, ir));
-    /* Use offsetof() to compute proper byte offset for on_ecall.
-     * This works correctly regardless of SYSTEM mode (which adds MMU ptrs).
+    /* 使用 offsetof() 计算 on_ecall 的正确字节偏移。无论 SYSTEM 模式是否添加
+     * MMU 指针字段，这种方式都能保持正确。
      */
     t2c_gen_call_io_func(
         start, builder, param_types,
@@ -879,8 +876,8 @@ T2C_OP(ecall, {
 T2C_OP(ebreak, {
     T2C_LLVM_GEN_STORE_IMM32(*builder, ir->pc,
                              t2c_gen_PC_addr(start, builder, ir));
-    /* Use offsetof() to compute proper byte offset for on_ebreak.
-     * This works correctly regardless of SYSTEM mode (which adds MMU ptrs).
+    /* 使用 offsetof() 计算 on_ebreak 的正确字节偏移。无论 SYSTEM 模式是否添加
+     * MMU 指针字段，这种方式都能保持正确。
      */
     t2c_gen_call_io_func(
         start, builder, param_types,
@@ -1299,8 +1296,8 @@ T2C_OP(cmv, {
 T2C_OP(cebreak, {
     T2C_LLVM_GEN_STORE_IMM32(*builder, ir->pc,
                              t2c_gen_PC_addr(start, builder, ir));
-    /* Use offsetof() to compute proper byte offset for on_ebreak.
-     * This works correctly regardless of SYSTEM mode (which adds MMU ptrs).
+    /* 使用 offsetof() 计算 on_ebreak 的正确字节偏移。无论 SYSTEM 模式是否添加
+     * MMU 指针字段，这种方式都能保持正确。
      */
     t2c_gen_call_io_func(
         start, builder, param_types,
@@ -1310,8 +1307,7 @@ T2C_OP(cebreak, {
 })
 
 T2C_OP(cjalr, {
-    /* The register which stores the indirect address needs to be loaded first
-     * to avoid being overriden by other operation.
+    /* 保存间接地址的寄存器必须先加载，避免后续操作覆盖其值。
      */
     T2C_LLVM_GEN_LOAD_VMREG(rs1, 32, t2c_gen_rs1_addr(start, builder, ir));
     T2C_LLVM_GEN_STORE_IMM32(*builder, ir->pc + 2,
@@ -1513,13 +1509,12 @@ T2C_OP(fuse5, {
     }
 })
 
-/* fused LI a7, imm + ECALL
- * This fusion is only available in standard RV32I/M/A/F/C since RV32E
- * uses a different syscall convention (t0 instead of a7).
+/* 融合 LI a7, imm + ECALL。
+ * 该融合只适用于标准 RV32I/M/A/F/C；RV32E 使用不同系统调用约定（t0 而非 a7）。
  */
 #if !RV32_HAS(RV32E)
 T2C_OP(fuse6, {
-    /* Store syscall number (imm) to a7 register */
+    /* 把系统调用号 imm 写入 a7 寄存器。 */
     LLVMValueRef a7_offset = LLVMConstInt(
         LLVMInt32Type(), offsetof(riscv_t, X) / sizeof(int) + rv_reg_a7, true);
     LLVMValueRef addr_a7 =
@@ -1527,9 +1522,9 @@ T2C_OP(fuse6, {
                               &a7_offset, 1, "addr_a7");
     LLVMBuildStore(*builder, LLVMConstInt(LLVMInt32Type(), ir->imm, true),
                    addr_a7);
-    /* Store PC and call ecall handler.
-     * ECALL is at ir->pc + 4 (second instruction in fused pair).
-     * Use offsetof() to compute proper byte offset for on_ecall.
+    /* 保存 PC 并调用 ecall 处理器。
+     * ECALL 位于 ir->pc + 4，即融合对中的第二条指令。
+     * 使用 offsetof() 计算 on_ecall 的正确字节偏移。
      */
     T2C_LLVM_GEN_STORE_IMM32(*builder, ir->pc + 4,
                              t2c_gen_PC_addr(start, builder, ir));
@@ -1540,17 +1535,17 @@ T2C_OP(fuse6, {
     LLVMBuildRetVoid(*builder);
 })
 #else
-/* RV32E stub: fuse6 pattern is never generated for RV32E.
- * Defensive fallback - return void if unexpectedly reached.
+/* RV32E stub：RV32E 下不会生成 fuse6 模式。
+ * 防御性回退：如果意外到达，直接返回 void。
  */
 T2C_OP(fuse6, {
-    assert(!"fuse6 should not be called in RV32E mode");
+    assert(!"RV32E 模式不应调用 fuse6");
     T2C_STORE_TIMER(*builder, start, insn_counter);
     LLVMBuildRetVoid(*builder);
 })
 #endif
 
-/* fused multiple ADDI */
+/* 融合多条 ADDI。 */
 T2C_OP(fuse7, {
     opcode_fuse_t *fuse = ir->fuse;
     for (int i = 0; i < ir->imm2; i++) {
@@ -1575,12 +1570,11 @@ T2C_OP(fuse7, {
     }
 })
 
-/* fused LUI + ADDI: 32-bit constant load (li pseudo-op)
- * rd = (lui_imm << 12) + addi_imm = ir->imm + ir->imm2
+/* 融合 LUI + ADDI：加载 32 位常量（li 伪指令）。
+ * rd = (lui_imm << 12) + addi_imm = ir->imm + ir->imm2。
  */
 T2C_OP(fuse8, {
-    /* Compute combined immediate and store to rd.
-     * Cast to uint32_t to avoid signed overflow UB.
+    /* 计算合并后的立即数并写入 rd。转为 uint32_t 可避免有符号溢出 UB。
      */
     uint32_t combined_imm = (uint32_t) ir->imm + (uint32_t) ir->imm2;
     LLVMValueRef rd_offset = LLVMConstInt(
@@ -1592,9 +1586,9 @@ T2C_OP(fuse8, {
                    addr_rd);
 })
 
-/* fused LUI + LW: absolute address load
- * addr = ir->imm (lui << 12) + ir->imm2 (lw offset)
- * ir->rs2 = destination register for load
+/* 融合 LUI + LW：绝对地址加载。
+ * addr = ir->imm（lui << 12）+ ir->imm2（lw 偏移）。
+ * ir->rs2 是加载目的寄存器。
  */
 T2C_OP(fuse9, {
     IIF(RV32_HAS(SYSTEM))(
@@ -1611,9 +1605,9 @@ T2C_OP(fuse9, {
         });
 })
 
-/* fused LUI + SW: absolute address store
- * addr = ir->imm (lui << 12) + ir->imm2 (sw offset)
- * ir->rs1 = source register for store
+/* 融合 LUI + SW：绝对地址存储。
+ * addr = ir->imm（lui << 12）+ ir->imm2（sw 偏移）。
+ * ir->rs1 是存储源寄存器。
  */
 T2C_OP(fuse10, {
     IIF(RV32_HAS(SYSTEM))(
@@ -1630,14 +1624,13 @@ T2C_OP(fuse10, {
         });
 })
 
-/* fused LW + ADDI (post-increment load)
- * addr = rv->X[ir->rs1] + ir->imm
- * ir->rd = load destination
- * ir->rs1 += ir->imm2 (increment)
+/* 融合 LW + ADDI（后递增加载）。
+ * addr = rv->X[ir->rs1] + ir->imm。
+ * ir->rd = 加载目的寄存器。
+ * ir->rs1 += ir->imm2（递增）。
  *
- * Note: Pattern matching in match_pattern() requires rd != rs1 to avoid
- * clobbering the base register before use in the increment. This lets us
- * safely use the original rs1 value for the post-increment.
+ * 注意：match_pattern() 要求 rd != rs1，以免在递增前覆盖基址寄存器。这样就能安全
+ * 使用原始 rs1 值执行后递增。
  */
 T2C_OP(fuse11, {
     IIF(RV32_HAS(SYSTEM))(
@@ -1645,33 +1638,32 @@ T2C_OP(fuse11, {
         {
             LLVMValueRef addr_rs1 = t2c_gen_rs1_addr(start, builder, ir);
             T2C_LLVM_GEN_LOAD_VMREG(rs1, 32, addr_rs1);
-            /* Compute address and load */
+            /* 计算地址并加载。 */
             LLVMValueRef mem_loc =
                 t2c_gen_mem_loc(start, builder, ir, mem_base);
             LLVMValueRef res =
                 LLVMBuildLoad2(*builder, LLVMInt32Type(), mem_loc, "res");
             LLVMBuildStore(*builder, res, t2c_gen_rd_addr(start, builder, ir));
-            /* Increment rs1 by imm2 (rd != rs1 guaranteed by fusion constraint)
-             */
+            /* rs1 按 imm2 递增，融合约束保证 rd != rs1。 */
             LLVMValueRef inc_val =
                 T2C_LLVM_GEN_ALU32_IMM(Add, val_rs1, ir->imm2);
             LLVMBuildStore(*builder, inc_val, addr_rs1);
         });
 })
 
-/* fused ADDI + BNE (loop counter decrement-branch)
- * rd = rs1 + imm
- * if rd != 0, branch to PC + 4 + imm2
+/* 融合 ADDI + BNE（循环计数递减并分支）。
+ * rd = rs1 + imm。
+ * 如果 rd != 0，则跳转到 PC + 4 + imm2。
  */
 T2C_OP(fuse12, {
     LLVMValueRef addr_PC = t2c_gen_PC_addr(start, builder, ir);
-    /* Compute rd = rs1 + imm */
+    /* 计算 rd = rs1 + imm。 */
     T2C_LLVM_GEN_LOAD_VMREG(rs1, 32, t2c_gen_rs1_addr(start, builder, ir));
     LLVMValueRef res = T2C_LLVM_GEN_ALU32_IMM(Add, val_rs1, ir->imm);
     LLVMBuildStore(*builder, res, t2c_gen_rd_addr(start, builder, ir));
-    /* Compare rd with 0 */
+    /* 比较 rd 与 0。 */
     T2C_LLVM_GEN_CMP_IMM32(NE, res, 0);
-    /* Create taken and untaken branches */
+    /* 创建 taken 和 untaken 分支。 */
     LLVMBasicBlockRef taken = LLVMAppendBasicBlock(start, "taken");
     LLVMBuilderRef builder2 = LLVMCreateBuilder();
     LLVMPositionBuilderAtEnd(builder2, taken);
@@ -1679,7 +1671,7 @@ T2C_OP(fuse12, {
         t2c_check_valid_blk(rv, block, ir->branch_taken->pc)) {
         *taken_builder = builder2;
     } else {
-        /* PC = ir->pc + 4 + ir->imm2 (ADDI is 4 bytes, then branch offset) */
+        /* PC = ir->pc + 4 + ir->imm2；ADDI 4 字节，随后加分支偏移。 */
         T2C_LLVM_GEN_STORE_IMM32(builder2, ir->pc + 4 + ir->imm2, addr_PC);
         T2C_STORE_TIMER(builder2, start, insn_counter);
         LLVMBuildRetVoid(builder2);
@@ -1691,7 +1683,7 @@ T2C_OP(fuse12, {
         t2c_check_valid_blk(rv, block, ir->branch_untaken->pc)) {
         *untaken_builder = builder3;
     } else {
-        /* PC = ir->pc + 8 (skip both ADDI and BNE, each 4 bytes) */
+        /* PC = ir->pc + 8；跳过 ADDI 和 BNE，两条各 4 字节。 */
         T2C_LLVM_GEN_STORE_IMM32(builder3, ir->pc + 8, addr_PC);
         T2C_STORE_TIMER(builder3, start, insn_counter);
         LLVMBuildRetVoid(builder3);

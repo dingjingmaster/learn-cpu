@@ -1,6 +1,6 @@
-# WebAssembly build configuration
+# WebAssembly 构建配置
 #
-# Provides Emscripten-specific build flags and targets.
+# 提供 Emscripten 专用编译参数和运行目标。
 
 ifndef _MK_WASM_INCLUDED
 _MK_WASM_INCLUDED := 1
@@ -18,23 +18,23 @@ WEB_FILES := $(BIN).js \
              $(BIN).worker.js \
              $(OUT)/elf_list.js
 
-# Only configure Emscripten settings when using emcc
+# 仅在使用 emcc 时配置 Emscripten 相关选项。
 ifeq ("$(CC_IS_EMCC)", "1")
 
 BIN := $(BIN).js
 
-# Tail-call optimization
+# 尾调用优化；解释器调度依赖该能力。
 CFLAGS += -mtail-call
 
-# SDL configuration for Emscripten
+# Emscripten 的 SDL 配置。
 ifeq ($(CONFIG_SDL),y)
-# Disable STRICT mode to avoid -Werror in SDL2_mixer port compilation
+# 关闭 STRICT，避免 SDL2_mixer 端口编译时被 -Werror 中断。
 CFLAGS_emcc += -sSTRICT=0 -sUSE_SDL=2 -sSDL2_MIXER_FORMATS=wav,mid -sUSE_SDL_MIXER=2
 OBJS_EXT += syscall_sdl.o
 LDFLAGS += -pthread
 endif
 
-# Emscripten build flags
+# Emscripten 构建参数。
 CFLAGS_emcc += -sINITIAL_MEMORY=2GB \
                -sALLOW_MEMORY_GROWTH \
                -s"EXPORTED_FUNCTIONS=$(EXPORTED_FUNCS)" \
@@ -46,7 +46,7 @@ CFLAGS_emcc += -sINITIAL_MEMORY=2GB \
                -O3 \
                -w
 
-# System mode assets
+# 系统模式资源。
 ifeq ($(CONFIG_SYSTEM),y)
 CFLAGS_emcc += --embed-file build/linux-image/Image@Image \
                --embed-file build/linux-image/rootfs.cpio@rootfs.cpio \
@@ -67,37 +67,37 @@ CFLAGS_emcc += --embed-file build/jit-bf.elf@/jit-bf.elf \
                --pre-js $(WEB_JS_RESOURCES)/user-pre.js
 endif
 
-# mimalloc support detection
+# mimalloc 支持探测。
 MIMALLOC_SUPPORT_SINCE_MAJOR := 3
 MIMALLOC_SUPPORT_SINCE_MINOR := 1
 MIMALLOC_SUPPORT_SINCE_PATCH := 50
 ifeq ($(call version_gte,$(EMCC_MAJOR),$(EMCC_MINOR),$(EMCC_PATCH),$(MIMALLOC_SUPPORT_SINCE_MAJOR),$(MIMALLOC_SUPPORT_SINCE_MINOR),$(MIMALLOC_SUPPORT_SINCE_PATCH)), 1)
     CFLAGS_emcc += -sMALLOC=mimalloc
 else
-    $(warning mimalloc requires Emscripten $(MIMALLOC_SUPPORT_SINCE_MAJOR).$(MIMALLOC_SUPPORT_SINCE_MINOR).$(MIMALLOC_SUPPORT_SINCE_PATCH)+)
+    $(warning mimalloc 需要 Emscripten $(MIMALLOC_SUPPORT_SINCE_MAJOR).$(MIMALLOC_SUPPORT_SINCE_MINOR).$(MIMALLOC_SUPPORT_SINCE_PATCH)+)
 endif
 
-# ELF list generator
+# ELF 列表生成器。
 $(OUT)/elf_list.js: artifact tools/gen-elf-list-js.py
 	$(Q)tools/gen-elf-list-js.py > $@
 
-# Dependencies for WASM build
-# System mode only needs artifact (linux-image) and timidity (audio)
-# User mode needs elf_list.js for demo selection and game data for embedding
+# WASM 构建依赖。
+# 系统模式只需要 artifact（linux-image）和 timidity（音频）。
+# 用户模式还需要 elf_list.js 供 demo 选择，并嵌入游戏数据。
 ifeq ($(CONFIG_SYSTEM),y)
 deps_emcc += artifact $(TIMIDITY_DATA)
 else
 deps_emcc += artifact $(OUT)/elf_list.js $(DOOM_DATA) $(QUAKE_DATA) $(TIMIDITY_DATA)
 endif
 
-# Browser TCO Support Detection
+# 浏览器 TCO 支持探测。
 
 CHROME_SUPPORT_TCO_AT_MAJOR := 112
 FIREFOX_SUPPORT_TCO_AT_MAJOR := 121
 SAFARI_SUPPORT_TCO_AT_MAJOR := 18
 SAFARI_SUPPORT_TCO_AT_MINOR := 2
 
-# Browser detection (platform-specific)
+# 浏览器探测（平台相关）。
 ifeq ($(UNAME_S),Darwin)
     CHROME_MAJOR := $(shell "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version 2>/dev/null | awk '{print $$3}' | cut -f1 -d.)
     FIREFOX_MAJOR := $(shell /Applications/Firefox.app/Contents/MacOS/firefox --version 2>/dev/null | awk '{print $$3}' | cut -f1 -d.)
@@ -107,24 +107,24 @@ else ifeq ($(UNAME_S),Linux)
     FIREFOX_MAJOR := $(shell firefox -v 2>/dev/null | awk '{print $$3}' | cut -f1 -d.)
 endif
 
-# Browser support notifications
+# 浏览器支持提示。
 ifneq ($(CHROME_MAJOR),)
 ifeq ($(call version_gte,$(CHROME_MAJOR),,,$(CHROME_SUPPORT_TCO_AT_MAJOR),,), 1)
-    $(info $(call noticex, Chrome $(CHROME_MAJOR) supports TCO))
+    $(info $(call noticex, Chrome $(CHROME_MAJOR) 支持 TCO))
 else
-    $(warning Chrome $(CHROME_MAJOR) does not support TCO (requires $(CHROME_SUPPORT_TCO_AT_MAJOR)+))
+    $(warning Chrome $(CHROME_MAJOR) 不支持 TCO（需要 $(CHROME_SUPPORT_TCO_AT_MAJOR)+）)
 endif
 endif
 
 ifneq ($(FIREFOX_MAJOR),)
 ifeq ($(call version_gte,$(FIREFOX_MAJOR),,,$(FIREFOX_SUPPORT_TCO_AT_MAJOR),,), 1)
-    $(info $(call noticex, Firefox $(FIREFOX_MAJOR) supports TCO))
+    $(info $(call noticex, Firefox $(FIREFOX_MAJOR) 支持 TCO))
 else
-    $(warning Firefox $(FIREFOX_MAJOR) does not support TCO (requires $(FIREFOX_SUPPORT_TCO_AT_MAJOR)+))
+    $(warning Firefox $(FIREFOX_MAJOR) 不支持 TCO（需要 $(FIREFOX_SUPPORT_TCO_AT_MAJOR)+）)
 endif
 endif
 
-# Web Demo Server
+# Web demo 服务器。
 
 DEMO_IP := 127.0.0.1
 DEMO_PORT := 8000

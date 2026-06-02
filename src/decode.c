@@ -3,13 +3,21 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * RISC-V 指令解码器。
+ *
+ * 本文件把 32 位基础/扩展指令和 16 位 RVC 压缩指令转换为统一的 rv_insn_t
+ * 内部表示。解码阶段会完成字段抽取、立即数重排、符号扩展和 opcode 分类，
+ * 让解释器和 JIT 不必重复理解原始指令编码。
+ */
+
 #include <assert.h>
 #include <stdlib.h>
 
 #include "decode.h"
 #include "riscv_private.h"
 
-/* decode rd field
+/* 解码 rd 字段。
  * rd = insn[11:7]
  */
 static inline uint32_t decode_rd(const uint32_t insn)
@@ -17,7 +25,7 @@ static inline uint32_t decode_rd(const uint32_t insn)
     return (insn & FR_RD) >> 7;
 }
 
-/* decode rs1 field.
+/* 解码 rs1 字段。
  * rs1 = insn[19:15]
  */
 static inline uint32_t decode_rs1(const uint32_t insn)
@@ -25,7 +33,7 @@ static inline uint32_t decode_rs1(const uint32_t insn)
     return (insn & FR_RS1) >> 15;
 }
 
-/* decode rs2 field.
+/* 解码 rs2 字段。
  * rs2 = insn[24:20]
  */
 static inline uint32_t decode_rs2(const uint32_t insn)
@@ -33,7 +41,7 @@ static inline uint32_t decode_rs2(const uint32_t insn)
     return (insn & FR_RS2) >> 20;
 }
 
-/* decoded funct3 field.
+/* 解码 funct3 字段。
  * funct3 = insn[14:12]
  */
 static inline uint32_t decode_funct3(const uint32_t insn)
@@ -41,7 +49,7 @@ static inline uint32_t decode_funct3(const uint32_t insn)
     return (insn & FR_FUNCT3) >> 12;
 }
 
-/* decode funct7 field.
+/* 解码 funct7 字段。
  * funct7 = insn[31:25]
  */
 static inline uint32_t decode_funct7(const uint32_t insn)
@@ -49,7 +57,7 @@ static inline uint32_t decode_funct7(const uint32_t insn)
     return (insn & FR_FUNCT7) >> 25;
 }
 
-/* decode U-type instruction immediate.
+/* 解码 U-type 指令立即数。
  * imm[31:12] = insn[31:12]
  */
 static inline uint32_t decode_utype_imm(const uint32_t insn)
@@ -57,7 +65,7 @@ static inline uint32_t decode_utype_imm(const uint32_t insn)
     return insn & FU_IMM_31_12;
 }
 
-/* decode J-type instruction immediate.
+/* 解码 J-type 指令立即数。
  * imm[20|10:1|11|19:12] = insn[31|30:21|20|19:12]
  */
 static inline int32_t decode_jtype_imm(const uint32_t insn)
@@ -67,11 +75,11 @@ static inline int32_t decode_jtype_imm(const uint32_t insn)
     dst |= (insn & FJ_IMM_19_12) << 11;
     dst |= (insn & FJ_IMM_11) << 2;
     dst |= (insn & FJ_IMM_10_1) >> 9;
-    /* NOTE: shifted to 2nd least significant bit */
+    /* NOTE：这里移动到次低有效位，最低位按 RISC-V 规则固定为 0。 */
     return ((int32_t) dst) >> 11;
 }
 
-/* decode I-type instruction immediate.
+/* 解码 I-type 指令立即数。
  * imm[11:0] = insn[31:20]
  */
 static inline int32_t decode_itype_imm(const uint32_t insn)
@@ -79,7 +87,7 @@ static inline int32_t decode_itype_imm(const uint32_t insn)
     return ((int32_t) (insn & FI_IMM_11_0)) >> 20;
 }
 
-/* decode B-type instruction immediate.
+/* 解码 B-type 指令立即数。
  * imm[12] = insn[31]
  * imm[11] = insn[7]
  * imm[10:5] = insn[30:25]
@@ -92,11 +100,11 @@ static inline int32_t decode_btype_imm(const uint32_t insn)
     dst |= (insn & FB_IMM_11) << 23;
     dst |= (insn & FB_IMM_10_5) >> 1;
     dst |= (insn & FB_IMM_4_1) << 12;
-    /* NOTE: shifted to 2nd least significant bit */
+    /* NOTE：这里移动到次低有效位，最低位按 RISC-V 规则固定为 0。 */
     return ((int32_t) dst) >> 19;
 }
 
-/* decode S-type instruction immediate.
+/* 解码 S-type 指令立即数。
  * imm[11:5] = insn[31:25]
  * imm[4:0] = insn[11:7]
  */
@@ -109,7 +117,7 @@ static inline int32_t decode_stype_imm(const uint32_t insn)
 }
 
 #if RV32_HAS(EXT_F)
-/* decode R4-type rs3 field
+/* 解码 R4-type 的 rs3 字段。
  * rs3 = inst[31:27]
  */
 static inline uint32_t decode_r4type_rs3(const uint32_t insn)
@@ -136,7 +144,7 @@ enum {
     /* clang-format on */
 };
 
-/* decode rs1 field
+/* 解码 rs1 字段。
  * rs1 = inst[11:7]
  */
 static inline uint16_t c_decode_rs1(const uint16_t insn)
@@ -144,7 +152,7 @@ static inline uint16_t c_decode_rs1(const uint16_t insn)
     return (uint16_t) ((insn & FC_RS1) >> 7U);
 }
 
-/* decode rs2 field
+/* 解码 rs2 字段。
  * rs2 = inst[6:2]
  */
 static inline uint16_t c_decode_rs2(const uint16_t insn)
@@ -152,7 +160,7 @@ static inline uint16_t c_decode_rs2(const uint16_t insn)
     return (uint16_t) ((insn & FC_RS2) >> 2U);
 }
 
-/* decode rd field
+/* 解码 rd 字段。
  * rd = inst[11:7]
  */
 static inline uint16_t c_decode_rd(const uint16_t insn)
@@ -160,7 +168,7 @@ static inline uint16_t c_decode_rd(const uint16_t insn)
     return (uint16_t) ((insn & FC_RD) >> 7U);
 }
 
-/* decode rs1' field
+/* 解码 rs1' 字段。
  * rs1' = inst[9:7]
  */
 static inline uint16_t c_decode_rs1c(const uint16_t insn)
@@ -168,7 +176,7 @@ static inline uint16_t c_decode_rs1c(const uint16_t insn)
     return (uint16_t) ((insn & FC_RS1C) >> 7U);
 }
 
-/* decode rs2' field
+/* 解码 rs2' 字段。
  * rs2' = inst[4:2]
  */
 static inline uint16_t c_decode_rs2c(const uint16_t insn)
@@ -176,7 +184,7 @@ static inline uint16_t c_decode_rs2c(const uint16_t insn)
     return (uint16_t) ((insn & FC_RS2C) >> 2U);
 }
 
-/* decode rd' field
+/* 解码 rd' 字段。
  * rd' = inst[4:2]
  */
 static inline uint16_t c_decode_rdc(const uint16_t insn)
@@ -184,7 +192,7 @@ static inline uint16_t c_decode_rdc(const uint16_t insn)
     return (uint16_t) ((insn & FC_RDC) >> 2U);
 }
 
-/* decode C.ADDI4SPN nzuimm field
+/* 解码 C.ADDI4SPN 的 nzuimm 字段。
  * nzuimm[5:4|9:6|2|3] = inst[]
  */
 static inline uint16_t c_decode_caddi4spn_nzuimm(const uint16_t insn)
@@ -197,7 +205,7 @@ static inline uint16_t c_decode_caddi4spn_nzuimm(const uint16_t insn)
     return tmp;
 }
 
-/* decode C.ADDI16SP nzimm field
+/* 解码 C.ADDI16SP 的 nzimm 字段。
  * nzimm[9] = inst[12]
  * nzimm[4|6|8:7|5] = inst[6:2]
  */
@@ -211,7 +219,7 @@ static inline int32_t c_decode_caddi16sp_nzimm(const uint16_t insn)
     return (tmp & 0x200) ? (0xfffffc00 | tmp) : (uint32_t) tmp;
 }
 
-/* decode C.LUI nzimm field
+/* 解码 C.LUI 的 nzimm 字段。
  * nzimm[17] = inst[12]
  * nzimm[16:12] = inst[6:2]
  */
@@ -231,7 +239,7 @@ static inline int32_t c_decode_caddi_imm(const uint16_t insn)
     return sign_extend_h(tmp);
 }
 
-/* decode CI-Format instruction immediate
+/* 解码 CI 格式指令立即数。
  * imm[5] = inst[12]
  * imm[4:0] = inst[6:2]
  */
@@ -241,7 +249,7 @@ static inline int32_t c_decode_citype_imm(const uint16_t insn)
     return (tmp & 0x20) ? (int32_t) (0xffffffc0 | tmp) : (int32_t) tmp;
 }
 
-/* decode CJ-format instruction immediate
+/* 解码 CJ 格式指令立即数。
  * imm[11] = inst[12]
  * imm[10] = inst[8]
  * imm[9:8] = inst[10:9]
@@ -266,11 +274,11 @@ static inline int32_t c_decode_cjtype_imm(const uint16_t insn)
     for (int i = 1; i <= 4; ++i)
         tmp |= (0x0800 & tmp) << i;
 
-    /* extend to 16 bit */
+    /* 扩展到 16 位。 */
     return (int32_t) (int16_t) tmp;
 }
 
-/* decode CB-format shamt field
+/* 解码 CB 格式 shamt 字段。
  * shamt[5] = inst[12]
  * shamt[4:0] = inst[6:2]
  */
@@ -282,7 +290,7 @@ static inline uint8_t c_decode_cbtype_shamt(const uint16_t insn)
     return tmp;
 }
 
-/* decode CB-format instruction immediate
+/* 解码 CB 格式指令立即数。
  * imm[8] = inst[12]
  * imm[7:6] = inst[6:5]
  * imm[4:3] = inst[11:10]
@@ -299,7 +307,7 @@ static inline uint16_t c_decode_cbtype_imm(const uint16_t insn)
     tmp |= (insn & 0b0000000001100000) << 1;
     tmp |= (insn & 0b0001000000000000) >> 4;
 
-    /* extend to 16 bit */
+    /* 扩展到 16 位。 */
     for (int i = 1; i <= 8; ++i)
         tmp |= (0x0100 & tmp) << i;
     return tmp;
@@ -402,27 +410,27 @@ static inline bool op_load(rv_insn_t *ir, const uint32_t insn)
      * LWU  imm[11:0] rs1 110    rd 0000011
      */
 
-    /* decode I-type */
+    /* 解码 I-type。 */
     decode_itype(ir, insn);
 
-    /* dispatch from funct3 field */
+    /* 根据 funct3 字段分派。 */
     switch (decode_funct3(insn)) {
-    case 0: /* LB: Load Byte */
+    case 0: /* LB：加载字节。 */
         ir->opcode = rv_insn_lb;
         break;
-    case 1: /* LH: Load Halfword */
+    case 1: /* LH：加载半字。 */
         ir->opcode = rv_insn_lh;
         break;
-    case 2: /* LW: Load Word */
+    case 2: /* LW：加载字。 */
         ir->opcode = rv_insn_lw;
         break;
-    case 4: /* LBU: Load Byte Unsigned */
+    case 4: /* LBU：无符号加载字节。 */
         ir->opcode = rv_insn_lbu;
         break;
-    case 5: /* LHU: Load Halfword Unsigned */
+    case 5: /* LHU：无符号加载半字。 */
         ir->opcode = rv_insn_lhu;
         break;
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
     return true;
@@ -447,23 +455,23 @@ static inline bool op_op_imm(rv_insn_t *ir, const uint32_t insn)
      * ANDI  imm[11:0]            rs1 111    rd 0010011
      */
 
-    /* decode I-type */
+    /* 解码 I-type。 */
     decode_itype(ir, insn);
 
-    /* nop can be implemented as "addi x0, x0, 0".
-     * Any integer computational instruction writing into "x0" is NOP.
+    /* nop 可实现为 "addi x0, x0, 0"。
+     * 任何写入 "x0" 的整数计算指令都等价于 NOP。
      */
     if (unlikely(ir->rd == rv_reg_zero)) {
         ir->opcode = rv_insn_nop;
         return true;
     }
 
-    /* dispatch from funct3 field */
+    /* 根据 funct3 字段分派。 */
     switch (decode_funct3(insn)) {
-    case 0: /* ADDI: Add Immediate */
+    case 0: /* ADDI：立即数加法。 */
         ir->opcode = rv_insn_addi;
         break;
-    case 1: /* SLLI: Shift Left Logical */
+    case 1: /* SLLI：立即数逻辑左移。 */
 #if RV32_HAS(Zbb)
         if (ir->imm == 0b011000000000) { /* clz */
             ir->opcode = rv_insn_clz;
@@ -504,13 +512,13 @@ static inline bool op_op_imm(rv_insn_t *ir, const uint32_t insn)
         if (unlikely(ir->imm & (1 << 5)))
             return false;
         break;
-    case 2: /* SLTI: Set on Less Than Immediate */
+    case 2: /* SLTI：有符号小于立即数则置位。 */
         ir->opcode = rv_insn_slti;
         break;
-    case 3: /* SLTIU: Set on Less Than Immediate Unsigned */
+    case 3: /* SLTIU：无符号小于立即数则置位。 */
         ir->opcode = rv_insn_sltiu;
         break;
-    case 4: /* XORI: Exclusive OR Immediate */
+    case 4: /* XORI：立即数异或。 */
         ir->opcode = rv_insn_xori;
         break;
     case 5:
@@ -534,22 +542,21 @@ static inline bool op_op_imm(rv_insn_t *ir, const uint32_t insn)
             return true;
         }
 #endif
-        /* SLL, SRL, and SRA perform logical left, logical right, and
-         * arithmetic right shifts on the value in register rs1.
+        /* SLL、SRL 和 SRA 分别对寄存器 rs1 的值执行逻辑左移、逻辑右移和算术右移。
          */
         ir->opcode = (ir->imm & ~0x1f)
-                         ? rv_insn_srai  /* SRAI: Shift Right Arithmetic */
-                         : rv_insn_srli; /* SRLI: Shift Right Logical */
+                         ? rv_insn_srai  /* SRAI：算术右移。 */
+                         : rv_insn_srli; /* SRLI：逻辑右移。 */
         if (unlikely(ir->imm & (1 << 5)))
             return false;
         break;
-    case 6: /* ORI: OR Immediate */
+    case 6: /* ORI：立即数或。 */
         ir->opcode = rv_insn_ori;
         break;
-    case 7: /* ANDI: AND Immediate */
+    case 7: /* ANDI：立即数与。 */
         ir->opcode = rv_insn_andi;
         break;
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
     return true;
@@ -566,10 +573,10 @@ static inline bool op_auipc(rv_insn_t *ir, const uint32_t insn)
      * AUPIC imm[31:12] rd 0010111
      */
 
-    /* decode U-type */
+    /* 解码 U-type。 */
     decode_utype(ir, insn);
 
-    /* Any integer computational instruction writing into "x0" is NOP. */
+    /* 任何写入 "x0" 的整数计算指令都等价于 NOP。 */
     if (unlikely(ir->rd == rv_reg_zero)) {
         ir->opcode = rv_insn_nop;
         return true;
@@ -593,21 +600,21 @@ static inline bool op_store(rv_insn_t *ir, const uint32_t insn)
      * SD   imm[11:5] rs2 rs1 011    imm[4:0] 0100011
      */
 
-    /* decode S-type */
+    /* 解码 S-type。 */
     decode_stype(ir, insn);
 
-    /* dispatch from funct3 field */
+    /* 根据 funct3 字段分派。 */
     switch (decode_funct3(insn)) {
-    case 0: /* SB: Store Byte */
+    case 0: /* SB：存储字节。 */
         ir->opcode = rv_insn_sb;
         break;
-    case 1: /* SH: Store Halfword */
+    case 1: /* SH：存储半字。 */
         ir->opcode = rv_insn_sh;
         break;
-    case 2: /* SW: Store Word */
+    case 2: /* SW：存储字。 */
         ir->opcode = rv_insn_sw;
         break;
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
     return true;
@@ -633,10 +640,10 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
      * AND  0000000 rs2 rs1 111    rd 0110011
      */
 
-    /* decode R-type */
+    /* 解码 R-type。 */
     decode_rtype(ir, insn);
 
-    /* nop can be implemented as "add x0, x1, x2" */
+    /* nop 可实现为 "add x0, x1, x2"。 */
     if (unlikely(ir->rd == rv_reg_zero)) {
         ir->opcode = rv_insn_nop;
         return true;
@@ -644,26 +651,26 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
 
     uint8_t funct3 = decode_funct3(insn);
 
-    /* dispatch from funct7 field */
+    /* 根据 funct7 字段分派。 */
     switch (decode_funct7(insn)) {
     case 0b0000000:
         switch (funct3) {
         case 0b000: /* ADD */
             ir->opcode = rv_insn_add;
             break;
-        case 0b001: /* SLL: Shift Left Logical */
+        case 0b001: /* SLL：逻辑左移。 */
             ir->opcode = rv_insn_sll;
             break;
-        case 0b010: /* SLT: Set on Less Than */
+        case 0b010: /* SLT：有符号小于则置位。 */
             ir->opcode = rv_insn_slt;
             break;
-        case 0b011: /* SLTU: Set on Less Than Unsigned */
+        case 0b011: /* SLTU：无符号小于则置位。 */
             ir->opcode = rv_insn_sltu;
             break;
-        case 0b100: /* XOR: Exclusive OR */
+        case 0b100: /* XOR：按位异或。 */
             ir->opcode = rv_insn_xor;
             break;
-        case 0b101: /* SRL: Shift Right Logical */
+        case 0b101: /* SRL：逻辑右移。 */
             ir->opcode = rv_insn_srl;
             break;
         case 0b110: /* OR */
@@ -672,7 +679,7 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
         case 0b111: /* AND */
             ir->opcode = rv_insn_and;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
@@ -689,33 +696,33 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
      * REM    0000001 rs2 rs1 110    rd 0110011
      * REMU   0000001 rs2 rs1 111    rd 0110011
      */
-    case 0b0000001: /* RV32M instructions */
+    case 0b0000001: /* RV32M 指令。 */
         switch (funct3) {
-        case 0b000: /* MUL: Multiply */
+        case 0b000: /* MUL：乘法。 */
             ir->opcode = rv_insn_mul;
             break;
-        case 0b001: /* MULH: Multiply High Signed Signed */
+        case 0b001: /* MULH：有符号 x 有符号乘法高位。 */
             ir->opcode = rv_insn_mulh;
             break;
-        case 0b010: /* MULHSU: Multiply High Signed Unsigned */
+        case 0b010: /* MULHSU：有符号 x 无符号乘法高位。 */
             ir->opcode = rv_insn_mulhsu;
             break;
-        case 0b011: /* MULHU: Multiply High Unsigned Unsigned */
+        case 0b011: /* MULHU：无符号 x 无符号乘法高位。 */
             ir->opcode = rv_insn_mulhu;
             break;
-        case 0b100: /* DIV: Divide Signed */
+        case 0b100: /* DIV：有符号除法。 */
             ir->opcode = rv_insn_div;
             break;
-        case 0b101: /* DIVU: Divide Unsigned */
+        case 0b101: /* DIVU：无符号除法。 */
             ir->opcode = rv_insn_divu;
             break;
-        case 0b110: /* REM: Remainder Signed */
+        case 0b110: /* REM：有符号取余。 */
             ir->opcode = rv_insn_rem;
             break;
-        case 0b111: /* REMU: Remainder Unsigned */
+        case 0b111: /* REMU：无符号取余。 */
             ir->opcode = rv_insn_remu;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
@@ -739,7 +746,7 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
         case 0b110: /* sh3add */
             ir->opcode = rv_insn_sh3add;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
@@ -782,7 +789,7 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
             ir->opcode = rv_insn_clmulr;
             break;
 #endif
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
@@ -796,7 +803,7 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
         case 0b101: /* ror */
             ir->opcode = rv_insn_ror;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
@@ -816,7 +823,7 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
         case 0b101: /* bext */
             ir->opcode = rv_insn_bext;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
@@ -834,10 +841,10 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
 
     case 0b0100000:
         switch (funct3) {
-        case 0b000: /* SUB: Substract */
+        case 0b000: /* SUB：减法。 */
             ir->opcode = rv_insn_sub;
             break;
-        case 0b101: /* SRA: Shift Right Arithmetic */
+        case 0b101: /* SRA：算术右移。 */
             ir->opcode = rv_insn_sra;
             break;
 #if RV32_HAS(Zbb)
@@ -852,11 +859,11 @@ static inline bool op_op(rv_insn_t *ir, const uint32_t insn)
             break;
 #endif /* RV32_HAS(Zbb) */
 
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
     return true;
@@ -873,10 +880,10 @@ static inline bool op_lui(rv_insn_t *ir, const uint32_t insn)
      * LUI  imm[31:12] rd 0110111
      */
 
-    /* decode U-type */
+    /* 解码 U-type。 */
     decode_utype(ir, insn);
 
-    /* Any integer computational instruction writing into "x0" is NOP. */
+    /* 任何写入 "x0" 的整数计算指令都等价于 NOP。 */
     if (unlikely(ir->rd == rv_reg_zero)) {
         ir->opcode = rv_insn_nop;
         return true;
@@ -902,30 +909,30 @@ static inline bool op_branch(rv_insn_t *ir, const uint32_t insn)
      * BGEU imm[12  imm[10:5] rs2 rs1 111    imm[4:1  imm[11] 1100011
      */
 
-    /* decode B-type */
+    /* 解码 B-type。 */
     decode_btype(ir, insn);
 
-    /* dispatch from funct3 field */
+    /* 根据 funct3 字段分派。 */
     switch (decode_funct3(insn)) {
-    case 0: /* BEQ: Branch if Equal */
+    case 0: /* BEQ：相等则分支。 */
         ir->opcode = rv_insn_beq;
         break;
-    case 1: /* BNE: Branch if Not Equal */
+    case 1: /* BNE：不相等则分支。 */
         ir->opcode = rv_insn_bne;
         break;
-    case 4: /* BLT: Branch if Less Than */
+    case 4: /* BLT：有符号小于则分支。 */
         ir->opcode = rv_insn_blt;
         break;
-    case 5: /* BGE: Branch if Greater Than */
+    case 5: /* BGE：有符号大于等于则分支。 */
         ir->opcode = rv_insn_bge;
         break;
-    case 6: /* BLTU: Branch if Less Than Unsigned */
+    case 6: /* BLTU：无符号小于则分支。 */
         ir->opcode = rv_insn_bltu;
         break;
-    case 7: /* BGEU: Branch if Greater Than Unsigned */
+    case 7: /* BGEU：无符号大于等于则分支。 */
         ir->opcode = rv_insn_bgeu;
         break;
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
     return true;
@@ -994,10 +1001,10 @@ static inline bool op_system(rv_insn_t *ir, const uint32_t insn)
      * SFENCE.VMA  0001001 rs2 rs1  000   00000  1110011
      */
 
-    /* decode I-type */
+    /* 解码 I-type。 */
     decode_itype(ir, insn);
 
-    /* dispatch from funct3 field */
+    /* 根据 funct3 字段分派。 */
     switch (decode_funct3(insn)) {
     case 0:
         if ((insn >> 25) == 0b0001001) { /* SFENCE.VMA */
@@ -1005,37 +1012,37 @@ static inline bool op_system(rv_insn_t *ir, const uint32_t insn)
             break;
         }
 
-        /* dispatch from imm field */
+        /* 根据 imm 字段分派。 */
         switch (ir->imm) {
-        case 0: /* ECALL: Environment Call */
+        case 0: /* ECALL：环境调用。 */
             ir->opcode = rv_insn_ecall;
             break;
-        case 1: /* EBREAK: Environment Break */
+        case 1: /* EBREAK：环境断点。 */
             ir->opcode = rv_insn_ebreak;
             break;
-        case 0x105: /* WFI: Wait for Interrupt */
+        case 0x105: /* WFI：等待中断。 */
             ir->opcode = rv_insn_wfi;
             break;
-        case 0x002: /* URET: return from traps in U-mode */
-        case 0x202: /* HRET: return from traps in H-mode */
-            /* illegal instruction */
+        case 0x002: /* URET：从 U-mode trap 返回。 */
+        case 0x202: /* HRET：从 H-mode trap 返回。 */
+            /* 非法指令。 */
             return false;
 #if RV32_HAS(SYSTEM)
-        case 0x102: /* SRET: return from traps in S-mode */
+        case 0x102: /* SRET：从 S-mode trap 返回。 */
             ir->opcode = rv_insn_sret;
             break;
 #endif
         case 0x302: /* MRET */
             ir->opcode = rv_insn_mret;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
 
 #if RV32_HAS(Zicsr)
-    /* All CSR instructions atomically read-modify-write a single CSR.
-     * Register operand
+    /* 所有 CSR 指令都会对单个 CSR 执行原子读-改-写。
+     * 寄存器操作数
      * ---------------------------------------------------------
      * Instruction         rd          rs1        Read    Write
      * -------------------+-----------+----------+-------+------
@@ -1044,7 +1051,7 @@ static inline bool op_system(rv_insn_t *ir, const uint32_t insn)
      * CSRRS/C             -           x0         yes     no
      * CSRRS/C             -           !x0        yes     yes
      *
-     * Immediate operand
+     * 立即数操作数
      * --------------------------------------------------------
      * Instruction         rd          uimm       Read    Write
      * -------------------+-----------+----------+-------+------
@@ -1063,13 +1070,13 @@ static inline bool op_system(rv_insn_t *ir, const uint32_t insn)
      * CSRRSI csr       uimm 110    rd 1110011
      * CSRRCI csr       uimm 111    rd 1110011
      */
-    case 1: /* CSRRW: Atomic Read/Write CSR */
+    case 1: /* CSRRW：原子读写 CSR。 */
         ir->opcode = rv_insn_csrrw;
         break;
-    case 2: /* CSRRS: Atomic Read and Set Bits in CSR */
+    case 2: /* CSRRS：原子读取 CSR 并置位。 */
         ir->opcode = rv_insn_csrrs;
         break;
-    case 3: /* CSRRC: Atomic Read and Clear Bits in CSR */
+    case 3: /* CSRRC：原子读取 CSR 并清位。 */
         ir->opcode = rv_insn_csrrc;
         break;
     case 5: /* CSRRWI */
@@ -1083,7 +1090,7 @@ static inline bool op_system(rv_insn_t *ir, const uint32_t insn)
         break;
 #endif /* RV32_HAS(Zicsr) */
 
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
 
@@ -1140,39 +1147,39 @@ static inline bool op_amo(rv_insn_t *ir, const uint32_t insn)
      * AMOMAXU.W 11100  aq rl rs2   rs1 010    rd  0101111
      */
 
-    /* decode R-type */
+    /* 解码 R-type。 */
     decode_rtype(ir, insn);
 
-    /* compute funct5 field */
+    /* 计算 funct5 字段。 */
     const uint32_t funct5 = (decode_funct7(insn) >> 2) & 0x1f;
 
-    /* dispatch from funct5 field */
+    /* 根据 funct5 字段分派。 */
     switch (funct5) {
-    case 0b00010: /* LR.W: Load Reserved */
+    case 0b00010: /* LR.W：保留加载。 */
         ir->opcode = rv_insn_lrw;
         break;
-    case 0b00011: /* SC.W: Store Conditional */
+    case 0b00011: /* SC.W：条件存储。 */
         ir->opcode = rv_insn_scw;
         break;
-    case 0b00001: /* AMOSWAP.W: Atomic Swap */
+    case 0b00001: /* AMOSWAP.W：原子交换。 */
         ir->opcode = rv_insn_amoswapw;
         break;
-    case 0b00000: /* AMOADD.W: Atomic ADD */
+    case 0b00000: /* AMOADD.W：原子加。 */
         ir->opcode = rv_insn_amoaddw;
         break;
-    case 0b00100: /* AMOXOR.W: Atomic XOR */
+    case 0b00100: /* AMOXOR.W：原子异或。 */
         ir->opcode = rv_insn_amoxorw;
         break;
-    case 0b01100: /* AMOAND.W: Atomic AND */
+    case 0b01100: /* AMOAND.W：原子与。 */
         ir->opcode = rv_insn_amoandw;
         break;
-    case 0b01000: /* AMOOR.W: Atomic OR */
+    case 0b01000: /* AMOOR.W：原子或。 */
         ir->opcode = rv_insn_amoorw;
         break;
-    case 0b10000: /* AMOMIN.W: Atomic MIN */
+    case 0b10000: /* AMOMIN.W：原子有符号最小值。 */
         ir->opcode = rv_insn_amominw;
         break;
-    case 0b10100: /* AMOMAX.W: Atomic MAX */
+    case 0b10100: /* AMOMAX.W：原子有符号最大值。 */
         ir->opcode = rv_insn_amomaxw;
         break;
     case 0b11000: /* AMOMINU.W */
@@ -1181,7 +1188,7 @@ static inline bool op_amo(rv_insn_t *ir, const uint32_t insn)
     case 0b11100: /* AMOMAXU.W */
         ir->opcode = rv_insn_amomaxuw;
         break;
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
     return true;
@@ -1202,7 +1209,7 @@ static inline bool op_load_fp(rv_insn_t *ir, const uint32_t insn)
      * FLW  imm[11:0] rs1 010   rd 0000111
      */
 
-    /* decode I-type */
+    /* 解码 I-type。 */
     decode_itype(ir, insn);
 
     ir->opcode = rv_insn_flw;
@@ -1220,7 +1227,7 @@ static inline bool op_store_fp(rv_insn_t *ir, const uint32_t insn)
      * FSW  imm[11:5] rs2 rs1 010   imm[4:0] 0100111
      */
 
-    /* decode S-type */
+    /* 解码 S-type。 */
     decode_stype(ir, insn);
 
     ir->opcode = rv_insn_fsw;
@@ -1257,11 +1264,11 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
      * FCVT.S.WU 1101000 00001 rs1 rm  rd 1010011
      */
 
-    /* decode R-type */
+    /* 解码 R-type。 */
     ir->rm = decode_funct3(insn);
     decode_rtype(ir, insn);
 
-    /* dispatch from funct7 field */
+    /* 根据 funct7 字段分派。 */
     switch (decode_funct7(insn)) {
     case 0b0000000: /* FADD.S */
         ir->opcode = rv_insn_fadds;
@@ -1279,7 +1286,7 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
         ir->opcode = rv_insn_fsqrts;
         break;
     case 0b0010000:
-        /* dispatch from rm region */
+        /* 根据 rm 区域分派。 */
         switch (ir->rm) {
         case 0b000: /* FSGNJ.S */
             ir->opcode = rv_insn_fsgnjs;
@@ -1290,12 +1297,12 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
         case 0b010: /* FSGNJX.S */
             ir->opcode = rv_insn_fsgnjxs;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
     case 0b1100000:
-        /* dispatch from rs2 region */
+        /* 根据 rs2 区域分派。 */
         switch (ir->rs2) {
         case 0b00000: /* FCVT.W.S */
             ir->opcode = rv_insn_fcvtws;
@@ -1303,12 +1310,12 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
         case 0b00001: /* FCVT.WU.S */
             ir->opcode = rv_insn_fcvtwus;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
     case 0b0010100:
-        /* dispatch from rm region */
+        /* 根据 rm 区域分派。 */
         switch (ir->rm) {
         case 0b000: /* FMIN.S */
             ir->opcode = rv_insn_fmins;
@@ -1316,12 +1323,12 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
         case 0b001: /* FMAX.S */
             ir->opcode = rv_insn_fmaxs;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
     case 0b1110000:
-        /* dispatch from rm region */
+        /* 根据 rm 区域分派。 */
         switch (ir->rm) {
         case 0b000: /* FMV.X.W */
             ir->opcode = rv_insn_fmvxw;
@@ -1329,12 +1336,12 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
         case 0b001: /* FCLASS.S */
             ir->opcode = rv_insn_fclasss;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
     case 0b1010000:
-        /* dispatch from rm region */
+        /* 根据 rm 区域分派。 */
         switch (ir->rm) {
         case 0b010: /* FEQ.S */
             ir->opcode = rv_insn_feqs;
@@ -1345,12 +1352,12 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
         case 0b000: /* FLE.S */
             ir->opcode = rv_insn_fles;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
     case 0b1101000:
-        /* dispatch from rs2 region */
+        /* 根据 rs2 区域分派。 */
         switch (ir->rs2) {
         case 0b00000: /* FCVT.S.W */
             ir->opcode = rv_insn_fcvtsw;
@@ -1358,14 +1365,14 @@ static inline bool op_op_fp(rv_insn_t *ir, const uint32_t insn)
         case 0b00001: /* FCVT.S.WU */
             ir->opcode = rv_insn_fcvtswu;
             break;
-        default: /* illegal instruction */
+        default: /* 非法指令。 */
             return false;
         }
         break;
     case 0b1111000: /* FMV.W.X */
         ir->opcode = rv_insn_fmvwx;
         break;
-    default: /* illegal instruction */
+    default: /* 非法指令。 */
         return false;
     }
     return true;
@@ -1382,7 +1389,7 @@ static inline bool op_madd(rv_insn_t *ir, const uint32_t insn)
      * FMADD.S rs3 00  rs2 rs1 rm rd 1000011
      */
 
-    /* decode R4-type */
+    /* 解码 R4-type。 */
     decode_r4type(ir, insn);
 
     ir->opcode = rv_insn_fmadds;
@@ -1400,7 +1407,7 @@ static inline bool op_msub(rv_insn_t *ir, const uint32_t insn)
      * FMSUB.S rs3 00  rs2 rs1 rm rd 1000111
      */
 
-    /* decode R4-type */
+    /* 解码 R4-type。 */
     decode_r4type(ir, insn);
 
     ir->opcode = rv_insn_fmsubs;
@@ -1418,7 +1425,7 @@ static inline bool op_nmadd(rv_insn_t *ir, const uint32_t insn)
      * FMSUB.S rs3 00  rs2 rs1 rm rd 1001111
      */
 
-    /* decode R4-type */
+    /* 解码 R4-type。 */
     decode_r4type(ir, insn);
 
     ir->opcode = rv_insn_fnmadds;
@@ -1436,7 +1443,7 @@ static inline bool op_nmsub(rv_insn_t *ir, const uint32_t insn)
      * FMSUB.S rs3 00  rs2 rs1 rm rd 1001011
      */
 
-    /* decode R4-type */
+    /* 解码 R4-type。 */
     decode_r4type(ir, insn);
 
     ir->opcode = rv_insn_fnmsubs;
@@ -1468,13 +1475,13 @@ static inline bool op_caddi(rv_insn_t *ir, const uint32_t insn)
 
     ir->rd = c_decode_rd(insn);
 
-    /* dispatch from rd/rs1 field */
+    /* 根据 rd/rs1 字段分派。 */
     switch (ir->rd) {
     case 0: /* C.NOP */
         ir->opcode = rv_insn_cnop;
         break;
     default: /* C.ADDI */
-        /* Add 6-bit signed immediate to rds, serving as NOP for X0 register. */
+        /* 将 6 位有符号立即数加到 rds；对 X0 寄存器则作为 NOP。 */
         ir->imm = c_decode_citype_imm(insn);
         ir->opcode = rv_insn_caddi;
         break;
@@ -1496,7 +1503,7 @@ static inline bool op_caddi4spn(rv_insn_t *ir, const uint32_t insn)
     ir->imm = c_decode_caddi4spn_nzuimm(insn);
     ir->rd = c_decode_rdc(insn) | 0x08;
 
-    /* Code point: nzuimm = 0 is reserved */
+    /* 编码点：nzuimm = 0 为保留编码。 */
     if (!ir->imm)
         return false;
     ir->opcode = rv_insn_caddi4spn;
@@ -1533,14 +1540,14 @@ static inline bool op_clui(rv_insn_t *ir, const uint32_t insn)
      */
 
     ir->rd = c_decode_rd(insn);
-    /* dispatch from rd/rs1 region */
+    /* 根据 rd/rs1 区域分派。 */
     switch (ir->rd) {
-    case 0: /* Code point: rd = x0 is HINTS */
+    case 0: /* 编码点：rd = x0 表示 HINTS。 */
         ir->opcode = rv_insn_cnop;
         break;
     case 2: { /* C.ADDI16SP */
         ir->imm = c_decode_caddi16sp_nzimm(insn);
-        /* Code point: nzimm = 0 is reserved */
+        /* 编码点：nzimm = 0 为保留编码。 */
         if (!(uint32_t) ir->imm)
             return false;
         ir->opcode = rv_insn_caddi16sp;
@@ -1548,7 +1555,7 @@ static inline bool op_clui(rv_insn_t *ir, const uint32_t insn)
     }
     default: { /* C.LUI */
         ir->imm = c_decode_clui_nzimm(insn);
-        /* Code point: nzimm = 0 is reserved */
+        /* 编码点：nzimm = 0 为保留编码。 */
         if (!ir->imm)
             return false;
         ir->opcode = rv_insn_clui;
@@ -1558,7 +1565,7 @@ static inline bool op_clui(rv_insn_t *ir, const uint32_t insn)
     return true;
 }
 
-/* MISC-ALU: CB-format CA-format
+/* MISC-ALU：CB 格式和 CA 格式。
  *
  * C.SRLI C.SRAI C.ANDI: CB-format
  *  15    13     12     11    10 9        7 6            2 1  0
@@ -1583,19 +1590,19 @@ static inline bool op_cmisc_alu(rv_insn_t *ir, const uint32_t insn)
      * C.ADDW 100    1         11     rd'/rs1' 01 rs2'     01
      */
 
-    /* dispatch from funct2 field */
+    /* 根据 funct2 字段分派。 */
     uint8_t funct2 = (insn & 0x0C00) >> 10;
     switch (funct2) {
     case 0: /* C.SRLI */
         ir->shamt = c_decode_cbtype_shamt(insn);
         ir->rs1 = c_decode_rs1c(insn) | 0x08;
 
-        /* Code point: shamt[5] = 1 is reserved */
+        /* 编码点：shamt[5] = 1 为保留编码。 */
         if (ir->shamt & 0x20)
             return false;
 
-        /* Code point: rd = x0 is HINTS
-         * Code point: shamt = 0 is HINTS
+        /* 编码点：rd = x0 表示 HINTS。
+         * 编码点：shamt = 0 表示 HINTS。
          */
         ir->opcode = (!ir->rs1 || !ir->shamt) ? rv_insn_cnop : rv_insn_csrli;
         break;
@@ -1603,7 +1610,7 @@ static inline bool op_cmisc_alu(rv_insn_t *ir, const uint32_t insn)
         ir->shamt = c_decode_cbtype_shamt(insn);
         ir->rs1 = c_decode_rs1(insn);
 
-        /* Code point: shamt[5] = 1 is reserved */
+        /* 编码点：shamt[5] = 1 为保留编码。 */
         if (ir->shamt & 0x20)
             return false;
         ir->opcode = rv_insn_csrai;
@@ -1613,12 +1620,12 @@ static inline bool op_cmisc_alu(rv_insn_t *ir, const uint32_t insn)
         ir->imm = c_decode_caddi_imm(insn);
         ir->opcode = rv_insn_candi;
         break;
-    case 3: /* Arithmetic */
+    case 3: /* 算术类。 */
         ir->rs1 = c_decode_rs1c(insn) | 0x08;
         ir->rs2 = c_decode_rs2c(insn) | 0x08;
         ir->rd = ir->rs1;
 
-        /* dispatch from funct6[2] | funct2[1:0] */
+        /* 根据 funct6[2] | funct2[1:0] 分派。 */
         switch (((insn & 0x1000) >> 10) | ((insn & 0x0060) >> 5)) {
         case 0: /* SUB */
             ir->opcode = rv_insn_csub;
@@ -1636,7 +1643,7 @@ static inline bool op_cmisc_alu(rv_insn_t *ir, const uint32_t insn)
         case 5: /* ADDW */
             assert(!"RV64/128C instructions");
             break;
-        default: /* Reserved (cases 6, 7) */
+        default: /* 保留编码（case 6、7）。 */
             assert(!"Instruction reserved");
             break;
         }
@@ -1681,7 +1688,7 @@ static inline bool op_clwsp(rv_insn_t *ir, const uint32_t insn)
     ir->imm = tmp;
     ir->rd = c_decode_rd(insn);
 
-    /* reserved for rd = x0 */
+    /* rd = x0 为保留编码。 */
     ir->opcode = ir->rd ? rv_insn_clwsp : rv_insn_cnop;
     return true;
 }
@@ -1793,19 +1800,19 @@ static inline bool op_ccr(rv_insn_t *ir, const uint32_t insn)
     ir->rs2 = c_decode_rs2(insn);
     ir->rd = ir->rs1;
 
-    /* dispatch from funct4[0] field */
+    /* 根据 funct4[0] 字段分派。 */
     switch ((insn & 0x1000) >> 12) {
     case 0:
-        /* dispatch from rs2 field */
+        /* 根据 rs2 字段分派。 */
         switch (ir->rs2) {
         case 0: /* C.JR */
-            /* Code point: rd = x0 is reserved */
+            /* 编码点：rd = x0 为保留编码。 */
             if (!ir->rs1)
                 return false;
             ir->opcode = rv_insn_cjr;
             break;
         default: /* C.MV */
-            /* Code point: rd = x0 is HINTS */
+            /* 编码点：rd = x0 表示 HINTS。 */
             ir->opcode = ir->rd ? rv_insn_cmv : rv_insn_cnop;
             break;
         }
@@ -1814,12 +1821,12 @@ static inline bool op_ccr(rv_insn_t *ir, const uint32_t insn)
         if (!ir->rs1 && !ir->rs2) /* C.EBREAK */
             ir->opcode = rv_insn_ebreak;
         else if (ir->rs1 && ir->rs2) { /* C.ADD */
-            /* Code point: rd = x0 is HINTS */
+            /* 编码点：rd = x0 表示 HINTS。 */
             ir->opcode = ir->rd ? rv_insn_cadd : rv_insn_cnop;
         } else if (ir->rs1 && !ir->rs2) /* C.JALR */
             ir->opcode = rv_insn_cjalr;
-        else { /* rs2 != x0 AND rs1 = x0 */
-            /* Hint */
+        else { /* rs2 != x0 且 rs1 = x0。 */
+            /* HINT。 */
             ir->opcode = rv_insn_cnop;
         }
         break;
@@ -1964,16 +1971,16 @@ static inline bool op_cfsw(rv_insn_t *ir, const uint32_t insn)
 #define op_cflwsp OP_UNIMP
 #endif /* RV32_HAS(EXT_C) && RV32_HAS(EXT_F) */
 
-/* handler for all unimplemented opcodes */
+/* 所有未实现 opcode 的处理器。 */
 static inline bool op_unimp(rv_insn_t *ir UNUSED, uint32_t insn UNUSED)
 {
     return false;
 }
 
-/* RV32 decode handler type */
+/* RV32 解码处理器类型。 */
 typedef bool (*decode_t)(rv_insn_t *ir, uint32_t insn);
 
-/* decode RISC-V instruction */
+/* 解码 RISC-V 指令。 */
 bool rv_decode(rv_insn_t *ir, uint32_t insn)
 {
     bool ret;
@@ -1983,7 +1990,7 @@ bool rv_decode(rv_insn_t *ir, uint32_t insn)
 #define OP_UNIMP op_unimp
 #define OP(insn) op_##insn
 
-    /* RV32 base opcode map */
+    /* RV32 基础 opcode 映射表。 */
     /* clang-format off */
     static const decode_t rv_jump_table[] = {
     //  000         001           010        011           100         101        110        111
@@ -1994,7 +2001,7 @@ bool rv_decode(rv_insn_t *ir, uint32_t insn)
     };
 
 #if RV32_HAS(EXT_C)
-    /* RV32C opcode map */
+    /* RV32C opcode 映射表。 */
     static const decode_t rvc_jump_table[] = {
     //  00             01             10          11
         OP(caddi4spn), OP(caddi),     OP(cslli),  OP(unimp),  // 000
@@ -2009,16 +2016,15 @@ bool rv_decode(rv_insn_t *ir, uint32_t insn)
 #endif
     /* clang-format on */
 
-    /* Compressed Extension Instruction */
+    /* 压缩扩展指令。 */
 #if RV32_HAS(EXT_C)
-    /* If the last 2-bit is one of 0b00, 0b01, and 0b10, it is
-     * a 16-bit instruction.
+    /* 若最后 2 位为 0b00、0b01 或 0b10，则该指令是 16 位指令。
      */
     if (is_compressed(insn)) {
         insn &= 0x0000FFFF;
         const uint16_t c_index = (insn & FC_FUNC3) >> 11 | (insn & FC_OPCODE);
 
-        /* decode instruction (compressed instructions) */
+        /* 解码压缩指令。 */
         op = rvc_jump_table[c_index];
         assert(op);
         ret = op(ir, insn);
@@ -2027,10 +2033,10 @@ bool rv_decode(rv_insn_t *ir, uint32_t insn)
     }
 #endif
 
-    /* standard uncompressed instruction */
+    /* 标准非压缩指令。 */
     const uint32_t index = (insn & INSN_6_2) >> 2;
 
-    /* decode instruction */
+    /* 解码指令。 */
     op = rv_jump_table[index];
     assert(op);
     ret = op(ir, insn);
@@ -2038,8 +2044,9 @@ bool rv_decode(rv_insn_t *ir, uint32_t insn)
 end:
 
 #if RV32_HAS(RV32E)
-    /* RV32E forbids x16-x31 for integer registers, but with the F extension,
-     * floating-point registers are not limited to 16. */
+    /* RV32E 禁止整数寄存器使用 x16-x31；但启用 F 扩展时，浮点寄存器不受 16 个
+     * 寄存器限制。
+     */
     if ((op != op_store_fp && op != op_load_fp && op != op_op_fp) &&
         unlikely(ir->rd > 15 || ir->rs1 > 15 || ir->rs2 > 15))
         ret = false;

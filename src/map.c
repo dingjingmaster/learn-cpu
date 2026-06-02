@@ -1,15 +1,19 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
  */
 
-/* This map implementation has undergone extensive modifications, heavily
- * relying on the rb.h header file from jemalloc.
- * The original rb.h file served as the foundation and source of inspiration
- * for adapting and tailoring it specifically for this map implementation.
- * Therefore, credit and sincere thanks are extended to jemalloc for their
- * invaluable work.
- * Reference:
+/*
+ * 通用红黑树 map 容器。
+ *
+ * map 使用侵入式节点保存 key/value，提供 O(log n) 插入、删除、查找和有序遍历。
+ * 断点表、文件描述符映射等模块复用该容器。实现借鉴 jemalloc rb.h，但接口被
+ * 收敛成适合 rv32emu 的小型 C 容器 API。
+ */
+
+/* 该 map 实现经过了大量改造，核心红黑树算法参考 jemalloc 的 rb.h。原始 rb.h 为
+ * 本项目的小型 map 容器提供了基础和灵感，特此致谢。
+ *
+ * 参考：
  *   https://github.com/jemalloc/jemalloc/blob/dev/include/ \
  *   jemalloc/internal/rb.h
  */
@@ -23,36 +27,33 @@
 #include "map.h"
 
 struct map_internal {
-    map_node_t *root;           /* Tree root */
-    size_t key_size, data_size; /* Size of key/value type */
-    size_t size;                /* Number of nodes */
-    /* Key comparison function */
+    map_node_t *root;           /* 树根。 */
+    size_t key_size, data_size; /* key/value 类型大小。 */
+    size_t size;                /* 节点数量。 */
+    /* key 比较函数。 */
     map_cmp_t (*comparator)(const void *, const void *);
 };
 
-/* Each red–black tree node requires at least one byte of storage (for its
- * linkage). A one-byte object could support up to 2^{sizeof(void *) * 8} nodes
- * in an address space. However, the red–black tree algorithm guarantees that
- * the tree depth is bounded by 2 * log₂(n), where n is the number of nodes.
+/* 每个红黑树节点至少需要 1 字节存储链接信息。理论上，1 字节对象在地址空间中可
+ * 支持最多 2^{sizeof(void *) * 8} 个节点；但红黑树算法保证树深度不超过
+ * 2 * log2(n)，n 为节点数量。
  *
- * For operations such as insertion and deletion, a fixed-size array is used to
- * track the path through the tree. RB_MAX_DEPTH is conservatively defined as 16
- * times the size of a pointer to ensure that the array is large enough for any
- * realistic tree, regardless of the theoretical maximum node count.
+ * 插入和删除等操作使用固定大小数组记录遍历路径。RB_MAX_DEPTH 保守定义为指针
+ * 大小的 16 倍，确保对任何现实规模的树都有足够空间，而不按理论最大节点数分配。
  */
 #define RB_MAX_DEPTH (sizeof(void *) << 4)
 
-/* Color/pointer manipulation macros */
+/* 颜色/指针打包操作宏。 */
 #define RB_COLOR_MASK 1UL
 #define RB_PTR_MASK (~RB_COLOR_MASK)
 
 typedef enum { RB_BLACK = 0, RB_RED = 1 } map_color_t;
 
-/* Helper macros for cleaner access patterns */
+/* 简化访问模式的辅助宏。 */
 #define RB_IS_RED(node) (rb_node_get_color(node) == RB_RED)
 #define RB_IS_BLACK(node) (rb_node_get_color(node) == RB_BLACK)
 
-/* Prefetch hints for better cache utilization */
+/* 预取提示，用于改善缓存利用率。 */
 #ifdef __builtin_prefetch
 #define PREFETCH_READ(addr) __builtin_prefetch((addr), 0, 1)
 #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 1)
@@ -61,7 +62,7 @@ typedef enum { RB_BLACK = 0, RB_RED = 1 } map_color_t;
 #define PREFETCH_WRITE(addr) ((void) 0)
 #endif
 
-/* Left accessors */
+/* 左子节点访问器。 */
 static inline map_node_t *rb_node_get_left(const map_node_t *node)
 {
     return node->left;
@@ -72,7 +73,7 @@ static inline void rb_node_set_left(map_node_t *node, map_node_t *left)
     node->left = left;
 }
 
-/* Right accessors - using consistent masking */
+/* 右子节点访问器，统一屏蔽颜色位。 */
 static inline map_node_t *rb_node_get_right(const map_node_t *node)
 {
     return (map_node_t *) (((uintptr_t) node->right_red) & ~RB_COLOR_MASK);
@@ -85,7 +86,7 @@ static inline void rb_node_set_right(map_node_t *node, map_node_t *right)
                         (((uintptr_t) node->right_red) & RB_COLOR_MASK));
 }
 
-/* Color accessors */
+/* 颜色访问器。 */
 static inline map_color_t rb_node_get_color(const map_node_t *node)
 {
     return ((uintptr_t) node->right_red) & RB_COLOR_MASK;
@@ -108,15 +109,15 @@ static inline void rb_node_set_black(map_node_t *node)
         (map_node_t *) (((uintptr_t) node->right_red) & ~RB_COLOR_MASK);
 }
 
-/* Node initializer */
+/* 节点初始化。 */
 static inline void rb_node_init(map_node_t *node)
 {
-    assert((((uintptr_t) node) & RB_COLOR_MASK) == 0); /* properly aligned */
+    assert((((uintptr_t) node) & RB_COLOR_MASK) == 0); /* 已正确对齐。 */
     node->left = NULL;
-    node->right_red = (map_node_t *) RB_RED; /* NULL with red color */
+    node->right_red = (map_node_t *) RB_RED; /* 带红色标记的 NULL。 */
 }
 
-/* Internal helper macros */
+/* 内部辅助宏。 */
 #define rb_node_rotate_left(x_node, r_node)                      \
     do {                                                         \
         (r_node) = rb_node_get_right((x_node));                  \
@@ -141,7 +142,7 @@ static void rb_remove(map_t rb, map_node_t *node)
     rb_path_entry_t path[RB_MAX_DEPTH];
     rb_path_entry_t *pathp = NULL, *nodep = NULL;
 
-    /* Traverse through red-black tree node and find the search target node. */
+    /* 遍历红黑树，找到待删除目标节点。 */
     path->node = rb->root;
     pathp = path;
     while (pathp->node) {
@@ -152,7 +153,7 @@ static void rb_remove(map_t rb, map_node_t *node)
         } else {
             pathp[1].node = rb_node_get_right(pathp->node);
             if (cmp == MAP_CMP_EQUAL) {
-                /* find node's successor, in preparation for swap */
+                /* 查找后继节点，为交换做准备。 */
                 pathp->cmp = MAP_CMP_GREATER;
                 nodep = pathp;
                 for (pathp++; pathp->node; pathp++) {
@@ -168,21 +169,18 @@ static void rb_remove(map_t rb, map_node_t *node)
 
     pathp--;
     if (pathp->node != node) {
-        /* swap node with its successor */
+        /* 将节点与后继节点交换。 */
         map_color_t tcolor = rb_node_get_color(pathp->node);
         rb_node_set_color(pathp->node, rb_node_get_color(node));
         rb_node_set_left(pathp->node, rb_node_get_left(node));
 
-        /* If the node's successor is its right child, the following code may
-         * behave incorrectly for the right child pointer.
-         * However, it is not a problem as the pointer will be correctly set
-         * when the successor is pruned.
+        /* 如果节点的后继就是其右子节点，下面代码对右子指针的处理中间状态可能不
+         * 完全准确；但后继节点被剪除时会正确设置该指针，因此不会造成问题。
          */
         rb_node_set_right(pathp->node, rb_node_get_right(node));
         rb_node_set_color(node, tcolor);
 
-        /* The child pointers of the pruned leaf node are never accessed again,
-         * so there is no need to set them to NULL.
+        /* 被剪除叶子节点的子指针之后不会再被访问，因此不需要清成 NULL。
          */
         nodep->node = pathp->node;
         pathp->node = node;
@@ -197,15 +195,13 @@ static void rb_remove(map_t rb, map_node_t *node)
     } else {
         map_node_t *left = rb_node_get_left(node);
         if (left) {
-            /* node has no successor, but it has a left child.
-             * Splice node out, without losing the left child.
+            /* 节点没有后继，但有左子节点。直接摘除该节点，同时保留左子树。
              */
             assert(RB_IS_BLACK(node));
             assert(RB_IS_RED(left));
             rb_node_set_black(left);
             if (pathp == path) {
-                /* the subtree rooted at the node's left child has not
-                 * changed, and it is now the root.
+                /* 以该节点左子节点为根的子树没有变化，现在它成为整棵树的根。
                  */
                 rb->root = left;
             } else {
@@ -217,25 +213,23 @@ static void rb_remove(map_t rb, map_node_t *node)
             return;
         }
         if (pathp == path) {
-            /* the tree only contained one node */
+            /* 树中原本只有一个节点。 */
             rb->root = NULL;
             return;
         }
     }
 
-    /* The invariant has been established that the node has no right child
-     * (morally speaking; the right child was not explicitly nulled out if
-     * swapped with its successor). Furthermore, the only nodes with
-     * out-of-date summaries exist in path[0], path[1], ..., pathp[-1].
+    /* 此处已建立不变量：待剪除节点没有右子节点（若与后继交换过，右子指针可能未
+     * 显式置空，但逻辑上成立）。此外，只有 path[0]..pathp[-1] 上的节点需要更新。
      */
     if (RB_IS_RED(pathp->node)) {
-        /* prune red node, which requires no fixup */
+        /* 剪除红色节点，无需额外修复。 */
         assert(pathp[-1].cmp == MAP_CMP_LESS);
         rb_node_set_left(pathp[-1].node, NULL);
         return;
     }
 
-    /* The node to be pruned is black, so unwind until balance is restored. */
+    /* 待剪除节点为黑色，需要沿路径回溯直到恢复平衡。 */
     pathp->node = NULL;
     for (pathp--; (uintptr_t) pathp >= (uintptr_t) path; pathp--) {
         assert(pathp->cmp != MAP_CMP_EQUAL);
@@ -246,8 +240,7 @@ static void rb_remove(map_t rb, map_node_t *node)
                 map_node_t *rightleft = rb_node_get_left(right);
                 map_node_t *tnode;
                 if (rightleft && RB_IS_RED(rightleft)) {
-                    /* In the following diagrams, ||, //, and \\
-                     * indicate the path to the removed node.
+                    /* 下列图中的 ||、// 和 \\ 表示通向被删除节点的路径。
                      *
                      *      ||
                      *    pathp(r)
@@ -271,7 +264,7 @@ static void rb_remove(map_t rb, map_node_t *node)
                     rb_node_rotate_left(pathp->node, tnode);
                 }
 
-                /* Balance restored, but rotation modified subtree root. */
+                /* 平衡已恢复，但旋转改变了子树根。 */
                 assert((uintptr_t) pathp > (uintptr_t) path);
                 if (pathp[-1].cmp == MAP_CMP_LESS)
                     rb_node_set_left(pathp[-1].node, tnode);
@@ -294,11 +287,10 @@ static void rb_remove(map_t rb, map_node_t *node)
                     rb_node_rotate_right(right, tnode);
                     rb_node_set_right(pathp->node, tnode);
                     rb_node_rotate_left(pathp->node, tnode);
-                    /* Balance restored, but rotation modified subtree root,
-                     * which may actually be the tree root.
+                    /* 平衡已恢复，但旋转改变了子树根；该子树根也可能就是整棵树根。
                      */
                     if (pathp == path) {
-                        /* set root */
+                        /* 设置树根。 */
                         rb->root = tnode;
                     } else {
                         if (pathp[-1].cmp == MAP_CMP_LESS)
@@ -360,11 +352,10 @@ static void rb_remove(map_t rb, map_node_t *node)
                     rb_node_set_black(tnode);
                 }
 
-                /* Balance restored, but rotation modified subtree root, which
-                 * may actually be the tree root.
+                /* 平衡已恢复，但旋转改变了子树根；该子树根也可能就是整棵树根。
                  */
                 if (pathp == path) {
-                    /* set root */
+                    /* 设置树根。 */
                     rb->root = tnode;
                 } else {
                     if (pathp[-1].cmp == MAP_CMP_LESS)
@@ -388,7 +379,7 @@ static void rb_remove(map_t rb, map_node_t *node)
                     rb_node_set_red(left);
                     rb_node_set_black(leftleft);
                     rb_node_rotate_right(pathp->node, tnode);
-                    /* Balance restored, but rotation modified subtree root. */
+                    /* 平衡已恢复，但旋转改变了子树根。 */
                     assert((uintptr_t) pathp > (uintptr_t) path);
                     if (pathp[-1].cmp == MAP_CMP_LESS)
                         rb_node_set_left(pathp[-1].node, tnode);
@@ -405,7 +396,7 @@ static void rb_remove(map_t rb, map_node_t *node)
                      */
                     rb_node_set_red(left);
                     rb_node_set_black(pathp->node);
-                    /* balance restored */
+                    /* 平衡已恢复。 */
                     return;
                 }
             } else {
@@ -421,11 +412,10 @@ static void rb_remove(map_t rb, map_node_t *node)
                     map_node_t *tnode;
                     rb_node_set_black(leftleft);
                     rb_node_rotate_right(pathp->node, tnode);
-                    /* Balance restored, but rotation modified subtree root,
-                     * which may actually be the tree root.
+                    /* 平衡已恢复，但旋转改变了子树根；该子树根也可能就是整棵树根。
                      */
                     if (pathp == path) {
-                        /* set root */
+                        /* 设置树根。 */
                         rb->root = tnode;
                     } else {
                         if (pathp[-1].cmp == MAP_CMP_LESS)
@@ -448,7 +438,7 @@ static void rb_remove(map_t rb, map_node_t *node)
         }
     }
 
-    /* set root */
+    /* 设置树根。 */
     rb->root = path->node;
     assert(RB_IS_BLACK(rb->root));
 }
@@ -462,23 +452,23 @@ static void rb_destroy_recurse(map_t rb, map_node_t *node)
     rb_node_set_left((node), NULL);
     rb_destroy_recurse(rb, rb_node_get_right(node));
     rb_node_set_right((node), NULL);
-    /* Single free for entire block (node + key + data) */
+    /* 节点、key、data 位于同一内存块，一次释放。 */
     free(node);
 }
 
-/* Create node with single allocation */
+/* 用单次分配创建节点。 */
 static map_node_t *map_create_node(const void *key,
                                    const void *value,
                                    size_t ksize,
                                    size_t vsize)
 {
-    /* Calculate aligned offsets more efficiently */
+    /* 计算对齐后的 key/data 偏移。 */
     const size_t align_mask = sizeof(void *) - 1;
     size_t key_offset = (sizeof(map_node_t) + align_mask) & ~align_mask;
     size_t data_offset = (key_offset + ksize + align_mask) & ~align_mask;
     size_t total_size = data_offset + vsize;
 
-    /* Check for overflow */
+    /* 检查大小计算是否溢出。 */
     if (unlikely(total_size < vsize || total_size < ksize))
         return NULL;
 
@@ -490,10 +480,10 @@ static map_node_t *map_create_node(const void *key,
     node->key = mem + key_offset;
     node->data = mem + data_offset;
 
-    /* Initialize node linkage */
+    /* 初始化节点链接。 */
     rb_node_init(node);
 
-    /* Copy key and value data efficiently */
+    /* 复制 key 和 value 数据。 */
     if (key)
         memcpy(node->key, key, ksize);
     else
@@ -507,17 +497,17 @@ static map_node_t *map_create_node(const void *key,
     return node;
 }
 
-/* Constructor - creates a new map instance */
+/* 构造函数：创建新的 map 实例。 */
 map_t map_new(size_t key_size,
               size_t data_size,
               map_cmp_t (*cmp)(const void *, const void *))
 {
-    /* Validate sizes to prevent integer overflow in allocation */
+    /* 校验大小，避免分配尺寸整数溢出。 */
     if (key_size == 0 || data_size == 0 || !cmp)
         return NULL;
 
-    /* Prevent overflow: ensure total allocation size is reasonable */
-    size_t max_size = SIZE_MAX / 4; /* Conservative limit */
+    /* 防止溢出：确保总分配尺寸合理。 */
+    size_t max_size = SIZE_MAX / 4; /* 保守上限。 */
     if (key_size > max_size || data_size > max_size ||
         (key_size + data_size) > max_size - sizeof(map_node_t))
         return NULL;
@@ -534,7 +524,7 @@ map_t map_new(size_t key_size,
     return tree;
 }
 
-/* Insert with single traversal - hot path */
+/* 单次遍历插入，属于热点路径。 */
 static inline const map_node_t *rb_insert_unique(map_t rb,
                                                  const void *key,
                                                  rb_path_entry_t *path,
@@ -542,7 +532,7 @@ static inline const map_node_t *rb_insert_unique(map_t rb,
 {
     rb_path_entry_t *pathp;
 
-    /* Single traversal to find insertion point or existing key */
+    /* 单次遍历查找插入点或已存在 key。 */
     path->node = rb->root;
     size_t depth = 0;
     for (pathp = path; pathp->node && depth < RB_MAX_DEPTH - 1;
@@ -553,19 +543,19 @@ static inline const map_node_t *rb_insert_unique(map_t rb,
         } else if (cmp == MAP_CMP_GREATER) {
             pathp[1].node = rb_node_get_right(pathp->node);
         } else {
-            /* Key already exists */
+            /* key 已存在。 */
             return pathp->node;
         }
     }
 
-    /* Key doesn't exist, return NULL and set pathp for insertion */
+    /* key 不存在，返回 NULL 并设置 pathp 供插入使用。 */
     if (depth >= RB_MAX_DEPTH - 1)
-        return (const map_node_t *) -1; /* Tree too deep */
+        return (const map_node_t *) -1; /* 树太深。 */
     *pathp_out = pathp;
     return NULL;
 }
 
-/* Insert a key-value pair into the map */
+/* 向 map 插入 key-value 对。 */
 bool map_insert(map_t obj, const void *key, const void *val)
 {
     if (!obj || !key)
@@ -574,22 +564,22 @@ bool map_insert(map_t obj, const void *key, const void *val)
     rb_path_entry_t path[RB_MAX_DEPTH];
     rb_path_entry_t *pathp = NULL;
 
-    /* Single traversal to check existence and get insertion point */
+    /* 单次遍历检查是否存在并取得插入点。 */
     const map_node_t *existing = rb_insert_unique(obj, key, path, &pathp);
     if (existing == (const map_node_t *) -1)
-        return false; /* Tree too deep */
+        return false; /* 树太深。 */
     if (existing)
-        return false; /* Key already exists */
+        return false; /* key 已存在。 */
 
-    /* Create and insert new node */
+    /* 创建并插入新节点。 */
     map_node_t *node = map_create_node(key, val, obj->key_size, obj->data_size);
     if (!node)
         return false;
 
-    /* Node already initialized in map_create_node, just set in path */
+    /* 节点已在 map_create_node 中初始化，这里只需写入路径。 */
     pathp->node = node;
 
-    /* Fix up red-black tree properties */
+    /* 修复红黑树性质。 */
     for (pathp--; (uintptr_t) pathp >= (uintptr_t) path; pathp--) {
         map_node_t *cnode = pathp->node;
         if (pathp->cmp == MAP_CMP_LESS) {
@@ -599,7 +589,7 @@ bool map_insert(map_t obj, const void *key, const void *val)
                 break;
             map_node_t *leftleft = rb_node_get_left(left);
             if (leftleft && RB_IS_RED(leftleft)) {
-                /* fix up 4-node */
+                /* 修复 4-node。 */
                 map_node_t *tnode;
                 rb_node_set_black(leftleft);
                 rb_node_rotate_right(cnode, tnode);
@@ -612,12 +602,12 @@ bool map_insert(map_t obj, const void *key, const void *val)
                 break;
             map_node_t *left = rb_node_get_left(cnode);
             if (left && RB_IS_RED(left)) {
-                /* split 4-node */
+                /* 拆分 4-node。 */
                 rb_node_set_black(left);
                 rb_node_set_black(right);
                 rb_node_set_red(cnode);
             } else {
-                /* lean left */
+                /* 调整为左倾。 */
                 map_node_t *tnode;
                 map_color_t tcolor = rb_node_get_color(cnode);
                 rb_node_rotate_left(cnode, tnode);
@@ -629,14 +619,14 @@ bool map_insert(map_t obj, const void *key, const void *val)
         pathp->node = cnode;
     }
 
-    /* Set root and make it black */
+    /* 设置根节点并染黑。 */
     obj->root = path->node;
     rb_node_set_black(obj->root);
     obj->size++;
     return true;
 }
 
-/* Get functions, avoiding stack allocation */
+/* 查找函数，避免栈上路径分配。 */
 void map_find(map_t obj, map_iter_t *it, const void *key)
 {
     if (unlikely(!obj || !it)) {
@@ -647,7 +637,7 @@ void map_find(map_t obj, map_iter_t *it, const void *key)
 
     map_node_t *node = obj->root;
 
-    /* Prefetch for large trees */
+    /* 大树场景提前预取。 */
     if (node && obj->size > 10000) {
         PREFETCH_READ(node->left);
         PREFETCH_READ(rb_node_get_right(node));
@@ -669,34 +659,34 @@ bool map_empty(map_t obj)
     return unlikely(!obj) || !obj->root;
 }
 
-/* Iteration */
+/* 迭代。 */
 bool map_at_end(map_t m, const map_iter_t *it)
 {
-    (void) m; /* Suppress unused parameter warning */
+    (void) m; /* 抑制未使用参数警告。 */
     return !(it->node);
 }
 
-/* Remove functions */
+/* 删除函数。 */
 void map_erase(map_t obj, map_iter_t *it)
 {
     if (!obj || !it || !it->node)
         return;
 
-    /* Verify node exists in tree before removal */
+    /* 删除前确认树中仍有节点。 */
     if (obj->size == 0)
         return;
 
     rb_remove(obj, it->node);
-    /* Single free for entire block (node + key + data) */
+    /* 节点、key、data 位于同一内存块，一次释放。 */
     free(it->node);
     it->node = NULL;
 
-    /* Prevent underflow */
+    /* 防止 size 下溢。 */
     if (obj->size > 0)
         obj->size--;
 }
 
-/* Empty map */
+/* 清空 map。 */
 void map_clear(map_t obj)
 {
     if (!obj)
@@ -706,7 +696,7 @@ void map_clear(map_t obj)
     obj->size = 0;
 }
 
-/* Destroy map and free all resources */
+/* 销毁 map 并释放所有资源。 */
 void map_delete(map_t obj)
 {
     if (!obj)
@@ -715,13 +705,13 @@ void map_delete(map_t obj)
     free(obj);
 }
 
-/* Get number of elements in map */
+/* 获取 map 中元素数量。 */
 size_t map_size(map_t obj)
 {
     return likely(obj) ? obj->size : 0;
 }
 
-/* Iterator traversal functions */
+/* 迭代器遍历函数。 */
 
 void map_first(map_t map, map_iter_t *it)
 {
@@ -773,7 +763,7 @@ void map_next(map_t map, map_iter_t *it)
     map_node_t *node = it->node;
     map_node_t *right = rb_node_get_right(node);
 
-    /* If right subtree exists, find leftmost node in right subtree */
+    /* 如果存在右子树，后继为右子树最左节点。 */
     if (right) {
         while (right->left)
             right = right->left;
@@ -781,7 +771,7 @@ void map_next(map_t map, map_iter_t *it)
         return;
     }
 
-    /* Find successor by searching from root */
+    /* 从根节点搜索后继。 */
     map_node_t *succ = NULL;
     map_node_t *curr = map->root;
 
@@ -810,7 +800,7 @@ void map_prev(map_t map, map_iter_t *it)
 
     map_node_t *node = it->node;
 
-    /* If left subtree exists, find rightmost node in left subtree */
+    /* 如果存在左子树，前驱为左子树最右节点。 */
     if (node->left) {
         node = node->left;
         while (rb_node_get_right(node))
@@ -819,9 +809,8 @@ void map_prev(map_t map, map_iter_t *it)
         return;
     }
 
-    /* Otherwise, find the first ancestor that is a right child */
-    /* We need to traverse up, but we don't have parent pointers */
-    /* So we need to find the predecessor by searching from root */
+    /* 否则需要找到第一个“当前节点位于其右子树”的祖先。 */
+    /* 没有父指针，因此从根节点重新搜索前驱。 */
 
     map_node_t *pred = NULL;
     map_node_t *curr = map->root;
@@ -834,7 +823,7 @@ void map_prev(map_t map, map_iter_t *it)
         } else if (cmp == MAP_CMP_LESS) {
             curr = curr->left;
         } else {
-            /* Found the node, predecessor is already set or NULL */
+            /* 已找到节点，前驱已设置或为 NULL。 */
             break;
         }
     }

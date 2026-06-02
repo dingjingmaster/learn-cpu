@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * RISC-V 虚拟机实例管理。
+ *
+ * 本文件实现 rv_create/rv_run/rv_delete 等生命周期函数，负责初始化寄存器、
+ * 内存、ELF 或系统镜像、设备、GDB stub、JIT 缓存和 T2C 后台线程。系统模式下
+ * 还会构造 DTB、映射内核/initrd、设置终端输入模式并在退出时同步设备状态。
  */
 
 #include <assert.h>
@@ -48,7 +55,7 @@
 #define BLOCK_IR_MAP_CAPACITY_BITS 10
 
 #if !RV32_HAS(JIT)
-/* initialize the block map */
+/* 初始化基本块哈希表。 */
 static void block_map_init(block_map_t *map, const uint8_t bits)
 {
     map->block_capacity = 1 << bits;
@@ -57,7 +64,7 @@ static void block_map_init(block_map_t *map, const uint8_t bits)
     assert(map->map);
 }
 
-/* clear all block in the block map */
+/* 清空基本块哈希表中的所有基本块和 IR 节点。 */
 void block_map_clear(riscv_t *rv)
 {
     block_map_t *map = &rv->block_map;
@@ -81,9 +88,8 @@ void block_map_clear(riscv_t *rv)
     }
     map->size = 0;
 
-    /* clear L1 direct-mapped block cache - use invalid tags to avoid
-     * false hits on PC=0 edge case. Separated arrays: tags first for
-     * cache-efficient miss detection, ptrs zeroed with memset.
+    /* 清空 L1 直接映射基本块缓存。使用无效 tag 避免 PC=0 边界场景误命中；
+     * tag 和指针分离存放，tag 优先用于高效 miss 检测，ptrs 用 memset 清零。
      */
     for (int i = 0; i < BLOCK_L1_SIZE; i++)
         rv->block_l1.tags[i] = BLOCK_L1_INVALID_TAG;
@@ -137,13 +143,13 @@ riscv_word_t rv_get_reg(riscv_t *rv, uint32_t reg)
     return ~0U;
 }
 
-/* Remap standard stream
+/* 重映射标准流。
  *
- * @rv: riscv
- * @fsp: a list of pair of mapping from fd to FILE *
- * @fsp_size: list size
+ * @rv: RISC-V 实例。
+ * @fsp: fd 到 FILE* 的映射列表。
+ * @fsp_size: 列表长度。
  *
- * Note: fd inside fsp should be 0 or 1 or 2 only
+ * 注意：fsp 中的 fd 只应为 0、1、2。
  */
 void rv_remap_stdstream(riscv_t *rv, fd_stream_pair_t *fsp, uint32_t fsp_size)
 {
@@ -161,14 +167,14 @@ void rv_remap_stdstream(riscv_t *rv, fd_stream_pair_t *fsp, uint32_t fsp_size)
         if (fd != STDIN_FILENO && fd != STDOUT_FILENO && fd != STDERR_FILENO)
             continue;
 
-        /* check if standard stream refered by fd exists or not */
+        /* 检查该标准 fd 是否已经存在映射。 */
         map_iter_t it;
         map_find(attr->fd_map, &it, &fd);
-        if (it.node) /* found, remove first */
+        if (it.node) /* 已存在则先删除旧映射。 */
             map_erase(attr->fd_map, &it);
         map_insert(attr->fd_map, &fd, &file);
 
-        /* store new fd to make the vm_attr_t consistent */
+        /* 保存新的宿主 fd，保持 vm_attr_t 一致。 */
         int new_fd = FILENO(file);
         assert(new_fd != -1);
 
@@ -185,9 +191,9 @@ void rv_remap_stdstream(riscv_t *rv, fd_stream_pair_t *fsp, uint32_t fsp_size)
 #define MEMIO(op) on_mem_##op
 #define IO_HANDLER_IMPL(type, op, RW)                                  \
     static IIF(RW)(                                                    \
-        /* W */ void MEMIO(op)(UNUSED riscv_t * rv, riscv_word_t addr, \
+        /* 写 */ void MEMIO(op)(UNUSED riscv_t * rv, riscv_word_t addr, \
                                riscv_##type##_t data),                 \
-        /* R */ riscv_##type##_t MEMIO(op)(UNUSED riscv_t * rv,        \
+        /* 读 */ riscv_##type##_t MEMIO(op)(UNUSED riscv_t * rv,        \
                                            riscv_word_t addr))         \
     {                                                                  \
         IIF(RW)(memory_##op(addr, (uint8_t *) &data),                  \
@@ -218,41 +224,40 @@ static void *t2c_runloop(void *arg)
     riscv_t *rv = (riscv_t *) arg;
     pthread_mutex_lock(&rv->wait_queue_lock);
     while (!rv->quit) {
-        /* Wait for work or quit signal */
+        /* 等待编译任务或退出信号。 */
         while (list_empty(&rv->wait_queue) && !rv->quit)
             pthread_cond_wait(&rv->wait_queue_cond, &rv->wait_queue_lock);
 
         if (rv->quit)
             break;
 
-        /* Extract work item while holding the lock */
+        /* 持锁取出一个待编译任务。 */
         queue_entry_t *entry =
             list_last_entry(&rv->wait_queue, queue_entry_t, list);
         list_del_init(&entry->list);
         pthread_mutex_unlock(&rv->wait_queue_lock);
 
-        /* Perform compilation with minimal lock contention.
+        /* 尽量降低锁竞争地执行编译。
          *
-         * Lock strategy: Hold cache_lock only when accessing shared data:
-         * 1. Initial lookup and validation (short)
-         * 2. Final jit_cache update (short)
+         * 锁策略：仅在访问共享数据时持有 cache_lock：
+         * 1. 初始查找和校验（短临界区）。
+         * 2. 最终更新 jit_cache（短临界区）。
          *
-         * The expensive LLVM compilation runs without holding cache_lock,
-         * allowing SFENCE.VMA/FENCE.I to proceed with minimal latency.
-         * If the block is invalidated during compilation, we detect this
-         * via the invalidated flag and discard the compiled result.
+         * 成本较高的 LLVM 编译阶段不持有 cache_lock，使 SFENCE.VMA/FENCE.I 可以
+         * 以较低延迟继续推进。如果基本块在编译期间失效，会通过 invalidated 标志
+         * 检测并丢弃编译结果。
          */
         pthread_mutex_lock(&rv->cache_lock);
-        /* Look up block from cache using the key (might have been evicted) */
+        /* 用 key 从缓存查找基本块；它可能已被淘汰。 */
         uint32_t pc = (uint32_t) entry->key;
         block_t *block = (block_t *) cache_get(rv->block_cache, pc, false);
 #if RV32_HAS(SYSTEM)
-        /* Verify SATP matches (for system mode) */
+        /* 系统模式下还要确认 SATP 匹配。 */
         uint32_t satp = (uint32_t) (entry->key >> 32);
         if (block && block->satp != satp)
             block = NULL;
 #endif
-        /* Compile only if block still exists in cache */
+        /* 仅当基本块仍存在于缓存中时才继续编译。 */
         if (block)
             t2c_compile(rv, block, &rv->cache_lock);
         else
@@ -267,10 +272,9 @@ static void *t2c_runloop(void *arg)
 #endif
 
 #if RV32_HAS(SYSTEM_MMIO)
-/* Map a file into memory at the specified location.
- * If max_size > 0, validates that file size does not exceed max_size.
- * Returns the actual file size on success, or -1 when file exceeds max_size
- * (caller handles the error message). Other errors cause program exit.
+/* 把文件映射到指定内存位置。
+ * max_size > 0 时校验文件大小不得超过 max_size。成功时返回实际文件大小；超过
+ * max_size 时返回 -1，由调用者负责输出更具体的错误信息；其他错误直接退出。
  */
 static off_t map_file(char **ram_loc, const char *name, off_t max_size)
 {
@@ -278,20 +282,20 @@ static off_t map_file(char **ram_loc, const char *name, off_t max_size)
     if (fd < 0)
         goto fail;
 
-    /* get file size */
+    /* 获取文件大小。 */
     struct stat st;
     if (fstat(fd, &st) < 0)
         goto cleanup;
 
-    /* Validate file size if max_size constraint is specified */
+    /* 如果指定了 max_size，先校验文件大小。 */
     if (max_size > 0 && st.st_size > max_size) {
         close(fd);
-        return -1; /* Caller handles the error message */
+        return -1; /* 调用者负责输出错误信息。 */
     }
 
 #if HAVE_MMAP
-    /* Remap file to memory region. Emscripten/Windows use fallback read path
-     * since they don't support mmap with location hints.
+    /* 把文件重新映射到目标内存区域。Emscripten/Windows 不支持带位置提示的 mmap，
+     * 因此使用 read 回退路径。
      */
     *ram_loc = mmap(*ram_loc, st.st_size, PROT_READ | PROT_WRITE,
                     MAP_FIXED | MAP_PRIVATE, fd, 0);
@@ -305,8 +309,7 @@ static off_t map_file(char **ram_loc, const char *name, off_t max_size)
 #endif
 
     /*
-     * The kernel selects a nearby page boundary and attempts to create
-     * the mapping.
+     * 内核会选择附近的页边界并尝试创建映射；ram_loc 随实际文件长度向后推进。
      */
     *ram_loc += st.st_size;
     close(fd);
@@ -315,7 +318,7 @@ static off_t map_file(char **ram_loc, const char *name, off_t max_size)
 cleanup:
     close(fd);
 fail:
-    rv_log_fatal("map_file() %s failed: %s", name, strerror(errno));
+    rv_log_fatal("map_file() 处理 %s 失败：%s", name, strerror(errno));
     exit(EXIT_FAILURE);
 }
 
@@ -329,16 +332,15 @@ static char *realloc_property(char *fdt,
     int oldlen = 0;
 
     if (!fdt_get_property(fdt, nodeoffset, name, &oldlen))
-        /* strings + property header */
+        /* 字符串表条目和 property 头。 */
         delta = sizeof(struct fdt_property) + strlen(name) + 1;
 
     if (newlen > oldlen)
-        /* actual value in off_struct */
+        /* off_struct 中的实际属性值。 */
         delta += ALIGN_FDT(newlen) - ALIGN_FDT(oldlen);
 
     int new_sz = fdt_totalsize(fdt) + delta;
-    /* Assume the pre-allocated RAM is enough here, so we
-     * don't realloc any memory for fdt */
+    /* 这里假设预留 RAM 足够容纳扩展后的 FDT，因此不重新分配 fdt 内存。 */
     fdt_open_into(fdt, fdt, new_sz);
     return fdt;
 }
@@ -354,17 +356,17 @@ static void load_dtb(char **ram_loc, vm_attr_t *attr)
     int node, err;
     int totalsize;
 
-#define DTB_EXPAND_SIZE 1024 /* or more if needed */
+#define DTB_EXPAND_SIZE 1024 /* 必要时可以继续增大。 */
 
-    /* Allocate enough memory for DTB + extra room */
+    /* 为 DTB 和额外扩展空间分配缓冲区。 */
     size_t minimal_len = ARRAY_SIZE(minimal);
     void *dtb_buf = calloc(minimal_len + DTB_EXPAND_SIZE, sizeof(uint8_t));
     assert(dtb_buf);
 
-    /* Expand it to a usable DTB blob */
+    /* 展开为可修改的 DTB blob。 */
     err = fdt_open_into(minimal, dtb_buf, minimal_len + DTB_EXPAND_SIZE);
     if (err < 0) {
-        rv_log_error("fdt_open_into fails\n");
+        rv_log_error("fdt_open_into 失败\n");
         exit(EXIT_FAILURE);
     }
 
@@ -386,7 +388,7 @@ static void load_dtb(char **ram_loc, vm_attr_t *attr)
         assert(!err);
     }
 
-/* Remove the rtc node if it is not enabled during compile time */
+/* 编译期未启用 RTC 时，从 DTB 删除 rtc 节点。 */
 #if !RV32_HAS(GOLDFISH_RTC)
     const char *rtc_path = fdt_get_alias(dtb_buf, "rtc0");
     assert(rtc_path);
@@ -396,7 +398,7 @@ static void load_dtb(char **ram_loc, vm_attr_t *attr)
 
     err = fdt_del_node(dtb_buf, node);
     if (err < 0)
-        rv_log_warn("Failed to remove rtc node from DTB");
+        rv_log_warn("从 DTB 删除 rtc 节点失败");
 #endif
 
     if (vblk) {
@@ -410,7 +412,7 @@ static void load_dtb(char **ram_loc, vm_attr_t *attr)
         uint32_t next_addr = base_addr;
         uint32_t next_irq = 1;
 
-        /* scan existing nodes to get next addr and irq */
+        /* 扫描已有节点，计算下一个可用地址和 IRQ。 */
         int subnode;
         fdt_for_each_subnode(subnode, dtb_buf, node)
         {
@@ -425,8 +427,7 @@ static void load_dtb(char **ram_loc, vm_attr_t *attr)
             if (endptr == at_pos + 1) {
                 attr->vblk_cnt = 0;
                 rv_log_error(
-                    "Invalid unit-address in node: %s, skipping virtio blocks "
-                    "MMIO",
+                    "节点 %s 的 unit-address 无效，跳过 virtio-blk MMIO",
                     name);
                 goto dtb_end;
             }
@@ -441,14 +442,14 @@ static void load_dtb(char **ram_loc, vm_attr_t *attr)
                     next_irq = irq + 1;
             }
         }
-        /* set IRQ for virtio block, see devices/virtio.h */
+        /* 设置 virtio-blk IRQ 基址，定义见 devices/virtio.h。 */
         attr->vblk_irq_base = next_irq;
 
-        /* set the VBLK MMIO valid range */
+        /* 设置 VBLK MMIO 有效范围。 */
         attr->vblk_mmio_base_hi = next_addr >> 20;
         attr->vblk_mmio_max_hi = attr->vblk_mmio_base_hi + attr->vblk_cnt;
 
-        /* adding new virtio block nodes */
+        /* 添加新的 virtio-blk DTB 节点。 */
         for (int i = 0; i < attr->vblk_cnt; i++) {
             uint32_t new_addr = next_addr + i * addr_offset;
             uint32_t new_irq = next_irq + i;
@@ -458,19 +459,19 @@ static void load_dtb(char **ram_loc, vm_attr_t *attr)
 
             int subnode = fdt_add_subnode(dtb_buf, node, node_name);
             if (subnode == -FDT_ERR_NOSPACE) {
-                rv_log_warn("add subnode no space!\n");
+                rv_log_warn("添加子节点失败：DTB 空间不足\n");
             }
             assert(subnode >= 0);
 
-            /* compatible = "virtio,mmio" */
+            /* compatible = "virtio,mmio"。 */
             assert(fdt_setprop_string(dtb_buf, subnode, "compatible",
                                       "virtio,mmio") == 0);
 
-            /* reg = <new_addr size> */
+            /* reg = <new_addr size>。 */
             uint32_t reg[2] = {cpu_to_fdt32(new_addr), cpu_to_fdt32(size)};
             assert(fdt_setprop(dtb_buf, subnode, "reg", reg, sizeof(reg)) == 0);
 
-            /* interrupts = <new_irq> */
+            /* interrupts = <new_irq>。 */
             uint32_t irq = cpu_to_fdt32(new_irq);
             assert(fdt_setprop(dtb_buf, subnode, "interrupts", &irq,
                                sizeof(irq)) == 0);
@@ -487,18 +488,14 @@ dtb_end:
 }
 
 /*
- * The control mode flag for keyboard.
+ * 键盘控制模式标志。
  *
- * ICANON: Enable canonical mode.
- * ECHO: Echo input characters.
- * ISIG: When any of the characters INTR, QUIT,
- *       SUSP, or DSUSP are received, generate the
- *       corresponding signal.
+ * ICANON：启用规范模式。
+ * ECHO：回显输入字符。
+ * ISIG：收到 INTR、QUIT、SUSP 或 DSUSP 等控制字符时产生对应信号。
  *
- * It is essential to re-enable ISIG upon exit.
- * Otherwise, the default signal handler will
- * not catch the signal. E.g., SIGINT generated by
- * CTRL + c.
+ * 退出时必须重新启用 ISIG；否则默认信号处理器无法捕获信号，例如 CTRL+c 产生的
+ * SIGINT。
  *
  */
 #define TERMIOS_C_CFLAG (ICANON | ECHO | ISIG)
@@ -510,10 +507,10 @@ static void reset_keyboard_input()
     tcsetattr(0, TCSANOW, &term);
 }
 
-/* Asynchronous communication to capture all keyboard input for the VM. */
+/* 切换终端模式，让 VM 异步捕获所有键盘输入。 */
 static void capture_keyboard_input()
 {
-    /* Hook exit, because we want to re-enable default control modes. */
+    /* 注册退出钩子，退出时恢复默认控制模式。 */
     atexit(reset_keyboard_input);
 
     struct termios term;
@@ -527,10 +524,9 @@ static void capture_keyboard_input()
 #if RV32_HAS(SYSTEM_MMIO)
 /*
  *
- * atexit() registers void (*)(void) callbacks, so no parameters can be passed.
- * Memory must be freed at runtime. block_map_clear() requires a RISC-V instance
- * and runs in interpreter mode. Instead of modifying its signature, access the
- * global RISC-V instance in main.c with external linkage.
+ * atexit() 注册的是 void (*)(void) 回调，不能传参。运行期仍需要释放内存，而
+ * block_map_clear() 需要 RISC-V 实例且仅解释器模式使用。这里不修改其函数签名，
+ * 而是通过 main.c 暴露的全局 RISC-V 实例访问运行时。
  *
  */
 extern riscv_t *rv;
@@ -539,7 +535,7 @@ static void rv_async_block_clear()
 #if !RV32_HAS(JIT)
     if (rv && rv->block_map.size)
         block_map_clear(rv);
-#else  /* TODO: JIT mode */
+#else  /* TODO：JIT 模式。 */
     return;
 #endif /* !RV32_HAS(JIT) */
 }
@@ -551,30 +547,30 @@ static void rv_fsync_device()
 
     vm_attr_t *attr = PRIV(rv);
     /*
-     * mmap_fallback, may need to write and sync the device
+     * mmap 回退路径下可能需要手动写回并同步设备。
      *
-     * vblk is optional, so it could be NULL
+     * vblk 是可选设备，可能为 NULL。
      */
     if (attr->vblk_cnt) {
         for (int i = 0; i < attr->vblk_cnt; i++) {
             virtio_blk_state_t *vblk = attr->vblk[i];
             if (vblk->disk_fd >= 3) {
-                if (vblk->device_features & VIRTIO_BLK_F_RO) /* readonly */
+                if (vblk->device_features & VIRTIO_BLK_F_RO) /* 只读。 */
                     goto end;
 
                 if (pwrite(vblk->disk_fd, vblk->disk, vblk->disk_size, 0) ==
                     -1) {
-                    rv_log_error("pwrite block device failed: %s",
+                    rv_log_error("写回块设备失败：%s",
                                  strerror(errno));
                     return;
                 }
 
                 if (fsync(vblk->disk_fd) == -1) {
-                    rv_log_error("fsync block device failed: %s",
+                    rv_log_error("同步块设备失败：%s",
                                  strerror(errno));
                     return;
                 }
-                rv_log_info("Sync block device OK");
+                rv_log_info("块设备同步完成");
 
             end:
                 close(vblk->disk_fd);
@@ -599,13 +595,13 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     assert(rv);
 
 #if RV32_HAS(SYSTEM_MMIO)
-    /* register cleaning callback for CTRL+a+x exit */
+    /* 注册 CTRL+a+x 退出时的清理回调。 */
     atexit(rv_async_block_clear);
-    /* register device sync callback for CTRL+a+x exit */
+    /* 注册 CTRL+a+x 退出时的设备同步回调。 */
     atexit(rv_fsync_device);
 #endif
 
-    /* copy over the attr */
+    /* 保存调用者传入的属性指针。 */
     rv->data = rv_attr;
 
     vm_attr_t *attr = PRIV(rv);
@@ -613,14 +609,14 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     assert(attr->mem);
     assert(!(((uintptr_t) attr->mem) & 0b11));
 
-    /* reset */
+    /* 初始化寄存器和栈。 */
     rv_reset(rv, 0U);
 
     /*
-     * default standard stream.
-     * rv_remap_stdstream() can be called to overwrite them
+     * 默认标准流。
+     * 调用者可通过 rv_remap_stdstream() 覆盖它们。
      *
-     * The logging stdout stream will be remapped as well
+     * 日志 stdout 流也会一起重映射。
      *
      */
     attr->fd_map = map_init(int, FILE *, map_cmp_int);
@@ -633,32 +629,32 @@ riscv_t *rv_create(riscv_user_t rv_attr)
                        3);
 
     rv_log_set_level(attr->log_level);
-    rv_log_info("Log level: %s", rv_log_level_string(attr->log_level));
+    rv_log_info("日志级别：%s", rv_log_level_string(attr->log_level));
 
 #if !RV32_HAS(SYSTEM_MMIO)
     elf_t *elf = elf_new();
     assert(elf);
 
     if (!elf_open(elf, attr->data.user.elf_program)) {
-        rv_log_fatal("elf_open() failed");
+        rv_log_fatal("elf_open() 失败");
         map_delete(attr->fd_map);
         memory_delete(attr->mem);
         free(rv);
         exit(EXIT_FAILURE);
     }
-    rv_log_info("%s ELF loaded", attr->data.user.elf_program);
+    rv_log_info("%s ELF 已装载", attr->data.user.elf_program);
 
     const struct Elf32_Sym *end;
     if ((end = elf_get_symbol(elf, "_end")))
         attr->break_addr = end->st_value;
 
 #if !RV32_HAS(SYSTEM)
-    /* set not exiting */
+    /* 初始状态不是退出中。 */
     attr->on_exit = false;
     attr->exit_addr = 0;
 
-    /* Try to find exit address from symbols. Check multiple names since
-     * different toolchains/libc implementations may use different symbols.
+    /* 尝试从符号表查找退出函数地址。不同工具链/libc 可能使用不同符号名，
+     * 因此按多个名称兜底查找。
      */
     const struct Elf32_Sym *exit_sym;
     if ((exit_sym = elf_get_symbol(elf, "exit")))
@@ -669,33 +665,33 @@ riscv_t *rv_create(riscv_user_t rv_attr)
 
     assert(elf_load(elf, attr->mem));
 
-    /* set the entry pc */
+    /* 设置入口 PC。 */
     const struct Elf32_Ehdr UNUSED *hdr = get_elf_header(elf);
     assert(rv_set_pc(rv, hdr->e_entry));
 
     elf_delete(elf);
 
-/* combine with USE_ELF for system test suite */
+/* 结合 USE_ELF 支持系统测试套件。 */
 #if RV32_HAS(SYSTEM)
-    /* this variable has external linkage to mmu_io defined in system.c */
+    /* mmu_io 定义在 system.c 中，具有外部链接。 */
     extern riscv_io_t mmu_io;
-    /* install the MMU I/O handlers */
+    /* 安装 MMU I/O 处理器。 */
     memcpy(&rv->io, &mmu_io, sizeof(riscv_io_t));
 #else
-    /* install the I/O handlers */
+    /* 安装用户态直接内存 I/O 处理器。 */
     const riscv_io_t io = {
-        /* memory read interface */
+        /* 内存读取接口。 */
         .mem_ifetch = MEMIO(ifetch),
         .mem_read_w = MEMIO(read_w),
         .mem_read_s = MEMIO(read_s),
         .mem_read_b = MEMIO(read_b),
 
-        /* memory write interface */
+        /* 内存写入接口。 */
         .mem_write_w = MEMIO(write_w),
         .mem_write_s = MEMIO(write_s),
         .mem_write_b = MEMIO(write_b),
 
-        /* system services or essential routines */
+        /* 系统服务和必要运行时例程。 */
         .on_ecall = ecall_handler,
         .on_ebreak = ebreak_handler,
         .on_memcpy = memcpy_handler,
@@ -707,31 +703,31 @@ riscv_t *rv_create(riscv_user_t rv_attr)
 
 #else
     /* *-----------------------------------------*
-     * |              Memory layout              |
+     * |              内存布局                   |
      * *----------------*----------------*-------*
      * |  kernel image  |  initrd image  |  dtb  |
      * *----------------*----------------*-------*
      */
 
-    /* load_dtb needs the count to add the virtio block subnode dynamically */
+    /* load_dtb 需要设备数量，用于动态添加 virtio-blk 子节点。 */
     attr->vblk_cnt = attr->data.system.vblk_device_cnt;
 
     char *ram_loc = (char *) attr->mem->mem_base;
     map_file(&ram_loc, attr->data.system.kernel, 0);
-    rv_log_info("Kernel loaded");
+    rv_log_info("内核已装载");
 
     uint32_t dtb_addr = attr->mem->mem_size - DTB_SIZE;
     ram_loc = ((char *) attr->mem->mem_base) + dtb_addr;
     load_dtb(&ram_loc, attr);
-    rv_log_info("DTB loaded");
-    /* Load optional initrd image before the dtb region.
-     * The initrd region size is defined by INITRD_SIZE at compile time.
+    rv_log_info("DTB 已装载");
+    /* 将可选 initrd 镜像加载到 dtb 区域之前。
+     * initrd 区域大小由编译期 INITRD_SIZE 定义。
      */
     if (attr->data.system.initrd) {
-        /* Ensure memory is large enough to hold initrd region */
+        /* 确保内存足够容纳 initrd 区域。 */
         if (dtb_addr < INITRD_SIZE) {
             rv_log_fatal(
-                "Memory too small for INITRD_SIZE (%u MiB). Increase MEM_SIZE.",
+                "内存过小，无法容纳 INITRD_SIZE（%u MiB）。请增大 MEM_SIZE。",
                 INITRD_SIZE / (1024 * 1024));
             exit(EXIT_FAILURE);
         }
@@ -740,40 +736,40 @@ riscv_t *rv_create(riscv_user_t rv_attr)
         off_t initrd_size =
             map_file(&ram_loc, attr->data.system.initrd, INITRD_SIZE);
         if (initrd_size < 0) {
-            /* map_file returns -1 when file exceeds max_size */
+            /* 文件超过 max_size 时 map_file 返回 -1。 */
             rv_log_fatal(
-                "Initrd file exceeds INITRD_SIZE (%u MiB).\n"
-                "Please rebuild with a larger INITRD_SIZE, e.g.:\n"
+                "Initrd 文件超过 INITRD_SIZE（%u MiB）。\n"
+                "请使用更大的 INITRD_SIZE 重新构建，例如：\n"
                 "  make ENABLE_SYSTEM=1 INITRD_SIZE=64 system",
                 INITRD_SIZE / (1024 * 1024));
             exit(EXIT_FAILURE);
         }
-        rv_log_info("Rootfs loaded (%ld bytes)", (long) initrd_size);
+        rv_log_info("Rootfs 已装载（%ld 字节）", (long) initrd_size);
     }
 
-    /* this variable has external linkage to mmu_io defined in system.c */
+    /* mmu_io 定义在 system.c 中，具有外部链接。 */
     extern riscv_io_t mmu_io;
     memcpy(&rv->io, &mmu_io, sizeof(riscv_io_t));
 
-    /* setup RISC-V hart */
+    /* 设置 RISC-V hart 启动参数。 */
     rv_set_reg(rv, rv_reg_a0, 0);
     rv_set_reg(rv, rv_reg_a1, dtb_addr);
 
-    /* setup timer */
+    /* 设置定时器。 */
     attr->timer = 0xFFFFFFFFFFFFFFF;
 
-    /* setup PLIC */
+    /* 设置 PLIC。 */
     attr->plic = plic_new();
     assert(attr->plic);
     attr->plic->rv = rv;
 
-    /* setup UART */
+    /* 设置 UART。 */
     attr->uart = u8250_new();
     assert(attr->uart);
     attr->uart->in_fd = attr->fd_stdin;
     attr->uart->out_fd = attr->fd_stdout;
 
-    /* setup rtc */
+    /* 设置 RTC。 */
 #if RV32_HAS(GOLDFISH_RTC)
     attr->rtc = rtc_new();
     assert(attr->rtc);
@@ -786,11 +782,11 @@ riscv_t *rv_create(riscv_user_t rv_attr)
 
     if (attr->vblk_cnt) {
         for (int i = 0; i < attr->vblk_cnt; i++) {
-/* Currently, only used for block image path and permission */
+/* 当前只用于块镜像路径和权限选项。 */
 #define MAX_OPTS 2
             char *vblk_device_str = attr->data.system.vblk_device[i];
             if (!vblk_device_str[0]) {
-                rv_log_error("Disk path cannot be empty");
+                rv_log_error("磁盘路径不能为空");
                 exit(EXIT_FAILURE);
             }
 
@@ -799,7 +795,7 @@ riscv_t *rv_create(riscv_user_t rv_attr)
             char *opt = strtok(vblk_device_str, ",");
             while (opt) {
                 if (vblk_opt_idx == MAX_OPTS) {
-                    rv_log_error("Too many arguments for vblk");
+                    rv_log_error("vblk 参数过多");
                     break;
                 }
                 vblk_opts[vblk_opt_idx++] = opt;
@@ -811,29 +807,26 @@ riscv_t *rv_create(riscv_user_t rv_attr)
             bool readonly = false;
 
             if (vblk_opts[0][0] == '~') {
-                /* HOME environment variable should be common in macOS and Linux
-                 * distribution and it is set by the login program
-                 */
+                /* macOS 和 Linux 发行版通常都会由登录程序设置 HOME 环境变量。 */
                 const char *home = getenv("HOME");
                 if (!home) {
                     rv_log_error(
-                        "HOME environment variable is not set, cannot access "
-                        "the disk %s",
+                        "HOME 环境变量未设置，无法访问磁盘 %s",
                         vblk_opts[0]);
                     exit(EXIT_FAILURE);
                 }
 
-                const char *suffix = vblk_opts[0] + 1; /* skip ~ */
+                const char *suffix = vblk_opts[0] + 1; /* 跳过 "~"。 */
                 size_t home_len = strlen(home);
                 size_t suffix_len = strlen(suffix);
                 if (home_len > SIZE_MAX - suffix_len - 1) {
-                    rv_log_error("Disk path too long");
+                    rv_log_error("磁盘路径过长");
                     exit(EXIT_FAILURE);
                 }
                 size_t path_len = home_len + suffix_len + 1;
                 vblk_device = malloc(path_len);
                 if (!vblk_device) {
-                    rv_log_error("Failed to allocate memory for disk path");
+                    rv_log_error("为磁盘路径分配内存失败");
                     exit(EXIT_FAILURE);
                 }
                 snprintf(vblk_device, path_len, "%s%s", home, suffix);
@@ -843,7 +836,7 @@ riscv_t *rv_create(riscv_user_t rv_attr)
 
             if (vblk_readonly) {
                 if (strcmp(vblk_readonly, "readonly") != 0) {
-                    rv_log_error("Unknown vblk option: %s", vblk_readonly);
+                    rv_log_error("未知 vblk 选项：%s", vblk_readonly);
                     exit(EXIT_FAILURE);
                 }
                 readonly = true;
@@ -862,26 +855,26 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     capture_keyboard_input();
 #endif /* !RV32_HAS(SYSTEM_MMIO) */
 
-    /* create block and IRs memory pool */
+    /* 创建基本块和 IR 节点内存池。 */
     rv->block_mp = mpool_create(sizeof(block_t) << BLOCK_MAP_CAPACITY_BITS,
                                 sizeof(block_t));
     rv->block_ir_mp = mpool_create(
         sizeof(rv_insn_t) << BLOCK_IR_MAP_CAPACITY_BITS, sizeof(rv_insn_t));
-    /* Fuse pool: fixed-size slots for macro-op fusion arrays.
-     * Each slot holds up to FUSE_MAX_ENTRIES opcode_fuse_t structures.
+    /* 融合池：用于宏操作融合数组的固定大小槽位。
+     * 每个槽位最多容纳 FUSE_MAX_ENTRIES 个 opcode_fuse_t 结构。
      */
     rv->fuse_mp = mpool_create(FUSE_SLOT_SIZE << BLOCK_IR_MAP_CAPACITY_BITS,
                                FUSE_SLOT_SIZE);
     if (!rv->block_mp || !rv->block_ir_mp || !rv->fuse_mp) {
-        rv_log_fatal("Failed to create memory pool");
+        rv_log_fatal("创建内存池失败");
         goto fail_mpool;
     }
 
 #if !RV32_HAS(JIT)
-    /* initialize the block map */
+    /* 初始化基本块哈希表。 */
     block_map_init(&rv->block_map, BLOCK_MAP_CAPACITY_BITS);
 
-    /* initialize L1 block cache with invalid tags */
+    /* 用无效 tag 初始化 L1 基本块缓存。 */
     for (int i = 0; i < BLOCK_L1_SIZE; i++)
         rv->block_l1.tags[i] = BLOCK_L1_INVALID_TAG;
     memset(rv->block_l1.ptrs, 0, sizeof(rv->block_l1.ptrs));
@@ -889,38 +882,37 @@ riscv_t *rv_create(riscv_user_t rv_attr)
     INIT_LIST_HEAD(&rv->block_list);
     rv->jit_state = jit_state_init(CODE_CACHE_SIZE);
     if (!rv->jit_state) {
-        rv_log_fatal("Failed to initialize JIT state");
+        rv_log_fatal("初始化 JIT 状态失败");
         goto fail_jit_state;
     }
     rv->block_cache = cache_create(BLOCK_MAP_CAPACITY_BITS);
     if (!rv->block_cache) {
-        rv_log_fatal("Failed to create block cache");
+        rv_log_fatal("创建基本块缓存失败");
         goto fail_block_cache;
     }
 #if RV32_HAS(T2C)
     rv->quit = false;
     rv->jit_cache = jit_cache_init();
     if (!rv->jit_cache) {
-        rv_log_fatal("Failed to initialize JIT cache");
+        rv_log_fatal("初始化 JIT 缓存失败");
         goto fail_jit_cache;
     }
     rv->inline_cache = inline_cache_init();
     if (!rv->inline_cache) {
-        rv_log_fatal("Failed to initialize inline cache");
+        rv_log_fatal("初始化 inline cache 失败");
         goto fail_inline_cache;
     }
-    /* prepare wait queue. */
+    /* 准备后台编译等待队列。 */
     pthread_mutex_init(&rv->wait_queue_lock, NULL);
     pthread_mutex_init(&rv->cache_lock, NULL);
     pthread_cond_init(&rv->wait_queue_cond, NULL);
     INIT_LIST_HEAD(&rv->wait_queue);
-    /* Activate the background compilation thread.
-     * Use larger stack (8MB) to handle deep recursion in t2c_trace_ebb
-     * and LLVM's internal stack usage during compilation.
+    /* 启动后台编译线程。
+     * 使用较大的 8MB 栈，以容纳 t2c_trace_ebb 的深递归和 LLVM 编译期内部栈使用。
      */
     pthread_attr_t t2c_attr;
     pthread_attr_init(&t2c_attr);
-    pthread_attr_setstacksize(&t2c_attr, 8 * 1024 * 1024); /* 8MB stack */
+    pthread_attr_setstacksize(&t2c_attr, 8 * 1024 * 1024); /* 8MB 栈。 */
     pthread_create(&t2c_thread, &t2c_attr, t2c_runloop, rv);
     pthread_attr_destroy(&t2c_attr);
 #endif
@@ -970,7 +962,7 @@ fail_mpool:
 
 #if !RV32_HAS(SYSTEM_MMIO)
 /*
- * TODO: enable to trace Linux kernel symbol
+ * TODO：支持跟踪 Linux 内核符号。
  */
 static void rv_run_and_trace(riscv_t *rv)
 {
@@ -984,13 +976,13 @@ static void rv_run_and_trace(riscv_t *rv)
     elf_t *elf = elf_new();
     assert(elf && elf_open(elf, prog_name));
 
-    for (; !rv_has_halted(rv);) { /* run until the flag is done */
-        /* trace execution */
+    for (; !rv_has_halted(rv);) { /* 持续运行直到 halt 标志置位。 */
+        /* 跟踪执行位置。 */
         uint32_t pc = rv_get_pc(rv);
         const char *sym = elf_find_symbol(elf, pc);
         rv_log_trace("%08x  %s", pc, (sym ? sym : ""));
 
-        rv_step(rv); /* step instructions */
+        rv_step(rv); /* 执行一批指令。 */
     }
 
     elf_delete(elf);
@@ -998,7 +990,7 @@ static void rv_run_and_trace(riscv_t *rv)
 #endif
 
 #if RV32_HAS(GDBSTUB)
-/* Run the RISC-V emulator as gdbstub */
+/* 以 gdbstub 模式运行 RISC-V 模拟器。 */
 void rv_debug(riscv_t *rv);
 #endif
 
@@ -1021,9 +1013,9 @@ void rv_run(riscv_t *rv)
 #ifdef __EMSCRIPTEN__
         emscripten_set_main_loop_arg(rv_step, (void *) rv, 0, 1);
 #else
-        /* default main loop */
-        for (; !rv_has_halted(rv);) /* run until the flag is done */
-            rv_step(rv);            /* step instructions */
+        /* 默认主循环。 */
+        for (; !rv_has_halted(rv);) /* 持续运行直到 halt 标志置位。 */
+            rv_step(rv);            /* 执行一批指令。 */
 #endif
     }
 #if !RV32_HAS(SYSTEM_MMIO)
@@ -1075,7 +1067,7 @@ void rv_delete(riscv_t *rv)
     block_map_destroy(rv);
 #else
 #if RV32_HAS(T2C)
-    /* Signal the thread to quit */
+    /* 通知后台线程退出。 */
     pthread_mutex_lock(&rv->wait_queue_lock);
     rv->quit = true;
     pthread_cond_signal(&rv->wait_queue_cond);
@@ -1083,7 +1075,7 @@ void rv_delete(riscv_t *rv)
 
     pthread_join(t2c_thread, NULL);
 
-    /* Clean up any remaining entries in wait queue */
+    /* 清理等待队列中尚未处理的条目。 */
     queue_entry_t *entry, *safe;
     list_for_each_entry_safe (entry, safe, &rv->wait_queue, list) {
         list_del(&entry->list);
@@ -1096,7 +1088,7 @@ void rv_delete(riscv_t *rv)
     jit_cache_exit(rv->jit_cache);
     inline_cache_exit(rv->inline_cache);
 
-    /* Dispose LLVM engines for all remaining blocks before freeing cache */
+    /* 释放缓存前，先销毁所有剩余基本块上的 LLVM engine。 */
     clear_cache_hot(rv->block_cache, t2c_dispose_block_engine);
 #endif
     jit_state_exit(rv->jit_state);
@@ -1111,7 +1103,7 @@ void rv_delete(riscv_t *rv)
 #if RV32_HAS(GOLDFISH_RTC)
     rtc_delete(attr->rtc);
 #endif /* RV32_HAS(GOLDFISH_RTC) */
-    /* sync device, cleanup inside the callee */
+    /* 同步设备；具体清理由被调函数完成。 */
     rv_fsync_device();
 #endif
     free(rv);
@@ -1129,17 +1121,17 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
     memory_t *mem = attr->mem;
 #endif
 
-    /* set the reset address */
+    /* 设置复位地址。 */
     rv->PC = pc;
 
-    /* set the default stack pointer */
+    /* 设置默认栈指针。 */
     rv->X[rv_reg_sp] =
         attr->mem_size - attr->stack_size - attr->args_offset_size;
 
-    /* User-mode: Store 'argc' and 'args' of the target program in 'state->mem'.
-     * System-mode: Skip this - kernel boot doesn't use argc/argv.
+    /* 用户态：把目标程序的 argc 和 args 写入客体内存。
+     * 系统态：跳过这一步，内核启动不使用 argc/argv。
      *
-     * memory layout of arguments as below:
+     * 参数内存布局如下：
      * -----------------------
      * |    NULL            |
      * -----------------------
@@ -1164,10 +1156,10 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
      * |    argc            |
      * -----------------------
      *
-     * TODO: access to envp
+     * TODO：支持访问 envp。
      */
 #if !RV32_HAS(SYSTEM_MMIO)
-    /* copy args to RAM */
+    /* 把参数字符串复制到 RAM。 */
     uintptr_t args_size = (1 + argc + 1) * sizeof(uint32_t);
     uintptr_t args_bottom = attr->mem_size - attr->stack_size;
     uintptr_t args_top = args_bottom - args_size;
@@ -1179,7 +1171,7 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
     args_p++;
 
     /* args */
-    /* used for calculating the offset of args when pushing to stack */
+    /* 记录每个参数长度，供后续压栈时计算偏移。 */
     size_t args_space[256];
     size_t args_space_idx = 0;
     size_t args_len;
@@ -1194,9 +1186,9 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
         args_len_total += args_len + 1;
     }
     args_p = (uintptr_t *) ((uintptr_t) args_p - args_len_total);
-    args_p--; /* point to argc */
+    args_p--; /* 指回 argc。 */
 
-    /* ready to push argc, args to stack */
+    /* 准备把 argc 和 argv 指针压到栈上。 */
     int stack_size = (1 + argc + 1) * sizeof(uint32_t);
     uintptr_t stack_bottom = (uintptr_t) rv->X[rv_reg_sp];
     uintptr_t stack_top = stack_bottom - stack_size;
@@ -1208,7 +1200,7 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
                         (void *) (mem->mem_base + (uintptr_t) args_p),
                         sizeof(int)));
     args_p++;
-    /* keep argc and args[0] within one word due to RV32 ABI */
+    /* 按 RV32 ABI，让 argc 和 args[0] 各占一个字。 */
     sp = (uintptr_t *) ((uint32_t *) sp + 1);
 
     /* args */
@@ -1221,33 +1213,31 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
     }
     assert(memory_fill(mem, (uintptr_t) sp, sizeof(uint32_t), 0));
 
-    /* reset sp pointing to argc */
+    /* 重置 sp，使其指向 argc。 */
     rv->X[rv_reg_sp] = stack_top;
 #endif /* !RV32_HAS(SYSTEM_MMIO) */
 
-    /* reset privilege mode */
+    /* 重置特权模式。 */
 #if RV32_HAS(SYSTEM)
     /*
-     * System simulation defaults to S-mode as
-     * it does not rely on M-mode software like OpenSBI.
+     * 系统模拟默认进入 S 模式，因为该启动路径不依赖 OpenSBI 等 M 模式软件。
      */
     rv->priv_mode = RV_PRIV_S_MODE;
 
-    /* not being trapped */
+    /* 初始状态未处于 trap 中。 */
     rv->is_trapped = false;
 
-    /* Reset address translation: clear SATP and flush both TLBs to prevent
-     * stale translations from previous execution.
+    /* 重置地址转换：清空 SATP 并刷新两个 TLB，避免复用上一次执行遗留的转换结果。
      */
     rv->csr_satp = 0;
     memset(rv->dtlb, 0, sizeof(rv->dtlb));
     memset(rv->itlb, 0, sizeof(rv->itlb));
 #else
-    /* ISA simulation defaults to M-mode */
+    /* ISA 用户态模拟默认进入 M 模式。 */
     rv->priv_mode = RV_PRIV_M_MODE;
 #endif
 
-    /* reset the csrs */
+    /* 重置 CSR。 */
     rv->csr_mtvec = 0;
     rv->csr_cycle = 0;
 #if RV32_HAS(SYSTEM)
@@ -1271,7 +1261,7 @@ void rv_reset(riscv_t *rv, riscv_word_t pc)
 #endif
 #if RV32_HAS(EXT_F)
     rv->csr_misa |= MISA_F;
-    /* reset float registers */
+    /* 重置浮点寄存器。 */
     for (int i = 0; i < N_RV_REGS; i++)
         rv->F[i].v = 0;
     rv->csr_fcsr = 0;
@@ -1327,12 +1317,12 @@ static void profile(block_t *block, uint32_t freq, FILE *output_file)
 void rv_profile(riscv_t *rv, char *out_file_path)
 {
     if (!out_file_path) {
-        rv_log_warn("Profiling data output file is NULL");
+        rv_log_warn("profiling 数据输出文件为空");
         return;
     }
     FILE *f = fopen(out_file_path, "w");
     if (!f) {
-        rv_log_error("Cannot open profiling data output file");
+        rv_log_error("无法打开 profiling 数据输出文件");
         return;
     }
 #if RV32_HAS(JIT)

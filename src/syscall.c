@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 用户态 ecall/系统调用处理。
+ *
+ * 模拟器实现 newlib 和简单 POSIX 程序常用的一小组系统调用，把客体寄存器 a0-a7
+ * 中的参数转换为宿主系统调用或运行时操作。系统模式下也复用本文件处理 SBI
+ * timer/base/reset 等调用。
  */
 
 #include <assert.h>
@@ -16,11 +23,10 @@
 
 #define PREALLOC_SIZE 4096
 
-/* newlib is a portable (not RISC-V specific) C library, which implements
- * printf(3) and other functions described in C standards. Some system calls
- * should be provided in conjunction with newlib.
+/* newlib 是可移植的 C 运行库，并非 RISC-V 专用。它实现了 printf(3) 以及
+ * C 标准库中的其他函数，因此模拟器需要补齐配套的一小组系统调用。
  *
- * system call: name, number
+ * 系统调用：名称、编号。
  */
 /* clang-format off */
 #define SUPPORTED_SYSCALLS                 \
@@ -95,7 +101,7 @@ static void syscall_write(riscv_t *rv)
     riscv_word_t buffer = rv_get_reg(rv, rv_reg_a1);
     riscv_word_t count = rv_get_reg(rv, rv_reg_a2);
 
-    /* lookup the file descriptor */
+    /* 查询文件描述符映射。 */
     map_iter_t it;
     map_find(attr->fd_map, &it, &fd);
     if (map_at_end(attr->fd_map, &it))
@@ -106,7 +112,7 @@ static void syscall_write(riscv_t *rv)
 
     while (count > PREALLOC_SIZE) {
         memory_read(attr->mem, tmp, buffer + total_write, PREALLOC_SIZE);
-        /* write out the data */
+        /* 分块写出客体内存中的数据。 */
         size_t written = fwrite(tmp, 1, PREALLOC_SIZE, handle);
         if (written != PREALLOC_SIZE && ferror(handle))
             goto error_handler;
@@ -115,27 +121,25 @@ static void syscall_write(riscv_t *rv)
     }
 
     memory_read(attr->mem, tmp, buffer + total_write, count);
-    /* write out the data */
+    /* 写出剩余数据。 */
     size_t written = fwrite(tmp, 1, count, handle);
     if (written != count && ferror(handle))
         goto error_handler;
     total_write += written;
     assert(total_write == rv_get_reg(rv, rv_reg_a2));
 
-    /* return number of bytes written */
+    /* 返回实际写出的字节数。 */
     rv_set_reg(rv, rv_reg_a0, total_write);
     return;
 
-    /* read the string being printed */
 error_handler:
-    /* error */
+    /* 出错时按 newlib 约定返回 -1。 */
     rv_set_reg(rv, rv_reg_a0, -1);
 }
 
 static void syscall_exit(riscv_t *rv)
 {
-    /* simply halt cpu and save exit code.
-     * the application decides the usage of exit code
+    /* 退出系统调用只停止 CPU 并保存退出码，退出码语义由上层应用决定。
      */
     rv_halt(rv);
 
@@ -144,30 +148,30 @@ static void syscall_exit(riscv_t *rv)
 }
 
 /* brk(increment)
- * Note:
- *   - 8 byte alignment for malloc chunks
- *   - 4 KiB aligned for sbrk blocks
+ * 说明：
+ *   - malloc chunk 使用 8 字节对齐。
+ *   - sbrk block 使用 4 KiB 对齐。
  */
 static void syscall_brk(riscv_t *rv)
 {
     vm_attr_t *attr = PRIV(rv);
 
-    /* get the increment parameter */
+    /* 读取新的 break 地址。 */
     riscv_word_t increment = rv_get_reg(rv, rv_reg_a0);
     if (increment)
         attr->break_addr = increment;
 
-    /* return new break address */
+    /* 返回当前 break 地址。 */
     rv_set_reg(rv, rv_reg_a0, attr->break_addr);
 }
 
 static void syscall_gettimeofday(riscv_t *rv)
 {
-    /* get the parameters */
+    /* 读取客体传入的 timeval/timezone 指针。 */
     riscv_word_t tv = rv_get_reg(rv, rv_reg_a0);
     riscv_word_t tz = rv_get_reg(rv, rv_reg_a1);
 
-    /* return the clock time */
+    /* 写回宿主时钟时间。 */
     if (tv) {
         struct timeval tv_s;
         rv_gettimeofday(&tv_s);
@@ -176,16 +180,16 @@ static void syscall_gettimeofday(riscv_t *rv)
     }
 
     if (tz) {
-        /* FIXME: This parameter is ignored by the syscall handler in newlib. */
+        /* FIXME：newlib 的 syscall 处理器当前会忽略 timezone 参数。 */
     }
 
-    /* success */
+    /* 成功返回 0。 */
     rv_set_reg(rv, rv_reg_a0, 0);
 }
 
 static void syscall_clock_gettime(riscv_t *rv)
 {
-    /* get the parameters */
+    /* 读取 clock id 和 timespec 输出地址。 */
     riscv_word_t id = rv_get_reg(rv, rv_reg_a0);
     riscv_word_t tp = rv_get_reg(rv, rv_reg_a1);
 
@@ -207,7 +211,7 @@ static void syscall_clock_gettime(riscv_t *rv)
         memory_write_w(tp + 8, (const uint8_t *) &tp_s.tv_nsec);
     }
 
-    /* success */
+    /* 成功返回 0。 */
     rv_set_reg(rv, rv_reg_a0, 0);
 }
 
@@ -220,45 +224,39 @@ static void syscall_close(riscv_t *rv)
 
 #if !RV32_HAS(SYSTEM)
     /*
-     * The crt0 closes standard file descriptor(0, 1, 2) when
-     * the process exits. Thus, the operations by the crt0
-     * should not be considered as error. For stripped ELFs where
-     * exit_addr is not found, allow close(fd<3) to succeed silently.
+     * crt0 会在进程退出时关闭标准文件描述符 0、1、2，这类操作不应视为错误。
+     * 对于无法找到 exit_addr 的 stripped ELF，允许 close(fd < 3) 静默成功。
      */
     if (fd < 3 && !PRIV(rv)->on_exit && PRIV(rv)->exit_addr) {
         rv_set_reg(rv, rv_reg_a0, -1);
         rv_log_error(
-            "Attempted to close a file descriptor < 3 (fd=%u). Operation "
-            "not supported.",
+            "尝试关闭小于 3 的标准文件描述符（fd=%u），该操作不受支持。",
             fd);
         return;
     }
 #endif
 
-    if (fd >= 3) { /* lookup the file descriptor */
+    if (fd >= 3) { /* 查询文件描述符映射。 */
         map_iter_t it;
         map_find(attr->fd_map, &it, &fd);
         if (!map_at_end(attr->fd_map, &it)) {
             if (fclose(map_iter_value(&it, FILE *))) {
-                /* error */
+                /* fclose 失败。 */
                 rv_set_reg(rv, rv_reg_a0, -1);
                 return;
             }
             map_erase(attr->fd_map, &it);
 
-            /* success */
+            /* 成功关闭并移除映射。 */
             rv_set_reg(rv, rv_reg_a0, 0);
         }
     }
 
-    /* success */
+    /* 标准描述符或已关闭描述符也按成功处理。 */
     rv_set_reg(rv, rv_reg_a0, 0);
 }
 
-/* lseek() repositions the file offset of the open file description associated
- * with the file descriptor fd to the argument offset according to the
- * directive whence.
- */
+/* lseek() 根据 whence 把 fd 对应已打开文件的偏移移动到 offset 指定位置。 */
 static void syscall_lseek(riscv_t *rv)
 {
     vm_attr_t *attr = PRIV(rv);
@@ -268,30 +266,30 @@ static void syscall_lseek(riscv_t *rv)
     uint32_t offset = rv_get_reg(rv, rv_reg_a1);
     uint32_t whence = rv_get_reg(rv, rv_reg_a2);
 
-    /* find the file descriptor */
+    /* 查询文件描述符映射。 */
     map_iter_t it;
     map_find(attr->fd_map, &it, &fd);
     if (map_at_end(attr->fd_map, &it)) {
-        /* error */
+        /* 未找到描述符。 */
         rv_set_reg(rv, rv_reg_a0, -1);
         return;
     }
 
     FILE *handle = map_iter_value(&it, FILE *);
     if (fseek(handle, offset, whence)) {
-        /* error */
+        /* fseek 失败。 */
         rv_set_reg(rv, rv_reg_a0, -1);
         return;
     }
 
     long pos = ftell(handle);
     if (pos == -1) {
-        /* error */
+        /* ftell 失败。 */
         rv_set_reg(rv, rv_reg_a0, -1);
         return;
     }
 
-    /* success */
+    /* 返回移动后的文件偏移。 */
     rv_set_reg(rv, rv_reg_a0, pos);
 }
 
@@ -304,18 +302,18 @@ static void syscall_read(riscv_t *rv)
     uint32_t buf = rv_get_reg(rv, rv_reg_a1);
     uint32_t count = rv_get_reg(rv, rv_reg_a2);
 
-    /* lookup the file */
+    /* 查询文件描述符映射。 */
     map_iter_t it;
     map_find(attr->fd_map, &it, &fd);
     if (map_at_end(attr->fd_map, &it)) {
-        /* error */
+        /* 未找到描述符。 */
         rv_set_reg(rv, rv_reg_a0, -1);
         return;
     }
 
     FILE *handle = map_iter_value(&it, FILE *);
     uint32_t total_read = 0;
-    /* read the file into runtime memory */
+    /* 从宿主文件读取数据，再写入客体内存。 */
 
     while (count > PREALLOC_SIZE) {
         size_t r = fread(tmp, 1, PREALLOC_SIZE, handle);
@@ -335,17 +333,17 @@ static void syscall_read(riscv_t *rv)
     }
     total_read += r;
     if (total_read != rv_get_reg(rv, rv_reg_a2) && ferror(handle)) {
-        /* error */
+        /* 宿主读失败。 */
         rv_set_reg(rv, rv_reg_a0, -1);
         return;
     }
-    /* success */
+    /* 返回实际读取的字节数。 */
     rv_set_reg(rv, rv_reg_a0, total_read);
 }
 
 static void syscall_fstat(riscv_t *rv UNUSED)
 {
-    /* FIXME: fill real implementation */
+    /* FIXME：补充真实 fstat 实现。 */
 }
 
 static void syscall_open(riscv_t *rv)
@@ -357,20 +355,20 @@ static void syscall_open(riscv_t *rv)
     uint32_t flags = rv_get_reg(rv, rv_reg_a1);
     uint32_t mode = rv_get_reg(rv, rv_reg_a2);
 
-    /* read name from runtime memory with bounds checking */
+    /* 带边界检查地读取客体内存中的路径字符串。 */
     if (name >= attr->mem->mem_size) {
         rv_set_reg(rv, rv_reg_a0, -1);
         return;
     }
 
-    /* Calculate safe maximum length to prevent reading beyond memory */
+    /* 计算安全最大长度，避免越过客体内存末尾。 */
     const size_t max_len = attr->mem->mem_size - name;
     const char *name_ptr = (char *) attr->mem->mem_base + name;
 
-    /* Use strnlen to safely find string length within bounds */
+    /* 在边界内查找字符串结尾。 */
     const size_t name_len = strnlen(name_ptr, max_len);
     if (name_len == max_len) {
-        /* No null terminator found within bounds */
+        /* 边界内没有找到 NUL 终止符。 */
         rv_set_reg(rv, rv_reg_a0, -1);
         return;
     }
@@ -383,7 +381,7 @@ static void syscall_open(riscv_t *rv)
     name_str[name_len] = '\0';
     memory_read(attr->mem, (uint8_t *) name_str, name, name_len);
 
-    /* open the file */
+    /* 按 flags/mode 映射出的宿主模式打开文件。 */
     const char *mode_str = get_mode_str(flags, mode);
     if (!mode_str) {
         free(name_str);
@@ -400,12 +398,12 @@ static void syscall_open(riscv_t *rv)
 
     free(name_str);
 
-    const int fd = find_free_fd(attr); /* find a free file descriptor */
+    const int fd = find_free_fd(attr); /* 分配一个空闲文件描述符。 */
 
-    /* insert into the file descriptor map */
+    /* 插入文件描述符映射。 */
     map_insert(attr->fd_map, (void *) &fd, &handle);
 
-    /* return the file descriptor */
+    /* 返回分配的客体文件描述符。 */
     rv_set_reg(rv, rv_reg_a0, fd);
 }
 
@@ -418,7 +416,7 @@ extern void syscall_control_audio(riscv_t *rv);
 #endif
 
 #if RV32_HAS(SYSTEM)
-/* SBI related system calls */
+/* SBI 相关调用。 */
 static void syscall_sbi_timer(riscv_t *rv)
 {
     vm_attr_t *attr = PRIV(rv);
@@ -494,7 +492,7 @@ static void syscall_sbi_rst(riscv_t *rv)
 
     switch (fid) {
     case SBI_RST_SYSTEM_RESET:
-        rv_log_info("System reset: type=%u, reason=%u", a0, a1);
+        rv_log_info("系统复位：type=%u, reason=%u", a0, a1);
         rv_halt(rv);
         rv_set_reg(rv, rv_reg_a0, SBI_SUCCESS);
         rv_set_reg(rv, rv_reg_a1, 0);
@@ -509,14 +507,14 @@ static void syscall_sbi_rst(riscv_t *rv)
 
 void syscall_handler(riscv_t *rv)
 {
-/* get the syscall number */
+/* 读取系统调用号。 */
 #if !RV32_HAS(RV32E)
     riscv_word_t syscall = rv_get_reg(rv, rv_reg_a7);
 #else
     riscv_word_t syscall = rv_get_reg(rv, rv_reg_t0);
 #endif
 
-    switch (syscall) { /* dispatch system call */
+    switch (syscall) { /* 分派系统调用。 */
 #define _(name, number)     \
     case SYS_##name:        \
         syscall_##name(rv); \
@@ -524,12 +522,11 @@ void syscall_handler(riscv_t *rv)
         SUPPORTED_SYSCALLS
 #undef _
     default:
-        rv_log_fatal("Unknown syscall: %d", (int) syscall);
+        rv_log_fatal("未知系统调用：%d", (int) syscall);
         break;
     }
 
-    /* save return code.
-     * the application decides the usage of the return code
+    /* 保存返回码，返回码用途由上层应用决定。
      */
     vm_attr_t *attr = PRIV(rv);
     attr->error = rv_get_reg(rv, rv_reg_a0);

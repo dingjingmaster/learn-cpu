@@ -3,6 +3,14 @@
  * "LICENSE" for information on usage and redistribution of this file.
  */
 
+/*
+ * 二级 LLVM JIT 驱动。
+ *
+ * T2C 会把热点基本块转换为 LLVM IR，调用 LLVM 优化和执行引擎生成宿主机器码。
+ * 本文件管理 LLVM 模块、执行引擎、inline cache、jit cache 和后台编译结果，
+ * 并与 cache_lock 协作处理系统模式下的地址空间失效。
+ */
+
 #include <llvm-c/Analysis.h>
 #include <llvm-c/BitWriter.h>
 #include <llvm-c/Core.h>
@@ -12,23 +20,23 @@
 #include <llvm/Config/llvm-config.h>
 #include <stdlib.h>
 
-/* LLVM version compatibility check.
- * T2C requires LLVM 18-21 for the following APIs:
- * - LLVMRunPasses (new pass manager, added in LLVM 13)
- * - LLVMGetInlineAsm with 9 arguments (CanThrow param added in LLVM 13)
- * - LLVMBuildAtomicRMW (stable across 18-21)
- * - LLVMCreateTargetMachine (stable across 18-21)
+/* LLVM 版本兼容性检查。
+ * T2C 需要 LLVM 18-21，原因是依赖以下 API：
+ * - LLVMRunPasses（新 pass manager，LLVM 13 加入）
+ * - 9 参数版本 LLVMGetInlineAsm（CanThrow 参数在 LLVM 13 加入）
+ * - LLVMBuildAtomicRMW（LLVM 18-21 中保持稳定）
+ * - LLVMCreateTargetMachine（LLVM 18-21 中保持稳定）
  *
- * Note: LLVM 22+ may deprecate MCJIT in favor of ORC JIT.
- * When upgrading beyond LLVM 21, review:
- * - MCJIT deprecation status
- * - Any LLVMGetInlineAsm signature changes
- * - Code model defaults for JIT on aarch64
+ * NOTE：LLVM 22+ 可能会用 ORC JIT 取代 MCJIT。
+ * 升级到 LLVM 21 以后版本时，需要检查：
+ * - MCJIT 弃用状态
+ * - LLVMGetInlineAsm 签名变化
+ * - aarch64 JIT 的 code model 默认值
  */
 #if LLVM_VERSION_MAJOR < 18
-#error "T2C requires LLVM 18 or later. Found LLVM " LLVM_VERSION_STRING
+#error "T2C 需要 LLVM 18 或更高版本。当前 LLVM 版本为 " LLVM_VERSION_STRING
 #elif LLVM_VERSION_MAJOR > 21
-#warning "LLVM version > 21 detected. T2C is tested with LLVM 18-21."
+#warning "检测到 LLVM 版本大于 21。T2C 目前测试覆盖 LLVM 18-21。"
 #endif
 
 #include "jit.h"
@@ -70,16 +78,15 @@ FORCE_INLINE LLVMBasicBlockRef t2c_block_map_search(struct LLVM_block_map *map,
     return NULL;
 }
 
-/* T2C_OP generates code for each RISC-V instruction with batched cycle updates.
+/* T2C_OP 为每条 RISC-V 指令生成代码，并批量更新周期计数。
  *
- * Cycle optimization: Instead of updating rv->csr_cycle per instruction, we
- * increment a local counter (alloca) and store to csr_cycle only at block
- * exits. This reduces memory traffic significantly - LLVM's mem2reg pass
- * promotes the alloca to a register, making per-instruction increments free.
+ * 周期计数优化：不再每条指令都更新 rv->csr_cycle，而是在本地计数器（alloca）
+ * 中累加，只在基本块出口写回 csr_cycle。这显著减少内存访问；LLVM 的 mem2reg
+ * pass 会把该 alloca 提升为寄存器，使逐指令累加几乎没有额外成本。
  *
- * The insn_counter parameter is an alloca created at function entry in
- * t2c_compile(). Before any LLVMBuildRetVoid(), T2C_STORE_TIMER must be called
- * to flush the accumulated count to rv->csr_cycle.
+ * insn_counter 参数是在 t2c_compile() 函数入口创建的 alloca。任何
+ * LLVMBuildRetVoid() 之前，都必须调用 T2C_STORE_TIMER，把累计值刷新到
+ * rv->csr_cycle。
  */
 #define T2C_OP(inst, code)                                                     \
     static void t2c_##inst(                                                    \
@@ -90,8 +97,7 @@ FORCE_INLINE LLVMBasicBlockRef t2c_block_map_search(struct LLVM_block_map *map,
         uint64_t mem_base UNUSED, block_t *block UNUSED, rv_insn_t *ir UNUSED, \
         LLVMValueRef insn_counter UNUSED)                                      \
     {                                                                          \
-        /* Increment local instruction counter (promoted to register by LLVM)  \
-         */                                                                    \
+        /* 递增本地指令计数器，之后会被 LLVM 提升为寄存器。 */                \
         LLVMValueRef cnt =                                                     \
             LLVMBuildLoad2(*builder, LLVMInt64Type(), insn_counter, "");       \
         cnt = LLVMBuildAdd(*builder, cnt,                                      \
@@ -142,18 +148,18 @@ T2C_LLVM_GEN_ADDR(csr_cycle, csr_cycle, 0);
         LLVMBuildICmp(*builder, LLVMInt##cond, rs1, \
                       LLVMConstInt(LLVMInt32Type(), imm, false), "")
 
-/* Store accumulated instruction count to rv->csr_cycle before block exit.
- * Called before every LLVMBuildRetVoid() to flush the counter.
- * The insn_counter is an alloca that LLVM's mem2reg promotes to a register.
+/* 在基本块退出前，把累计指令数写入 rv->csr_cycle。
+ * 每次 LLVMBuildRetVoid() 之前都会调用该宏来刷新计数器。
+ * insn_counter 是一个 alloca，LLVM 的 mem2reg 会把它提升为寄存器。
  *
- * Uses atomic add (LLVMBuildAtomicRMW) for thread safety:
- * - Prevents torn reads if debugger/monitor reads csr_cycle concurrently
- * - Single atomic instruction vs non-atomic load-add-store sequence
- * - Monotonic ordering sufficient (no synchronization with other memory ops)
+ * 这里使用原子加（LLVMBuildAtomicRMW）保证线程安全：
+ * - 调试器或监视器并发读取 csr_cycle 时，不会看到撕裂读
+ * - 相比非原子的 load-add-store 序列，只需要一条原子指令
+ * - Monotonic 顺序足够，因为不需要与其他内存操作同步
  *
- * Using csr_cycle instead of timer ensures:
- * - SYSTEM mode: timer interrupts work correctly (timer = csr_cycle + offset)
- * - Non-SYSTEM mode: RDCYCLE instruction returns accurate counts
+ * 使用 csr_cycle 而不是 timer 可以保证：
+ * - SYSTEM 模式：定时器中断仍然正确工作（timer = csr_cycle + offset）
+ * - 非 SYSTEM 模式：RDCYCLE 指令返回准确计数
  */
 #define T2C_STORE_TIMER(bldr, start_val, counter)                         \
     do {                                                                  \
@@ -182,26 +188,24 @@ UNUSED FORCE_INLINE LLVMValueRef t2c_gen_mem_loc(LLVMValueRef start,
     return addr;
 }
 
-/* Load and call a function pointer from rv->io struct.
+/* 从 rv->io 结构体中加载函数指针并调用。
  *
- * The byte_offset parameter is the offset from the start of riscv_t to the
- * target function pointer. Callers should use:
- *   - offsetof(riscv_t, io) + offsetof(riscv_io_t, on_ecall) for ecall
- *   - offsetof(riscv_t, io) + offsetof(riscv_io_t, on_ebreak) for ebreak
+ * byte_offset 参数是从 riscv_t 起始位置到目标函数指针的字节偏移。调用方应使用：
+ *   - ecall：offsetof(riscv_t, io) + offsetof(riscv_io_t, on_ecall)
+ *   - ebreak：offsetof(riscv_t, io) + offsetof(riscv_io_t, on_ebreak)
  *
- * This approach is correct regardless of RV32_HAS(SYSTEM) configuration,
- * which adds extra MMU function pointers to riscv_io_t.
+ * 无论 RV32_HAS(SYSTEM) 是否启用，该做法都正确；系统模式会向 riscv_io_t
+ * 追加额外 MMU 函数指针。
  *
- * Uses manual pointer arithmetic (PtrToInt -> Add -> IntToPtr) to compute
- * the correct address, avoiding issues with GEP and struct layout
- * mismatches that can cause crashes on Apple Silicon.
+ * 这里手动执行指针算术（PtrToInt -> Add -> IntToPtr）来计算正确地址，避免
+ * GEP 与结构体布局不匹配的问题；该问题在 Apple Silicon 上可能导致崩溃。
  */
 FORCE_INLINE void t2c_gen_call_io_func(LLVMValueRef start,
                                        LLVMBuilderRef *builder,
                                        LLVMTypeRef *param_types,
                                        size_t byte_offset)
 {
-    /* Convert rv pointer to integer, add offset, convert back to pointer */
+    /* 将 rv 指针转为整数，加上偏移后再转回指针。 */
     LLVMValueRef rv_ptr = LLVMGetParam(start, 0);
     LLVMValueRef rv_int =
         LLVMBuildPtrToInt(*builder, rv_ptr, LLVMInt64Type(), "");
@@ -211,7 +215,7 @@ FORCE_INLINE void t2c_gen_call_io_func(LLVMValueRef start,
         *builder, func_ptr_addr,
         LLVMPointerType(LLVMPointerType(LLVMVoidType(), 0), 0), "");
 
-    /* Load function pointer and call */
+    /* 加载函数指针并发起调用。 */
     LLVMValueRef io_func = LLVMBuildLoad2(
         *builder, LLVMPointerType(LLVMVoidType(), 0), func_ptr_ptr, "io_func");
     LLVMBuildCall2(*builder,
@@ -227,12 +231,12 @@ static LLVMTypeRef t2c_inline_cache_struct_type;
 #undef T2C_OP
 
 static const void *dispatch_table[] = {
-/* RV32 instructions */
+/* RV32 指令。 */
 #define _(inst, can_branch, insn_len, translatable, reg_mask) \
     [rv_insn_##inst] = t2c_##inst,
     RV_INSN_LIST
 #undef _
-/* Macro operation fusion instructions */
+/* 宏操作融合指令。 */
 #define _(inst) [rv_insn_##inst] = t2c_##inst,
         FUSE_INSN_LIST
 #undef _
@@ -288,7 +292,7 @@ static void t2c_trace_ebb(LLVMBuilderRef *builder,
     t2c_block_map_insert(map, entry, ir->pc);
     LLVMBuilderRef tk = NULL, utk = NULL;
 
-    /* Get mem_base once at the start, not on every instruction */
+    /* 入口处只获取一次 mem_base，避免每条指令重复读取。 */
     vm_attr_t *priv = PRIV(rv);
     uint64_t mem_base = (uint64_t) ((memory_t *) priv->mem)->mem_base;
 
@@ -302,11 +306,10 @@ static void t2c_trace_ebb(LLVMBuilderRef *builder,
     }
 
     if (!t2c_insn_is_terminal(ir->opcode)) {
-        /* For non-branch instructions that have fall-through continuation,
-         * use the current builder since the instruction handler doesn't
-         * create a separate taken/untaken path.
-         * Branch instruction handlers (jal, beq, etc.) set tk/utk themselves,
-         * but non-branch instruction handlers (lw, sw, add, etc.) don't.
+        /* 对带 fall-through 后继的非分支指令，使用当前 builder。
+         * 这类指令处理器不会创建独立的 taken/untaken 路径。
+         * 分支处理器（jal、beq 等）会自行设置 tk/utk；非分支处理器
+         * （lw、sw、add 等）不会。
          */
         if (!tk && ir->branch_taken)
             tk = *builder;
@@ -314,7 +317,7 @@ static void t2c_trace_ebb(LLVMBuilderRef *builder,
             utk = *builder;
 
         if (ir->branch_untaken) {
-            /* Cache untaken_pc to avoid race condition with main thread */
+            /* 缓存 untaken_pc，避免与主线程发生竞争。 */
             uint32_t untaken_pc = ir->branch_untaken->pc;
             if (set_has(set, untaken_pc)) {
                 LLVMBuildBr(utk, t2c_block_map_search(map, untaken_pc));
@@ -342,8 +345,8 @@ static void t2c_trace_ebb(LLVMBuilderRef *builder,
             if (set_has(set, taken_pc)) {
                 LLVMBuildBr(tk, t2c_block_map_search(map, taken_pc));
             } else {
-                /* Use stored taken_pc instead of re-reading
-                 * ir->branch_taken->pc to avoid race condition with main thread
+                /* 使用已保存的 taken_pc，而不是再次读取 ir->branch_taken->pc，
+                 * 避免与主线程发生竞争。
                  */
                 block_t *blk = cache_get(rv->block_cache, taken_pc, false);
                 if (blk && blk->translatable
@@ -368,26 +371,25 @@ static void t2c_trace_ebb(LLVMBuilderRef *builder,
 
 void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
 {
-    /* Skip if already compiled (defensive check) */
+    /* 已经编译过时直接跳过，这是防御性检查。 */
     if (ATOMIC_LOAD(&block->hot2, ATOMIC_ACQUIRE)) {
         pthread_mutex_unlock(cache_lock);
         return;
     }
 
     LLVMModuleRef module = LLVMModuleCreateWithName("my_module");
-    /* Build LLVM struct type that matches riscv_internal layout.
+    /* 构造与 riscv_internal 布局匹配的 LLVM 结构体类型。
      *
-     * Actual riscv_internal struct layout (see riscv_private.h):
-     *   1. bool halt (1 byte + padding)
-     *   2. uint32_t X[32] (128 bytes)
-     *   3. uint32_t PC (4 bytes)
-     *   4. uint64_t timer (8 bytes)
-     *   5. riscv_user_t data (pointer, 8 bytes)
-     *   6. riscv_io_t io (function pointers)
+     * 实际 riscv_internal 结构体布局（见 riscv_private.h）：
+     *   1. bool halt（1 字节 + padding）
+     *   2. uint32_t X[32]（128 字节）
+     *   3. uint32_t PC（4 字节）
+     *   4. uint64_t timer（8 字节）
+     *   5. riscv_user_t data（指针，8 字节）
+     *   6. riscv_io_t io（函数指针）
      *
-     * Note: Additional fields may exist with SYSTEM/EXT_F/etc enabled.
-     * The io struct offset is computed using offsetof() in
-     * t2c_gen_call_io_func.
+     * 注意：启用 SYSTEM/EXT_F 等配置后，实际结构体中可能还有额外字段。
+     * io 结构体偏移由 t2c_gen_call_io_func 中的 offsetof() 计算。
      */
     LLVMTypeRef io_members[] = {
         LLVMPointerType(LLVMVoidType(), 0), LLVMPointerType(LLVMVoidType(), 0),
@@ -398,7 +400,7 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
         LLVMPointerType(LLVMVoidType(), 0), LLVMPointerType(LLVMVoidType(), 0)};
     LLVMTypeRef struct_io = LLVMStructType(io_members, 12, false);
     LLVMTypeRef arr_X = LLVMArrayType(LLVMInt32Type(), 32);
-    /* Match actual riscv_internal layout order */
+    /* 匹配 riscv_internal 的实际字段顺序。 */
     LLVMTypeRef rv_members[] = {
         LLVMInt8Type(),                     /* halt */
         arr_X,                              /* X[32] */
@@ -413,25 +415,27 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
         LLVMAddFunction(module, "t2c_block",
                         LLVMFunctionType(LLVMVoidType(), param_types, 1, 0));
 
-    /* Function type for calling T2C blocks via jit_cache lookup.
-     * Must match the actual T2C block signature: void f(riscv_t *rv)
-     * Using pointer type (not i64) for correct cross-block calling. */
+    /* 通过 jit_cache 查找并调用 T2C 基本块的函数类型。
+     * 必须匹配真实 T2C 基本块签名：void f(riscv_t *rv)。
+     * 为保证跨基本块调用正确，这里使用指针类型，而不是 i64。
+     */
     LLVMTypeRef t2c_args[1] = {LLVMPointerType(LLVMVoidType(), 0)};
     t2c_jit_cache_func_type =
         LLVMFunctionType(LLVMVoidType(), t2c_args, 1, false);
 
-    /* jit_cache struct: { uint32_t seq, [pad], uint64_t key, void *entry }
-     * C struct has 4 bytes padding after seq for 8-byte alignment of key.
-     * LLVM doesn't add this padding automatically, so we add explicit i32 pad.
-     * Field indices: 0=seq, 1=pad, 2=key, 3=entry */
+    /* jit_cache 结构体：{ uint32_t seq, [pad], uint64_t key, void *entry }
+     * C 结构体中，seq 后面有 4 字节 padding，用于让 key 按 8 字节对齐。
+     * LLVM 不会自动补这个 padding，因此这里显式添加 i32 pad。
+     * 字段索引：0=seq，1=pad，2=key，3=entry。
+     */
     LLVMTypeRef jit_cache_memb[4] = {LLVMInt32Type(), LLVMInt32Type(),
                                      LLVMInt64Type(),
                                      LLVMPointerType(LLVMVoidType(), 0)};
     t2c_jit_cache_struct_type = LLVMStructType(jit_cache_memb, 4, false);
 
-    /* inline_cache struct: { uint64_t key, void *entry }
-     * Field indices: 0=key, 1=entry
-     * No padding needed - already naturally aligned. */
+    /* inline_cache 结构体：{ uint64_t key, void *entry }
+     * 字段索引：0=key，1=entry。该布局天然对齐，不需要 padding。
+     */
     LLVMTypeRef inline_cache_memb[2] = {LLVMInt64Type(),
                                         LLVMPointerType(LLVMVoidType(), 0)};
     t2c_inline_cache_struct_type = LLVMStructType(inline_cache_memb, 2, false);
@@ -440,10 +444,9 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
     LLVMBuilderRef first_builder = LLVMCreateBuilder();
     LLVMPositionBuilderAtEnd(first_builder, first_block);
 
-    /* Create instruction counter alloca in entry block for mem2reg promotion.
-     * LLVM's mem2reg pass promotes allocas in the entry block to SSA registers,
-     * eliminating per-instruction memory traffic. The counter is initialized to
-     * 0 and incremented by each T2C_OP. Timer is updated only at block exits.
+    /* 在入口块中创建指令计数器 alloca，方便 mem2reg 提升。
+     * LLVM 的 mem2reg pass 会把入口块中的 alloca 提升为 SSA 寄存器，消除逐指令
+     * 内存访问。计数器初始值为 0，每个 T2C_OP 递增，只有基本块出口才更新时间。
      */
     LLVMValueRef insn_counter =
         LLVMBuildAlloca(first_builder, LLVMInt64Type(), "insn_counter");
@@ -454,13 +457,12 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
     LLVMBuilderRef builder = LLVMCreateBuilder();
     LLVMPositionBuilderAtEnd(builder, entry);
     LLVMBuildBr(first_builder, entry);
-    /* Allocate set on HEAP to avoid stack overflow.
-     * set_t is 256KB (1024 * 32 * 8 bytes) in system mode - too large for
-     * stack.
+    /* 在堆上分配 set，避免栈溢出。
+     * 系统模式下 set_t 大小为 256KB（1024 * 32 * 8 字节），不适合放在栈上。
      */
     set_t *set = malloc(sizeof(set_t));
     if (!set) {
-        rv_log_error("Failed to allocate set for T2C compilation");
+        rv_log_error("为 T2C 编译分配集合失败");
         LLVMDisposeBuilder(first_builder);
         LLVMDisposeBuilder(builder);
         LLVMDisposeModule(module);
@@ -470,19 +472,19 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
     set_reset(set);
     struct LLVM_block_map map;
     map.count = 0;
-    /* Translate custom IR into LLVM IR */
+    /* 将自定义 IR 翻译为 LLVM IR。 */
     t2c_trace_ebb(&builder, param_types, start, &entry, rv, block, set, &map,
                   insn_counter);
 
-    block->is_compiling = true; /* Mark block as busy to prevent eviction */
+    block->is_compiling = true; /* 标记该块繁忙，防止被淘汰。 */
 
-    /* Release lock during expensive LLVM compilation.
-     * IR translation is complete; block fields are no longer accessed until
-     * we need to write results. SFENCE.VMA can now proceed with minimal delay.
+    /* 昂贵的 LLVM 编译期间释放锁。
+     * IR 翻译已经完成；在需要写回结果前，不再访问 block 字段。这样 SFENCE.VMA
+     * 可以用较小延迟继续执行。
      */
     pthread_mutex_unlock(cache_lock);
 
-    /* Offload LLVM IR to LLVM backend */
+    /* 将 LLVM IR 交给 LLVM 后端处理。 */
     char *error = NULL, *triple = LLVMGetDefaultTargetTriple();
     LLVMExecutionEngineRef engine;
     LLVMTargetRef target;
@@ -490,21 +492,21 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
 #if defined(__aarch64__)
-    /* Initialize asm parser for inline assembly support in JIT.
-     * Required for ARM64 ISB instruction emission in t2c_jit_cache_helper.
+    /* 初始化 asm parser，以支持 JIT 中的内联汇编。
+     * t2c_jit_cache_helper 发射 ARM64 ISB 指令时需要它。
      */
     LLVMInitializeNativeAsmParser();
 #endif
     if (LLVMGetTargetFromTriple(triple, &target, &error) != 0) {
-        rv_log_fatal("Failed to create target");
+        rv_log_fatal("创建 LLVM target 失败");
         abort();
     }
-    /* Use PIC relocation mode for JIT code - helps with indirect calls.
-     * Code model selection:
-     * - Apple Silicon (ARM64 macOS): Use Small model to avoid MCJIT bugs with
-     *   movz/movk sequences that Large model generates for 64-bit constants.
-     *   ARM64's limited addressing modes make Large model problematic.
-     * - Other platforms: Use Large model per LLVM MCJIT recommendations.
+    /* JIT 代码使用 PIC 重定位模式，便于处理间接调用。
+     * code model 选择：
+     * - Apple Silicon（ARM64 macOS）：使用 Small model，避免 Large model 为
+     *   64 位常量生成 movz/movk 序列时触发 MCJIT 问题。ARM64 寻址模式较受限，
+     *   Large model 在这里容易出问题。
+     * - 其他平台：按 LLVM MCJIT 推荐使用 Large model。
      */
 #if defined(__aarch64__) && defined(__APPLE__)
     LLVMCodeModel code_model = LLVMCodeModelSmall;
@@ -515,22 +517,22 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
         target, triple, LLVMGetHostCPUName(), LLVMGetHostCPUFeatures(),
         LLVMCodeGenLevelNone, LLVMRelocPIC, code_model);
     LLVMPassBuilderOptionsRef pb_option = LLVMCreatePassBuilderOptions();
-    /* Run LLVM optimization passes on the generated IR.
+    /* 对生成的 IR 运行 LLVM 优化 pass。
      *
-     * Optimization level is configurable via CONFIG_T2C_OPT_LEVEL (Kconfig):
-     *   O0: No optimization (fastest compile, for debugging only)
-     *   O1: Basic optimizations (~50% faster compile than O3)
-     *   O2: Balanced compilation/runtime trade-off
-     *   O3: Aggressive optimizations, best runtime (default for production)
+     * 优化等级可通过 CONFIG_T2C_OPT_LEVEL（Kconfig）配置：
+     *   O0：不优化（编译最快，仅用于调试）
+     *   O1：基础优化（编译速度约比 O3 快 50%）
+     *   O2：平衡编译耗时和运行性能
+     *   O3：激进优化，运行性能最好（生产默认值）
      *
-     * system_jit_defconfig uses O1 for faster CI boot tests.
-     * jit_defconfig uses O3 (default) for production performance.
+     * system_jit_defconfig 使用 O1，以加快 CI 启动测试。
+     * jit_defconfig 使用 O3（默认值），面向生产运行性能。
      */
 #ifndef CONFIG_T2C_OPT_LEVEL
 #define CONFIG_T2C_OPT_LEVEL 3
 #endif
     static_assert(CONFIG_T2C_OPT_LEVEL >= 0 && CONFIG_T2C_OPT_LEVEL <= 3,
-                  "T2C optimization level must be 0-3");
+                  "T2C 优化等级必须在 0-3 之间");
     static const char *const t2c_opt_passes[] = {
         "default<O0>",
         "default<O1>",
@@ -539,9 +541,9 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
     };
     LLVMRunPasses(module, t2c_opt_passes[CONFIG_T2C_OPT_LEVEL], tm, pb_option);
 
-    /* Use LLVMCreateMCJITCompilerForModule with explicit options.
-     * Unlike LLVMCreateExecutionEngineForModule, this respects our code model
-     * setting which is critical for Apple Silicon where Small model is needed.
+    /* 使用 LLVMCreateMCJITCompilerForModule 并显式传入选项。
+     * 不同于 LLVMCreateExecutionEngineForModule，该接口会尊重 code model 设置；
+     * 对必须使用 Small model 的 Apple Silicon 来说这很关键。
      */
     struct LLVMMCJITCompilerOptions options;
     LLVMInitializeMCJITCompilerOptions(&options, sizeof(options));
@@ -550,39 +552,39 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
 
     if (LLVMCreateMCJITCompilerForModule(&engine, module, &options,
                                          sizeof(options), &error) != 0) {
-        rv_log_fatal("Failed to create MCJIT execution engine: %s", error);
+        rv_log_fatal("创建 MCJIT 执行引擎失败：%s", error);
         LLVMDisposeMessage(error);
         abort();
     }
 
-    /* Get function pointer - store in local variable first.
-     * We'll write to block->func only under cache_lock to avoid data race
-     * with eviction path that reads block->func.
+    /* 取得函数指针，先存在局部变量里。
+     * block->func 只在持有 cache_lock 时写入，避免与读取 block->func 的淘汰路径
+     * 发生数据竞争。
      */
     exec_t2c_func_t func =
         (exec_t2c_func_t) LLVMGetPointerToGlobal(engine, start);
 
-    /* Cleanup LLVM resources - execution engine owns the module */
+    /* 清理 LLVM 资源；module 的所有权已经交给 execution engine。 */
     LLVMDisposeBuilder(first_builder);
     LLVMDisposeBuilder(builder);
     LLVMDisposePassBuilderOptions(pb_option);
     LLVMDisposeTargetMachine(tm);
     LLVMDisposeMessage(triple);
 
-    /* Reacquire lock to update shared state.
-     * All block field writes must happen under lock to avoid data races.
+    /* 重新获取锁以更新共享状态。
+     * 所有 block 字段写入都必须在锁内完成，避免数据竞争。
      */
     pthread_mutex_lock(cache_lock);
 
     block->is_compiling = false;
 
-    /* Defensive check: if LLVM failed to generate code, don't mark as compiled.
-     * Must dispose the engine to prevent memory leak.
+    /* 防御性检查：如果 LLVM 未能生成代码，不要标记为已编译。
+     * 同时必须销毁 engine，避免内存泄漏。
      */
     if (!func) {
-        /* Check if block was evicted - if so, free it and its IRs */
+        /* 检查基本块是否已被淘汰；如果是，则释放它和它的 IR。 */
         if (block->should_free) {
-            /* Free IRs that main thread skipped during deferred eviction */
+            /* 释放主线程在延迟淘汰期间跳过的 IR。 */
             for (rv_insn_t *ir = block->ir_head, *next_ir; ir; ir = next_ir) {
                 next_ir = ir->next;
                 if (ir->fuse)
@@ -597,13 +599,13 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
         return;
     }
 
-    /* Check if block was evicted while we were compiling.
-     * If so, we are responsible for freeing it.
+    /* 检查编译期间基本块是否已被淘汰。
+     * 如果已淘汰，当前线程负责释放它。
      */
     if (block->should_free) {
-        /* Dispose engine (we own it) */
+        /* 销毁由当前线程持有的 engine。 */
         LLVMDisposeExecutionEngine(engine);
-        /* Free IRs that main thread skipped during deferred eviction */
+        /* 释放主线程在延迟淘汰期间跳过的 IR。 */
         for (rv_insn_t *ir = block->ir_head, *next_ir; ir; ir = next_ir) {
             next_ir = ir->next;
             if (ir->fuse)
@@ -619,9 +621,9 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
 #if RV32_HAS(SYSTEM)
     uint64_t key = (uint64_t) block->pc_start | ((uint64_t) block->satp << 32);
 
-    /* Check invalidated flag after reacquiring lock. If SFENCE.VMA ran while
-     * we were compiling, it set this flag and cleared jit_cache. We must not
-     * re-add a stale entry. Dispose engine to prevent leak.
+    /* 重新获取锁后检查 invalidated 标志。如果编译期间执行过 SFENCE.VMA，
+     * 该标志会被置位且 jit_cache 已清空。此时不能重新加入过期条目，并需销毁
+     * engine 以避免泄漏。
      */
     if (block->invalidated) {
         LLVMDisposeExecutionEngine(engine);
@@ -633,15 +635,14 @@ void t2c_compile(riscv_t *rv, block_t *block, pthread_mutex_t *cache_lock)
     uint64_t key = (uint64_t) block->pc_start;
 #endif
 
-    /* Write to block fields under lock to avoid data race with eviction */
+    /* 在锁内写入 block 字段，避免与淘汰路径发生数据竞争。 */
     block->func = func;
     block->llvm_engine = engine;
 
     jit_cache_update(rv->jit_cache, key, block->func);
 
-    /* Atomic store-release ensures all writes to block->func and jit_cache
-     * are visible to other threads before they observe hot2=true.
-     * Pairs with atomic load-acquire in rv_step().
+    /* 原子 release 存储确保其他线程观察到 hot2=true 前，已经能看到 block->func 和
+     * jit_cache 的全部写入。它与 rv_step() 中的 acquire 加载配对。
      */
     ATOMIC_STORE(&block->hot2, true, ATOMIC_RELEASE);
 
@@ -669,18 +670,17 @@ void inline_cache_exit(struct inline_cache *cache)
     free(cache);
 }
 
-/* Clear all inline cache entries.
- * Called on SFENCE.VMA with rs1=0 (flush all) or when resetting emulator.
- * No seqlock needed - only main thread reads/writes inline cache.
+/* 清空所有 inline cache 条目。
+ * 在 rs1=0 的 SFENCE.VMA（全量刷新）或模拟器重置时调用。
+ * inline cache 只有主线程读写，因此不需要 seqlock。
  */
 void inline_cache_clear(struct inline_cache *cache)
 {
     memset(cache, 0, N_INLINE_CACHE_ENTRIES * sizeof(struct inline_cache));
 }
 
-/* Clear inline cache entries for a specific VA page.
- * Called on SFENCE.VMA with specific address.
- * Only clears entries whose PC falls within the target page.
+/* 清空指定 VA 页对应的 inline cache 条目。
+ * 在带具体地址的 SFENCE.VMA 中调用；只清理 PC 落在目标页中的条目。
  */
 void inline_cache_clear_page(struct inline_cache *cache,
                              uint32_t va,
@@ -706,8 +706,8 @@ void inline_cache_clear_page(struct inline_cache *cache,
     }
 }
 
-/* Clear inline cache entries matching a specific key.
- * Used when evicting a compiled block to prevent stale entry pointers.
+/* 清空匹配指定 key 的 inline cache 条目。
+ * 淘汰已编译基本块时使用，避免留下过期 entry 指针。
  */
 void inline_cache_clear_key(struct inline_cache *cache, uint64_t key)
 {
@@ -722,9 +722,9 @@ void inline_cache_clear_key(struct inline_cache *cache, uint64_t key)
     }
 }
 
-/* Dispose LLVM execution engine when a T2C-compiled block is freed.
- * The engine owns the memory where block->func points, so it must be
- * disposed before the block is freed to prevent dangling pointers.
+/* 释放 T2C 编译基本块时销毁 LLVM execution engine。
+ * engine 持有 block->func 指向的代码内存，因此必须在释放 block 前销毁，
+ * 避免悬垂指针。
  */
 void t2c_dispose_engine(void *engine)
 {
@@ -732,13 +732,13 @@ void t2c_dispose_engine(void *engine)
         LLVMDisposeExecutionEngine((LLVMExecutionEngineRef) engine);
 }
 
-/* Wrapper for clear_cache_hot callback - disposes block's LLVM engine.
- * Called during shutdown via clear_cache_hot to clean up all remaining blocks.
- * Sets both llvm_engine and func to NULL to prevent use-after-free.
+/* clear_cache_hot 回调的包装函数，用于销毁基本块的 LLVM engine。
+ * 关闭阶段通过 clear_cache_hot 调用，清理所有剩余基本块。
+ * 同时把 llvm_engine 和 func 置为 NULL，避免 use-after-free。
  *
- * DISABLE_UBSAN_FUNC: Disable UBSAN function pointer type check.
- * LLVM's cflags can cause function type metadata mismatch between t2c.c
- * and cache.c, triggering false positive when called via clear_func_t.
+ * DISABLE_UBSAN_FUNC：禁用 UBSAN 函数指针类型检查。
+ * LLVM 的 cflags 可能导致 t2c.c 与 cache.c 之间的函数类型元数据不匹配；
+ * 通过 clear_func_t 调用时可能触发误报。
  */
 DISABLE_UBSAN_FUNC
 void t2c_dispose_block_engine(void *block)
@@ -747,61 +747,58 @@ void t2c_dispose_block_engine(void *block)
     if (blk && blk->llvm_engine) {
         LLVMDisposeExecutionEngine((LLVMExecutionEngineRef) blk->llvm_engine);
         blk->llvm_engine = NULL;
-        blk->func = NULL; /* func pointed into engine's memory */
+        blk->func = NULL; /* func 原本指向 engine 管理的内存。 */
     }
 }
 
 void jit_cache_update(struct jit_cache *cache, uint64_t key, void *entry)
 {
-    /* XOR high 32 bits (satp) with low 32 bits (pc) before masking.
-     * This distributes entries from different address spaces across the table,
-     * reducing cache thrashing when multiple processes share virtual addresses.
+    /* 掩码前先将高 32 位（satp）与低 32 位（pc）异或。
+     * 这样可把不同地址空间的条目分散到表中，降低多个进程共享虚拟地址时的缓存抖动。
      */
     uint32_t pos =
         ((uint32_t) key ^ (uint32_t) (key >> 32)) & (N_JIT_CACHE_ENTRIES - 1);
 
-    /* Seqlock write pattern:
-     * 1. Increment seq to odd (signals write in progress)
-     * 2. Write entry and key (atomic relaxed to avoid data race with readers)
-     * 3. Increment seq to even (signals write complete)
-     * Release ordering on seq ensures readers see consistent state.
+    /* Seqlock 写入模式：
+     * 1. 把 seq 递增为奇数，表示正在写入
+     * 2. 写入 entry 和 key（原子 relaxed/release，用于避免与读者数据竞争）
+     * 3. 把 seq 递增为偶数，表示写入完成
+     * seq 上的 release 顺序保证读者看到一致状态。
      */
     uint32_t seq = ATOMIC_LOAD(&cache[pos].seq, ATOMIC_RELAXED);
-    ATOMIC_STORE(&cache[pos].seq, seq + 1, ATOMIC_RELEASE); /* odd = writing */
+    ATOMIC_STORE(&cache[pos].seq, seq + 1, ATOMIC_RELEASE); /* 奇数 = 写入中 */
     ATOMIC_STORE(&cache[pos].entry, entry, ATOMIC_RELEASE);
     ATOMIC_STORE(&cache[pos].key, key, ATOMIC_RELEASE);
-    ATOMIC_STORE(&cache[pos].seq, seq + 2, ATOMIC_RELEASE); /* even = done */
+    ATOMIC_STORE(&cache[pos].seq, seq + 2, ATOMIC_RELEASE); /* 偶数 = 完成 */
 }
 
 void jit_cache_clear(struct jit_cache *cache)
 {
-    /* Clear all entries using seqlock pattern for thread-safe invalidation. */
+    /* 使用 seqlock 模式清空所有条目，保证线程安全的失效操作。 */
     for (uint32_t i = 0; i < N_JIT_CACHE_ENTRIES; i++) {
         uint32_t seq = ATOMIC_LOAD(&cache[i].seq, ATOMIC_RELAXED);
         ATOMIC_STORE(&cache[i].seq, seq + 1,
-                     ATOMIC_RELEASE); /* odd = writing */
+                     ATOMIC_RELEASE); /* 奇数 = 写入中 */
         ATOMIC_STORE(&cache[i].entry, NULL, ATOMIC_RELEASE);
         ATOMIC_STORE(&cache[i].key, 0, ATOMIC_RELEASE);
-        ATOMIC_STORE(&cache[i].seq, seq + 2, ATOMIC_RELEASE); /* even = done */
+        ATOMIC_STORE(&cache[i].seq, seq + 2, ATOMIC_RELEASE); /* 偶数 = 完成 */
     }
 }
 
-/* Selectively clear jit_cache entries for a specific VA page and SATP.
- * This is more efficient than jit_cache_clear() for address-specific
- * SFENCE.VMA operations, avoiding unnecessary invalidation of unrelated
- * entries.
+/* 按指定 VA 页和 SATP 选择性清理 jit_cache 条目。
+ * 对按地址执行的 SFENCE.VMA 来说，这比 jit_cache_clear() 更高效，可避免不必要地
+ * 失效无关条目。
  *
- * Caller must hold cache_lock (rv->cache_lock) to synchronize with the T2C
- * compilation thread. The T2C thread holds this lock when updating jit_cache
- * entries via jit_cache_update(). Without this lock:
- * 1. T2C thread could be writing an entry while we read/clear it
- * 2. Race could cause partially-written keys to be matched incorrectly
- * 3. Entry could be cleared right after T2C writes it, causing wasted work
+ * 调用方必须持有 cache_lock（rv->cache_lock），以便与 T2C 编译线程同步。
+ * T2C 线程通过 jit_cache_update() 更新 jit_cache 条目时也持有该锁。
+ * 如果没有这把锁：
+ * 1. T2C 线程可能在当前线程读/清理条目的同时写入条目
+ * 2. 竞争可能导致半写入 key 被错误匹配
+ * 3. 条目可能在 T2C 刚写入后立即被清掉，造成无效工作
  *
- * The seqlock pattern used here only protects the main thread's JIT cache
- * lookups from seeing torn reads - it does not provide mutual exclusion for
- * writers. The cache_lock provides that exclusion between the main thread
- * (SFENCE.VMA) and T2C thread (block compilation).
+ * 这里的 seqlock 模式只保护主线程的 JIT cache 查找不看到撕裂读，并不为写者提供
+ * 互斥。主线程（SFENCE.VMA）与 T2C 线程（基本块编译）之间的写者互斥由
+ * cache_lock 提供。
  */
 void jit_cache_clear_page(struct jit_cache *cache, uint32_t va, uint32_t satp)
 {
@@ -815,18 +812,18 @@ void jit_cache_clear_page(struct jit_cache *cache, uint32_t va, uint32_t satp)
         uint32_t entry_pc = (uint32_t) key;
         uint32_t entry_satp = (uint32_t) (key >> 32);
 
-        /* Match entries with same SATP and PC in the target page */
+        /* 匹配 SATP 相同且 PC 落在目标页中的条目。 */
         if (entry_satp == satp) {
             uint32_t entry_page = entry_pc & ~(RV_PG_SIZE - 1);
             if (entry_page == va_page) {
-                /* Clear using seqlock pattern */
+                /* 使用 seqlock 模式清理。 */
                 uint32_t seq = ATOMIC_LOAD(&cache[i].seq, ATOMIC_RELAXED);
                 ATOMIC_STORE(&cache[i].seq, seq + 1,
-                             ATOMIC_RELEASE); /* odd = writing */
+                             ATOMIC_RELEASE); /* 奇数 = 写入中 */
                 ATOMIC_STORE(&cache[i].entry, NULL, ATOMIC_RELEASE);
                 ATOMIC_STORE(&cache[i].key, 0, ATOMIC_RELEASE);
                 ATOMIC_STORE(&cache[i].seq, seq + 2,
-                             ATOMIC_RELEASE); /* even = done */
+                             ATOMIC_RELEASE); /* 偶数 = 完成 */
             }
         }
     }

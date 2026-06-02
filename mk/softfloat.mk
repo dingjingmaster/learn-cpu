@@ -1,13 +1,13 @@
-# Berkeley SoftFloat library for floating-point emulation
+# Berkeley SoftFloat 浮点模拟库
 #
-# Provides IEEE 754 compliant software floating-point for F extension.
+# 为 RV32F 扩展提供符合 IEEE 754 语义的软件浮点实现。
 
 ifndef _MK_SOFTFLOAT_INCLUDED
 _MK_SOFTFLOAT_INCLUDED := 1
 
 SOFTFLOAT_DIR := src/softfloat/source
 
-# FIXME: Suppress compilation warnings in upstream SoftFloat 3
+# FIXME：抑制上游 SoftFloat 3 的编译警告。
 CFLAGS_softfloat := \
     -Wno-unused-parameter \
     -Wno-unused-variable \
@@ -17,7 +17,7 @@ CFLAGS_softfloat := \
     -I$(SOFTFLOAT_DIR)/RISCV \
     -I$(SOFTFLOAT_DIR)/include
 
-# FIXME: make the flags configurable
+# FIXME：这些编译参数后续应改为可配置。
 CFLAGS_softfloat += \
     -I$(OUT)/softfloat \
     -D LITTLEENDIAN=1 \

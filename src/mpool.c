@@ -1,6 +1,13 @@
 /*
- * rv32emu is freely redistributable under the MIT License. See the file
- * "LICENSE" for information on usage and redistribution of this file.
+ * rv32emu 可依据 MIT 许可证自由再分发。使用和再分发规则见 LICENSE 文件。
+ */
+
+/*
+ * 固定大小对象内存池。
+ *
+ * 基本块和 IR 节点会频繁分配/释放，直接使用 malloc 会带来碎片和开销。
+ * mpool 以 chunk 为单位扩展空闲链表，提供 O(1) 分配和释放；支持 mmap 的平台
+ * 使用 mmap 获取 arena，不支持时退回 malloc。
  */
 
 #include <stdint.h>
@@ -15,7 +22,7 @@
 
 #include "mpool.h"
 
-/* Chunk layout: [memchunk_t next-pointer][user data] */
+/* chunk 布局：[memchunk_t next 指针][用户数据]。 */
 typedef struct memchunk {
     struct memchunk *next;
 } memchunk_t;
@@ -33,7 +40,7 @@ typedef struct mpool {
     area_t area;
 } mpool_t;
 
-/* Allocate page-aligned memory via mmap (demand-paged) or malloc fallback */
+/* 通过 mmap 分配页对齐、按需映射内存；不可用时退回 malloc。 */
 static void *mem_arena(size_t sz)
 {
     void *p;
@@ -62,7 +69,7 @@ mpool_t *mpool_create(size_t pool_size, size_t chunk_size)
     new_mp->area.next = NULL;
     size_t pgsz = getpagesize();
 
-    /* Overflow checks */
+    /* 溢出检查，避免页数和 chunk 数量计算回绕。 */
     if (chunk_size > SIZE_MAX - sizeof(memchunk_t))
         goto fail_mpool;
     if (pool_size < chunk_size + sizeof(memchunk_t))
@@ -82,7 +89,7 @@ mpool_t *mpool_create(size_t pool_size, size_t chunk_size)
     new_mp->chunk_count = pool_size / (sizeof(memchunk_t) + chunk_size);
     new_mp->chunk_size = chunk_size;
 
-    /* Build free list */
+    /* 在新 arena 上构建空闲链表。 */
     new_mp->free_chunk_head = (memchunk_t *) p;
     memchunk_t *cur = new_mp->free_chunk_head;
     for (size_t i = 0; i < new_mp->chunk_count - 1; i++) {
@@ -98,7 +105,7 @@ fail_mpool:
     return NULL;
 }
 
-/* Extend pool by allocating another memory area of same size */
+/* 通过再分配一块同样大小的内存区域扩展内存池。 */
 static void *mpool_extend(mpool_t *mp)
 {
     size_t pool_size = mp->page_count * getpagesize();
@@ -114,7 +121,7 @@ static void *mpool_extend(mpool_t *mp)
     new_area->next = NULL;
     size_t chunk_count = pool_size / (sizeof(memchunk_t) + mp->chunk_size);
 
-    /* Build free list for new area */
+    /* 为新区域构建空闲链表。 */
     mp->free_chunk_head = (memchunk_t *) p;
     memchunk_t *cur = mp->free_chunk_head;
     for (size_t i = 0; i < chunk_count - 1; i++) {
@@ -124,7 +131,7 @@ static void *mpool_extend(mpool_t *mp)
     }
     mp->chunk_count += chunk_count;
 
-    /* Append to area list */
+    /* 追加到 area 链表，销毁时统一释放。 */
     area_t *cur_area = &mp->area;
     while (cur_area->next)
         cur_area = cur_area->next;

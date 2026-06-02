@@ -1,12 +1,12 @@
-# rv32emu Configuration
+# rv32emu 配置
 #
-# RISC-V RV32 Emulator with tiered JIT compilation
+# 带分层 JIT 编译能力的 RISC-V RV32 模拟器。
 
-mainmenu "rv32emu Configuration"
+mainmenu "rv32emu 配置"
 
-# Environment Detection (read-only, set by tools/detect-env.py)
+# 环境探测：只读选项，由 tools/detect-env.py 自动填充。
 
-menu "Toolchain Detection"
+menu "工具链探测"
 
 config COMPILER_TYPE
     string
@@ -22,56 +22,56 @@ config CC_IS_CLANG
 config CC_IS_GCC
     def_bool $(shell,tools/detect-env.py --is-gcc 2>/dev/null)
 
-comment "Emscripten detected - WebAssembly build available"
+comment "已探测到 Emscripten，可构建 WebAssembly 版本"
     depends on HAVE_EMCC
 
-comment "Emscripten not found - install emsdk for WebAssembly builds"
+comment "未找到 Emscripten；如需 WebAssembly 构建，请安装 emsdk"
     depends on !HAVE_EMCC
 
 endmenu
 
-# Build Target Selection
+# 构建目标选择。
 
-menu "Build Target"
+menu "构建目标"
 
 choice
-    prompt "Build Target"
+    prompt "构建目标"
     default BUILD_NATIVE
     help
-      Select the build target platform.
+      选择模拟器最终运行的平台。
 
 config BUILD_NATIVE
-    bool "Native (Linux/macOS/Windows)"
+    bool "本地程序（Linux/macOS/Windows）"
     help
-      Build native executable for the host platform.
-      Uses system compiler (GCC or Clang).
+      为当前宿主平台构建本地可执行文件。
+      构建时使用系统编译器（GCC 或 Clang）。
 
 config BUILD_WASM
-    bool "WebAssembly (Emscripten)"
+    bool "WebAssembly（Emscripten）"
     depends on HAVE_EMCC
     help
-      Build WebAssembly module for web browsers.
-      Requires Emscripten SDK (emsdk) to be installed and activated.
+      为浏览器构建 WebAssembly 模块。
+      需要先安装并激活 Emscripten SDK（emsdk）。
 
-      The build will use 'emcc' as the compiler.
-      Run in browser with: make start-web
+      该模式会使用 `emcc` 作为编译器。
+      可通过 `make start-web` 在浏览器中运行。
 
 endchoice
 
-# Internal: Set CC_IS_EMCC when BUILD_WASM is selected
+# 内部选项：选择 BUILD_WASM 时同步设置 CC_IS_EMCC。
 config CC_IS_EMCC
     bool
     default BUILD_WASM
 
-comment "Build mode: WebAssembly (Emscripten)"
+comment "当前构建模式：WebAssembly（Emscripten）"
     depends on BUILD_WASM
 
-comment "Build mode: Native"
+comment "当前构建模式：本地程序"
     depends on BUILD_NATIVE
 
 endmenu
 
-# Dependency Detection
+# 依赖探测。
 
 config HAVE_SDL2
     bool
@@ -91,329 +91,327 @@ config HAVE_RISCV_TOOLCHAIN
     bool
     default $(shell,tools/detect-env.py --have-riscv-toolchain 2>/dev/null)
 
-# RISC-V ISA Extensions
+# RISC-V ISA 扩展。
 
-menu "RISC-V ISA Configuration"
+menu "RISC-V ISA 配置"
 
 choice
-    prompt "Base Integer Instruction Set"
+    prompt "基础整数指令集"
     default RV32I
 
 config RV32I
-    bool "RV32I (Standard 32 registers)"
+    bool "RV32I（标准 32 个寄存器）"
     help
-      Standard RISC-V 32-bit base integer instruction set
-      with 32 general-purpose registers.
+      标准 RISC-V 32 位基础整数指令集，包含 32 个通用寄存器。
 
 config RV32E
-    bool "RV32E (Embedded 16 registers)"
+    bool "RV32E（嵌入式 16 个寄存器）"
     help
-      Reduced RISC-V base integer instruction set for embedded
-      systems with only 16 general-purpose registers.
+      面向嵌入式系统的精简基础整数指令集，只包含 16 个通用寄存器。
 
 endchoice
 
-comment "Standard Extensions"
+comment "标准扩展"
 
 config EXT_M
-    bool "M - Integer Multiplication and Division"
+    bool "M - 整数乘除法"
     default y
     help
-      Enable integer multiplication and division instructions.
-      Required for most practical programs.
+      启用整数乘法和除法指令。
+      绝大多数实用程序都需要该扩展。
 
 config EXT_A
-    bool "A - Atomic Instructions"
+    bool "A - 原子指令"
     default y
     help
-      Enable atomic memory operation instructions.
-      Required for multi-threading and synchronization.
+      启用原子内存操作指令。
+      多线程和同步原语通常需要该扩展。
 
 config EXT_F
-    bool "F - Single-Precision Floating-Point"
+    bool "F - 单精度浮点"
     default y
     help
-      Enable single-precision (32-bit) floating-point instructions.
-      Uses Berkeley SoftFloat for IEEE 754 compliance.
+      启用单精度（32 位）浮点指令。
+      项目使用 Berkeley SoftFloat 保证 IEEE 754 语义。
 
 config EXT_C
-    bool "C - Compressed Instructions"
+    bool "C - 压缩指令"
     default y
     help
-      Enable 16-bit compressed instruction encoding.
-      Reduces code size by approximately 25-30%.
+      启用 16 位压缩指令编码。
+      通常可将代码体积降低约 25% 到 30%。
 
-comment "Zicsr and Zifencei Extensions"
+comment "Zicsr 和 Zifencei 扩展"
 
 config Zicsr
-    bool "Zicsr - Control and Status Register"
+    bool "Zicsr - 控制与状态寄存器"
     default y
     help
-      Enable CSR (Control and Status Register) instructions.
-      Required for privileged mode and system emulation.
+      启用 CSR（Control and Status Register）指令。
+      特权模式和系统模拟需要该扩展。
 
 config Zifencei
-    bool "Zifencei - Instruction-Fetch Fence"
+    bool "Zifencei - 指令取指栅栏"
     default y
     help
-      Enable instruction-fetch fence for self-modifying code.
-      Required for JIT compilation support.
+      启用用于自修改代码同步的指令取指栅栏。
+      JIT 支持也依赖该扩展处理指令缓存一致性。
 
-comment "Bit Manipulation Extensions (Zb*)"
+comment "位操作扩展（Zb*）"
 
 config Zba
-    bool "Zba - Address Generation"
+    bool "Zba - 地址生成"
     default y
     help
-      Enable address generation bit manipulation instructions.
-      Provides efficient shifted-add operations.
+      启用地址生成相关的位操作指令。
+      该扩展提供高效的移位加法操作。
 
 config Zbb
-    bool "Zbb - Basic Bit Manipulation"
+    bool "Zbb - 基础位操作"
     default y
     help
-      Enable basic bit manipulation instructions.
-      Includes count, rotate, byte-reverse operations.
+      启用基础位操作指令。
+      包含计数、旋转、字节反转等操作。
 
 config Zbc
-    bool "Zbc - Carry-less Multiplication"
+    bool "Zbc - 无进位乘法"
     default y
     help
-      Enable carry-less multiplication instructions.
-      Useful for cryptographic applications (GCM, CRC).
+      启用无进位乘法指令。
+      该扩展常用于 GCM、CRC 等密码学或校验场景。
 
 config Zbs
-    bool "Zbs - Single-bit Instructions"
+    bool "Zbs - 单 bit 指令"
     default y
     help
-      Enable single-bit manipulation instructions.
-      Provides efficient bit test, set, clear operations.
+      启用单 bit 操作指令。
+      可高效完成 bit 测试、置位和清零。
 
 endmenu
 
-# Execution Modes
+# 执行模式。
 
-menu "Execution Modes"
+menu "执行模式"
 
-comment "Emulation Mode"
+comment "模拟方式"
 
 choice
-    prompt "Execution Engine"
+    prompt "执行引擎"
     default INTERPRETER_ONLY
     help
-      Select the execution engine for RISC-V instruction emulation.
+      选择 RISC-V 指令模拟使用的执行引擎。
 
 config INTERPRETER_ONLY
-    bool "Interpreter Only"
+    bool "仅解释器"
     help
-      Pure interpreter mode using tail-call-optimization-based instruction dispatch.
-      Most portable, works on all platforms.
+      使用基于尾调用优化的解释器调度直接执行指令。
+      这是最可移植的模式，适用于所有平台。
 
 config JIT
-    bool "JIT Compilation (Hybrid)"
+    bool "JIT 编译（混合模式）"
     depends on !CC_IS_EMCC
     help
-      Hybrid interpreter + Just-In-Time compilation.
-      Tier-1 JIT uses template-based code generation for hot paths.
+      启用解释器 + 即时编译的混合执行模式。
+      一级 JIT 使用模板化代码生成优化热点路径。
 
-      JIT is only available on x86_64 and ARM64 platforms.
-      Falls back to interpreter for cold code.
+      JIT 仅支持 x86_64 和 ARM64 宿主平台。
+      冷代码仍会回退到解释器执行。
 
 endchoice
 
 config T2C
-    bool "Tier-2 LLVM Compiler"
+    bool "二级 LLVM 编译器"
     default y
     depends on JIT && HAVE_LLVM18
     help
-      Enable tier-2 JIT compiler powered by LLVM 18.
-      Provides advanced optimizations for hot code paths.
+      启用由 LLVM 18 驱动的二级 JIT 编译器。
+      它会为热点代码路径提供更强的优化。
 
-      Requires LLVM 18 development libraries.
+      该功能需要 LLVM 18 开发库。
 
-comment "System Emulation"
+comment "系统模拟"
 
 config SYSTEM
-    bool "System Emulation Mode"
+    bool "系统模拟模式"
     default n
     help
-      Enable system emulation mode for running the Linux kernel.
-      Includes MMU, timer, UART, and virtio device emulation.
+      启用用于运行 Linux 内核的系统模拟模式。
+      该模式包含 MMU、定时器、UART 和 virtio 设备模拟。
 
-      When enabled, rv32emu can boot a complete Linux system.
-      Requires additional kernel image and rootfs.
+      启用后，rv32emu 可以引导一个完整 Linux 系统。
+      运行时需要额外提供内核镜像和 rootfs/initrd。
 
 config GOLDFISH_RTC
-    bool "Enable Goldfish RTC"
+    bool "启用 Goldfish RTC"
     default y
     depends on SYSTEM && !ELF_LOADER
     help
-      Enable Goldfish RTC peripheral when running the Linux system.
-      Only available in kernel boot mode (without ELF_LOADER).
+      在运行 Linux 系统时启用 Goldfish RTC 外设。
+      仅在内核引导模式可用，即未启用 ELF_LOADER 时可用。
 
 config ELF_LOADER
-    bool "ELF Loader for System Mode"
+    bool "系统模式 ELF 装载器"
     default n
     depends on SYSTEM
     help
-      Use ELF loader in system mode instead of raw kernel image.
+      在系统模式下使用 ELF 装载器，而不是直接装载原始内核镜像。
 
-      This option changes the emulator's operating mode:
-      - Without ELF_LOADER: Kernel boot mode (-k/-i flags for kernel/initrd)
-      - With ELF_LOADER: User-mode ELF execution (runs ELF files directly)
+      该选项会改变模拟器的运行方式：
+      - 未启用 ELF_LOADER：内核引导模式，使用 -k/-i 指定 kernel/initrd
+      - 启用 ELF_LOADER：直接运行 ELF 文件
 
-      Enable this for running 'make check' tests in system mode.
-      Disable this for booting Linux kernel images.
+      在系统模式下运行 `make check` 测试时可启用此选项。
+      若目标是引导 Linux 内核镜像，则应关闭此选项。
 
 endmenu
 
-# Performance Optimizations
+# 性能优化。
 
-menu "Performance Options"
+menu "性能选项"
 
 config MOP_FUSION
-    bool "Macro-op Fusion"
+    bool "宏操作融合"
     default y
     help
-      Enable macro-operation fusion for common instruction sequences.
-      Fuses consecutive instructions into optimized handlers.
+      对常见连续指令序列启用宏操作融合。
+      多条指令会被合并成专用优化处理器。
 
-      Improves performance by reducing dispatch overhead.
+      这样可以减少调度开销并提升执行性能。
 
 config BLOCK_CHAINING
-    bool "Block Chaining"
+    bool "基本块链接"
     default y
     help
-      Enable basic block chaining for translated code.
-      Links consecutive blocks to avoid dispatch overhead.
+      为已翻译代码启用基本块链接。
+      连续基本块可以直接跳转，避免回到调度器。
 
-      Improves JIT performance significantly.
+      该选项能显著提升 JIT 性能。
 
 config T2C_OPT_LEVEL
-    int "T2C LLVM Optimization Level (0-3)"
+    int "T2C LLVM 优化级别（0-3）"
     default 3
     range 0 3
     depends on T2C
     help
-      LLVM optimization level for T2C compiled code:
-        0 - No optimization (fastest compile, for debugging)
-        1 - Basic optimization (~50% faster compile than O3)
-        2 - Standard optimization (balanced)
-        3 - Aggressive optimization (default, best runtime performance)
+      T2C 编译代码使用的 LLVM 优化级别：
+        0 - 不优化（编译最快，适合调试）
+        1 - 基础优化（编译速度约比 O3 快 50%）
+        2 - 标准优化（编译时间和运行性能折中）
+        3 - 激进优化（默认值，运行性能最好）
 
-      For CI boot tests, O1 significantly reduces compilation time
-      while maintaining correctness. Use O3 for production.
+      CI 引导测试中，O1 可以明显减少编译时间并保持正确性。
+      生产或性能测试场景建议使用 O3。
 
 config LTO
-    bool "Link-Time Optimization"
+    bool "链接时优化"
     default y
     depends on CC_IS_GCC || CC_IS_CLANG
     help
-      Enable link-time optimization for smaller, faster binaries.
-      Increases build time but improves runtime performance.
+      启用链接时优化，生成更小且更快的可执行文件。
+      该选项会增加构建时间，但通常能改善运行性能。
 
 endmenu
 
-# Debugging and Development
+# 调试和开发。
 
-menu "Debugging"
+menu "调试"
 
 config GDBSTUB
-    bool "GDB Remote Debugging"
+    bool "GDB 远程调试"
     default n
     depends on !CC_IS_EMCC
     help
-      Enable GDB remote debugging stub.
-      Allows debugging RISC-V programs with gdb.
+      启用 GDB 远程调试 stub。
+      可使用 gdb 调试 RISC-V 客体程序。
 
-      Connect with: riscv32-unknown-elf-gdb -ex "target remote :1234"
+      连接命令示例：riscv32-unknown-elf-gdb -ex "target remote :1234"
 
 config LOG_COLOR
-    bool "Colored Log Output"
+    bool "彩色日志输出"
     default y
     help
-      Enable ANSI color codes in log output.
-      Improves readability of debug messages.
+      在日志输出中启用 ANSI 颜色码。
+      这会提升调试信息的可读性。
 
 config UBSAN
-    bool "Undefined Behavior Sanitizer"
+    bool "未定义行为检测器"
     default n
     depends on CC_IS_GCC || CC_IS_CLANG
     help
-      Enable UndefinedBehaviorSanitizer for detecting UB at runtime.
-      Useful for development and debugging, not for production.
+      启用 UndefinedBehaviorSanitizer，在运行时检测未定义行为。
+      该选项适合开发和调试，不建议用于生产构建。
 
 endmenu
 
-# SDL Graphics and Audio
+# SDL 图形和音频。
 
-menu "Graphics and Audio"
+menu "图形和音频"
 
 config SDL
-    bool "SDL2 Graphics Support"
+    bool "SDL2 图形支持"
     default y
     depends on HAVE_SDL2 || CC_IS_EMCC
     help
-      Enable SDL2-based graphics and input support.
-      Required for graphical applications like Doom and Quake.
+      启用基于 SDL2 的图形和输入支持。
+      Doom、Quake 等图形应用需要该功能。
 
-      For WebAssembly builds, uses Emscripten SDL2 port.
+      WebAssembly 构建会使用 Emscripten 的 SDL2 端口。
 
 config SDL_MIXER
-    bool "SDL2_mixer Audio Support"
+    bool "SDL2_mixer 音频支持"
     default y
     depends on SDL && (HAVE_SDL2_MIXER || CC_IS_EMCC)
     help
-      Enable SDL2_mixer for audio playback.
-      Supports WAV and MIDI formats.
+      启用 SDL2_mixer 音频播放支持。
+      可播放 WAV 和 MIDI 格式。
 
 endmenu
 
-# Testing
+# 测试。
 
-menu "Testing"
+menu "测试"
 
 config ARCH_TEST
-    bool "RISC-V Architecture Tests"
+    bool "RISC-V 架构测试"
     default n
     help
-      Build for RISC-V architecture compliance testing.
-      Used by 'make arch-test' target.
+      为 RISC-V 架构合规测试构建模拟器。
+      `make arch-test` 目标会使用该选项。
 
 endmenu
 
-# Build Options
+# 构建选项。
 
-menu "Build Options"
+menu "构建选项"
 
 config OPTIMIZE_LEVEL
-    int "Optimization Level (0-3)"
+    int "编译优化级别（0-3）"
     default 2
     range 0 3
     help
-      Compiler optimization level:
-        0 - No optimization (fastest compile)
-        1 - Basic optimization
-        2 - Standard optimization (default)
-        3 - Aggressive optimization
+      编译器优化级别：
+        0 - 不优化（编译最快）
+        1 - 基础优化
+        2 - 标准优化（默认）
+        3 - 激进优化
 
 config OPTIMIZE_SIZE
-    bool "Optimize for Size (-Os)"
+    bool "优化体积（-Os）"
     default n
     help
-      Trade speed for smaller binary size.
-      Recommended for embedded or WebAssembly deployments.
+      用运行速度换取更小的二进制体积。
+      推荐在嵌入式或 WebAssembly 部署场景中使用。
 
 config DEBUG_SYMBOLS
-    bool "Include Debug Symbols (-g)"
+    bool "包含调试符号（-g）"
     default n
     help
-      Generate debug information for gdb/lldb.
-      Increases binary size significantly.
+      生成供 gdb/lldb 使用的调试信息。
+      该选项会明显增加二进制体积。
 
 endmenu
 
-# Configuration marker
+# 配置完成标记。
 config CONFIGURED
     bool
     default y
